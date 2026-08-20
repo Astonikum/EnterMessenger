@@ -26,7 +26,11 @@ jobs:
           tag="desktop-v$version"
           title="Enter Desktop v$version"
           notes="Desktop bundles built from the committed desktop version."
-          if release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id 2>/dev/null)"; then
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.id, .tag_name] | @tsv' | \
+            awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
+
+          if [[ -n "$release_id" ]]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
               -f "name=$title" \
               -f "body=$notes" \
@@ -113,3 +117,26 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  finalize:
+    name: Keep desktop draft release
+    needs: release
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Keep release as draft
+        shell: bash
+        run: |
+          version="$(node -p "require('./desktop/package.json').version")"
+          tag="desktop-v$version"
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.id, .tag_name] | @tsv' | \
+            awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
+          test -n "$release_id" || { echo "Release $tag was not found"; exit 1; }
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=true \
+            -F prerelease=false >/dev/null

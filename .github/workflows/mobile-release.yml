@@ -132,7 +132,11 @@ jobs:
               -f "sha=$GITHUB_SHA" >/dev/null
           fi
 
-          if release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id 2>/dev/null)"; then
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.id, .tag_name] | @tsv' | \
+            awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
+
+          if [[ -n "$release_id" ]]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
               -f "name=$title" \
               -f "body=$notes" \
