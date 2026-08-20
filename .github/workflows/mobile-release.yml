@@ -106,7 +106,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="mobile-v${{ steps.version.outputs.version }}"
+          tag=mobile
           title="Enter Mobile v${{ steps.version.outputs.version }}"
           notes="Android ${{ steps.artifact.outputs.profile }} artifact created by EAS."
 

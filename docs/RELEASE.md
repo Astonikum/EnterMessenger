@@ -13,7 +13,7 @@
 - desktop: `desktop/package.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/tauri.conf.json`;
 - mobile: `mobile/package.json`, `mobile/app.json`.
 
-Desktop action создает draft-релиз с тегом `desktop-v<version>`, а Mobile action — draft-релиз с тегом `mobile-v<version>`. Версия берется отдельно из manifest соответствующей платформы. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
+Desktop action создает draft-релиз с тегом `desktop`, а Mobile action — draft-релиз с тегом `mobile`. Версия указывается в названии релиза и берется отдельно из manifest соответствующей платформы. Эти теги указывают на последний релиз своей платформы; старые versioned-теги сохраняются как история. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
 
 Для мобильного тестового релиза выбери `platform: android`, `profile: preview` и `submit: false`. APK появится во вкладке Assets draft-релиза. Для Google Play выбери `profile: production` и включи `submit` — этот вариант выпускает AAB.
 
