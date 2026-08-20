@@ -4,10 +4,11 @@ import { MessengerView } from "./views/messenger-view";
 import { readTabState, writeTabState } from "./lib/app-state";
 import { EMPTY_MESSAGES } from "./lib/empty-messages";
 import { clearMessageCache, MESSAGE_CACHE_KEY_PREFIX, readMessageCache, readMessageCacheAsync, writeMessageCache } from "./lib/message-cache";
-import { createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type DeviceHistoryEntry, type RemoteMessage, type RemoteReadReceipt, type SearchUser } from "./lib/enter-api";
+import { acknowledgeMessage, createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type DeviceHistoryEntry, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse } from "./lib/enter-api";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./lib/e2e";
 import { formatMessageTime, makeId } from "./lib/utils";
 import { migrateLocalServerAddress } from "./lib/server-address";
+import { createRealtimeQueue, createSyncQueue } from "./lib/sync-queue";
 import type { Conversation, Message, OutboxEntry, Profile } from "./types";
 
 const LEGACY_OUTBOX_KEY = "enter-outbox";
@@ -98,7 +99,8 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
     author: remote.author,
     text: payload.text,
     editOf: payload.editOf,
-    time: formatMessageTime(new Date(remote.envelope.created_at)),
+    time: formatMessageTime(new Date(remote.createdAt)),
+    stackId: remote.stackId,
     envelope: remote.envelope,
   };
 }
@@ -120,7 +122,7 @@ function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array
     const existingIndex = existing.findIndex((item) => item.id === message.id);
     if (existingIndex >= 0) {
       const replaced = [...existing];
-      replaced[existingIndex] = { ...replaced[existingIndex], ...message, readAt: message.readAt ?? replaced[existingIndex].readAt };
+      replaced[existingIndex] = { ...replaced[existingIndex], ...message, readAt: message.readAt ?? replaced[existingIndex].readAt, deliveredAt: message.deliveredAt ?? replaced[existingIndex].deliveredAt };
       next[conversationId] = replaced;
     } else {
       next[conversationId] = [...existing, message];
@@ -136,6 +138,15 @@ function mergeReadReceipts(current: Record<string, Message[]>, receipts: RemoteR
   return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
     const readAt = readAtByMessage.get(message.id);
     return readAt && (!message.readAt || readAt > message.readAt) ? { ...message, readAt } : message;
+  })]));
+}
+
+function mergeDeliveryReceipts(current: Record<string, Message[]>, receipts: RemoteDeliveryReceipt[]) {
+  if (receipts.length === 0) return current;
+  const deliveredAtByMessage = new Map(receipts.map((receipt) => [receipt.messageId, receipt.deliveredAt]));
+  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
+    const deliveredAt = deliveredAtByMessage.get(message.id);
+    return deliveredAt && (!message.deliveredAt || deliveredAt > message.deliveredAt) ? { ...message, deliveredAt } : message;
   })]));
 }
 
@@ -342,7 +353,6 @@ export default function App() {
     if (!activeProfile || showAuth) return;
     setSyncConnected(false);
     let cancelled = false;
-    let syncing = false;
     let cursor = syncCursorsRef.current[activeProfile.id] ?? 0;
     let ownBundle: PublicDeviceKey | null = null;
     let ownAccount: PublicAccountKey | null = null;
@@ -473,46 +483,65 @@ export default function App() {
       }
     }
 
-    async function syncOnce() {
-      if (cancelled || syncing) return;
-      syncing = true;
+    const knownConversationIds = new Set(conversations.map((conversation) => conversation.id));
+    const seenMessageIds = new Set(Object.values(messagesByProfileRef.current[profile.id] ?? EMPTY_MESSAGES).flat().map((message) => message.id));
+    let retryRealtime: () => void | Promise<void> = () => undefined;
+    const advanceCursor = (nextCursor: number) => {
+      if (nextCursor <= cursor) return;
+      cursor = nextCursor;
+      syncCursorsRef.current[profile.id] = nextCursor;
+      setSyncCursors((current) => ({ ...current, [profile.id]: Math.max(current[profile.id] ?? 0, nextCursor) }));
+    };
+
+    async function applySyncResult(result: SyncResponse) {
+      if (cancelled) return false;
+      setSyncConnected(true);
+      result.conversations.forEach((conversation) => knownConversationIds.add(conversation.id));
+      setConversations((current) => result.conversations.map((remote) => {
+        const mapped = mapRemoteConversation(remote);
+        const local = current.find((conversation) => conversation.id === mapped.id);
+        return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted, folder: local.folder } : mapped;
+      }));
+      if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+      const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
+      const deviceMessages = result.messages.filter((message) => ownKeyIds.has(message.envelope.key_id));
+      const decryptedMessages = (await Promise.all(deviceMessages.map(async (message) => {
+        try {
+          const senderDevices = await senderDevicesFor(message.envelope.sender);
+          return { conversationId: message.conversationId, message: await decryptRemoteMessage(profile, message, senderDevices) };
+        } catch {
+          return null;
+        }
+      }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
+      const decryptFailures = deviceMessages.length - decryptedMessages.length;
+      if (cancelled) return false;
+      const acknowledged = [...new Set(decryptedMessages
+        .filter(({ message }) => message.author === "them")
+        .map(({ message }) => message.id))];
+      try {
+        await Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId)));
+      } catch {
+        if (!cancelled) setMessageError("Не удалось подтвердить получение сообщения. Синхронизация повторится.");
+        return false;
+      }
+      decryptedMessages.forEach(({ message }) => seenMessageIds.add(message.id));
+      setMessagesByProfile((current) => {
+        const existing = current[profile.id] ?? EMPTY_MESSAGES;
+        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decryptedMessages), result.readReceipts), result.deliveryReceipts) };
+      });
+      if (decryptFailures === 0) advanceCursor(Math.max(cursor, result.nextCursor));
+      setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
+      void backfillHistoryToAccount();
+      void backfillHistoryToDevices();
+      void retryOutboxForProfile(profile.id);
+      return decryptFailures === 0;
+    }
+
+    const syncOnce = createSyncQueue(async () => {
+      if (cancelled) return;
       try {
         cursor = Math.max(cursor, syncCursorsRef.current[profile.id] ?? 0);
-        const result = await syncProfile(profile, cursor);
-        if (cancelled) return;
-        setSyncConnected(true);
-        setConversations((current) => result.conversations.map((remote) => {
-          const mapped = mapRemoteConversation(remote);
-          const local = current.find((conversation) => conversation.id === mapped.id);
-          return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted, folder: local.folder } : mapped;
-        }));
-        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return;
-        const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
-        const deviceMessages = result.messages.filter((message) => ownKeyIds.has(message.envelope.key_id));
-        const decryptedMessages = (await Promise.all(deviceMessages.map(async (message) => {
-          try {
-            const senderDevices = await senderDevicesFor(message.envelope.sender);
-            return { conversationId: message.conversationId, message: await decryptRemoteMessage(profile, message, senderDevices) };
-          } catch {
-            return null;
-          }
-        }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
-        const decryptFailures = deviceMessages.length - decryptedMessages.length;
-        if (cancelled) return;
-        setMessagesByProfile((current) => {
-          const existing = current[profile.id] ?? EMPTY_MESSAGES;
-          return { ...current, [profile.id]: mergeReadReceipts(mergeRemoteMessages(existing, decryptedMessages), result.readReceipts) };
-        });
-        if (decryptFailures === 0) {
-          const nextCursor = Math.max(cursor, result.nextCursor);
-          cursor = nextCursor;
-          syncCursorsRef.current[profile.id] = nextCursor;
-          setSyncCursors((current) => ({ ...current, [profile.id]: Math.max(current[profile.id] ?? 0, nextCursor) }));
-        }
-        setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
-        void backfillHistoryToAccount();
-        void backfillHistoryToDevices();
-        void retryOutboxForProfile(profile.id);
+        await applySyncResult(await syncProfile(profile, cursor));
       } catch (reason) {
         if (cancelled) return;
         setSyncConnected(false);
@@ -521,10 +550,113 @@ export default function App() {
           setShowAuth(true);
         }
         // Cached messages remain available while the server is offline or the session expired.
-      } finally {
-        syncing = false;
       }
+      retryRealtime();
+    });
+
+    type DirectRealtimeEvent = Extract<RealtimeEvent, { cursor: number }>;
+    async function applyRealtimeEvent(event: DirectRealtimeEvent) {
+      if (event.type === "message") {
+        if (!knownConversationIds.has(event.message.conversationId)) {
+          const before = cursor;
+          await syncOnce();
+          return cursor > before;
+        }
+        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+        const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
+        if (!ownKeyIds.has(event.message.envelope.key_id)) return true;
+        try {
+          const message = await decryptRemoteMessage(profile, event.message, await senderDevicesFor(event.message.envelope.sender));
+          if (message.author === "them") {
+            try {
+              await acknowledgeMessage(profile, message.id);
+            } catch {
+              setMessageError("Не удалось подтвердить получение realtime-сообщения. Синхронизация повторится.");
+              return false;
+            }
+          }
+          const isNewMessage = !seenMessageIds.has(message.id);
+          seenMessageIds.add(message.id);
+          setMessagesByProfile((current) => {
+            const existing = current[profile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }]) };
+          });
+          if (isNewMessage && event.message.author === "them") {
+            setConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
+          }
+          setMessageError("");
+          return true;
+        } catch {
+          setMessageError("Не удалось расшифровать realtime-сообщение. Синхронизация повторится.");
+          return false;
+        }
+      }
+      setMessagesByProfile((current) => {
+        const existing = current[profile.id] ?? EMPTY_MESSAGES;
+        const messages = event.type === "readReceipt"
+          ? mergeReadReceipts(existing, [{ messageId: event.messageId, readAt: event.readAt }])
+          : mergeDeliveryReceipts(existing, [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
+        return { ...current, [profile.id]: messages };
+      });
+      return true;
     }
+
+    const realtimeQueue = createRealtimeQueue<DirectRealtimeEvent>(() => cursor, advanceCursor, applyRealtimeEvent, syncOnce);
+    retryRealtime = realtimeQueue.retry;
+    let realtimeSnapshot = Promise.resolve();
+
+    let realtime: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let fallbackInterval: number | null = null;
+    let reconnectDelay = 1000;
+
+    const startFallbackSync = () => {
+      if (fallbackInterval === null) fallbackInterval = window.setInterval(() => void syncOnce(), 500);
+    };
+    const stopFallbackSync = () => {
+      if (fallbackInterval !== null) {
+        window.clearInterval(fallbackInterval);
+        fallbackInterval = null;
+      }
+    };
+    const scheduleRealtimeReconnect = () => {
+      if (cancelled || reconnectTimer !== null) return;
+      const delay = reconnectDelay;
+      reconnectDelay = Math.min(30_000, reconnectDelay * 2);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connectRealtime();
+      }, delay);
+    };
+    const handleRealtimeClose = () => {
+      if (cancelled) return;
+      startFallbackSync();
+      scheduleRealtimeReconnect();
+    };
+    const connectRealtime = () => {
+      if (cancelled) return;
+      try {
+        realtime = openRealtime(profile, cursor, (event) => {
+          if (event.type === "ready") {
+            reconnectDelay = 1000;
+            stopFallbackSync();
+            setSyncConnected(true);
+          } else if (event.type === "sync") {
+            realtimeSnapshot = realtimeSnapshot.then(() => applySyncResult(event)).then(() => realtimeQueue.retry());
+          } else if (event.type === "message" || event.type === "readReceipt" || event.type === "deliveryReceipt") {
+            realtimeSnapshot = realtimeSnapshot.then(() => { realtimeQueue.enqueue(event); });
+          } else if (event.type === "presence") {
+            setConversations((current) => current.map((conversation) => conversation.id === event.conversationId
+              ? { ...conversation, online: event.online, lastSeenAt: event.lastSeenAt }
+              : conversation));
+          } else if (event.type === "error") {
+            realtime?.close();
+          }
+        }, handleRealtimeClose);
+      } catch {
+        handleRealtimeClose();
+      }
+    };
 
     void (async () => {
       try {
@@ -549,11 +681,18 @@ export default function App() {
         // Cached messages remain available while the server is offline or the session expired.
       }
     })();
-    const interval = window.setInterval(() => void syncOnce(), 3000);
+    connectRealtime();
     const wake = () => { if (document.visibilityState === "visible") void syncOnce(); };
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("focus", wake);
-    return () => { cancelled = true; window.clearInterval(interval); document.removeEventListener("visibilitychange", wake); window.removeEventListener("focus", wake); };
+    return () => {
+      cancelled = true;
+      realtime?.close();
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      stopFallbackSync();
+      document.removeEventListener("visibilitychange", wake);
+      window.removeEventListener("focus", wake);
+    };
   }, [activeProfileId, activeProfile?.token, showAuth]);
 
   async function addProfile(profile: Profile, password: string) {
@@ -606,7 +745,7 @@ export default function App() {
     if (!activeProfile) return;
     const requestId = ++searchRequestId.current;
     const query = rawQuery.trim();
-    if (!query.startsWith("@") || query === "@") {
+    if (!query || (query.includes("@") && !/^@[^@]+(?:@[^@]+)?$/.test(query))) {
       setSearchResult(null);
       setSearchError("");
       setSearchBusy(false);
@@ -702,20 +841,21 @@ export default function App() {
     }
     try {
       const { bundle, account } = await prepareProfile(profile);
-      const ownDevices = await allDeviceKeys(profile, bundle);
-      const recipientDevices = conversation.handle && conversation.handle !== "favorites"
-        ? await fetchPublicDeviceKeys(profile, conversation.handle)
-        : ownDevices;
-      const recipientAccount = conversation.handle && conversation.handle !== "favorites"
-        ? await fetchPublicAccountKey(profile, conversation.handle)
-        : account;
+      const isDirectConversation = Boolean(conversation.handle && conversation.handle !== "favorites");
+      const [ownDevices, fetchedRecipientDevices, fetchedRecipientAccount] = await Promise.all([
+        allDeviceKeys(profile, bundle),
+        isDirectConversation ? fetchPublicDeviceKeys(profile, conversation.handle!) : Promise.resolve<PublicDeviceKey[]>([]),
+        isDirectConversation ? fetchPublicAccountKey(profile, conversation.handle!) : Promise.resolve<PublicAccountKey | undefined>(undefined),
+      ]);
+      const recipientDevices = isDirectConversation ? fetchedRecipientDevices : ownDevices;
+      const recipientAccount = isDirectConversation ? fetchedRecipientAccount : account;
       const recipients = [recipientAccount, ...recipientDevices, ...ownDevices].filter((device): device is PublicDeviceKey | PublicAccountKey => Boolean(device)).filter((device, index, devices) => devices.findIndex((item) => item.keyId === device.keyId) === index);
       const envelopes = await Promise.all(recipients.map((recipient) => encryptMessage(profile, targetConversationId, message, recipient)));
       const localEnvelope = envelopes.find((envelope) => envelope.key_id === account?.keyId) ?? envelopes[0];
       const localMessage: Message = { ...message, envelope: localEnvelope, deliveryStatus: "pending" };
       updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, ...localMessage }));
-      await sendRemoteMessage(profile, targetConversationId, localMessage, envelopes);
-      updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: undefined }));
+      const sent = await sendRemoteMessage(profile, targetConversationId, localMessage, envelopes);
+      updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, ...localMessage, time: formatMessageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
       removeOutbox(profile.id, message.id);
       setMessageError("");
     } catch (reason) {

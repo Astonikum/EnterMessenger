@@ -22,6 +22,7 @@ pub struct DiscoveryDocument {
 pub struct DiscoveryEndpoints {
     pub keys: &'static str,
     pub federation_delivery: &'static str,
+    pub realtime: &'static str,
 }
 
 #[derive(Serialize)]
@@ -33,7 +34,7 @@ pub struct CryptoProfile {
     pub groups: &'static str,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EncryptedEnvelope {
     pub protocol: String,
     pub message_id: String,
@@ -106,10 +107,12 @@ pub fn discovery(
             "message-relay",
             "federation",
             "encrypted-messages",
+            "realtime",
         ],
         endpoints: DiscoveryEndpoints {
             keys: "/enter/v1/keys/{handle}",
             federation_delivery: "/enter/v1/federation/deliveries",
+            realtime: "/api/v1/realtime",
         },
         crypto: CryptoProfile {
             identity_signature: "ECDSA-P256-SHA256",

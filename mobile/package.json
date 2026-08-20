@@ -9,7 +9,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
-    "test:crypto": "node scripts/e2e-self-check.mjs"
+    "test:crypto": "node scripts/e2e-self-check.mjs",
+    "test:realtime": "node --experimental-strip-types --test ../test/realtime-lifecycle.test.mjs"
   },
   "dependencies": {
     "@expo-google-fonts/ibm-plex-sans": "^0.4.1",

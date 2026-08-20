@@ -19,6 +19,11 @@ type MessageListProps = {
 
 const AUTO_SCROLL_THRESHOLD = 32;
 
+function sameStack(left?: Message, right?: Message) {
+  if (!left || !right || left.author !== right.author) return false;
+  return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
+}
+
 // #preview MessageList {"messages":[{"id":"1","author":"them","text":"Привет!","time":"12:48"},{"id":"2","author":"me","text":"На связи.","time":"12:49"}]}
 export function MessageList({ messages, onReply = () => undefined, onEdit = () => undefined, onTogglePinned = () => undefined, onSave = () => undefined, onDelete = () => undefined, onReact = () => undefined, onForward = () => undefined, searching = false, readOnly = false }: MessageListProps) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -52,15 +57,15 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
       {!searching && messages.length === 0 ? <div className="chat-empty-state flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center"><div className="mb-0.5 flex size-16 items-center justify-center rounded-full bg-[#29224d]"><Icon name={readOnly ? "info" : "chat"} className="size-7 text-primary" /></div><h2 className="m-0 text-lg font-bold tracking-tight">Нет сообщений</h2><p className="m-0 text-sm leading-[1.3125rem] text-muted-foreground">{readOnly ? "Обновления появятся здесь." : "Начните общение"}</p></div> : messages.map((message, index) => {
         const previous = messages[index - 1];
         const next = messages[index + 1];
-        const sameAsPrevious = previous?.author === message.author && previous.time === message.time;
-        const sameAsNext = next?.author === message.author && next.time === message.time;
+        const sameAsPrevious = sameStack(previous, message);
+        const sameAsNext = sameStack(message, next);
         const bubblePosition = sameAsPrevious ? (sameAsNext ? "chat-bubble-middle" : "chat-bubble-bottom") : (sameAsNext ? "chat-bubble-top" : "chat-bubble-single");
 
         return (
           <div key={message.id} className={cn("chat-message", message.author === "me" ? "chat-message-out" : "chat-message-in", "flex", sameAsPrevious ? "" : "pt-2", message.author === "me" ? "justify-end" : "justify-start")}>
             <ContextMenu
               header={(close) => <div className="-mx-1.5 -mt-1.5 mb-1.5 flex items-center justify-between gap-0.5 rounded-t-xl bg-accent/70 px-2 py-1.5">{reactions.map((reaction) => <button key={reaction} type="button" className="grid size-7 place-items-center rounded-full text-base transition-transform hover:scale-125 hover:bg-background/30" title={`Реакция ${reaction}`} aria-label={`Реакция ${reaction}`} onClick={() => { onReact(message, reaction); close(); }}>{reaction}</button>)}</div>}
-              footer={<div className="-mx-1.5 -mb-1.5 mt-1.5 flex items-center gap-1.5 rounded-b-xl border-t border-border/70 px-3 py-2 text-[0.6875rem] text-muted-foreground"><Icon name={message.deliveryStatus ? "schedule" : message.author === "me" && message.readAt ? "done_all" : "check"} className="size-3.5" />{message.deliveryStatus === "pending" ? "отправляется" : message.deliveryStatus === "failed" ? "не отправлено · повторю" : message.author === "me" ? (message.readAt ? "прочитано" : "доставлено") : "доставлено"}</div>}
+              footer={<div className="-mx-1.5 -mb-1.5 mt-1.5 flex items-center gap-1.5 rounded-b-xl border-t border-border/70 px-3 py-2 text-[0.6875rem] text-muted-foreground"><Icon name={message.deliveryStatus ? "schedule" : message.author === "me" && (message.readAt || message.deliveredAt) ? "done_all" : "check"} className="size-3.5" />{message.deliveryStatus === "pending" ? "отправляется" : message.deliveryStatus === "failed" ? "не отправлено · повторю" : message.author === "me" ? (message.readAt ? "прочитано" : message.deliveredAt ? "доставлено" : "отправлено") : "доставлено"}</div>}
               items={[
                 { label: "Ответить", icon: <Icon name="reply" className="size-4" />, onSelect: () => onReply(message) },
                 { label: "Изменить", icon: <Icon name="edit" className="size-4" />, disabled: message.author !== "me", onSelect: () => onEdit(message) },
@@ -82,7 +87,7 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
                 {message.reaction && <span className="mt-1 inline-flex rounded-full bg-background/25 px-1.5 py-0.5 text-sm">{message.reaction}</span>}
                 {!sameAsNext && <div className={cn("mt-1 flex items-center justify-end gap-1 text-[0.625rem]", message.author === "me" ? "text-primary-foreground/65" : "text-muted-foreground")}>
                   {message.time}
-                  {message.author === "me" && (message.deliveryStatus ? <span title={message.deliveryStatus === "failed" ? "Не отправлено, будет повтор" : "Отправляется"}>{message.deliveryStatus === "failed" ? "!" : "…"}</span> : <span title={message.readAt ? "Прочитано" : "Доставлено"}><Icon name={message.readAt ? "done_all" : "check"} className="size-3" /></span>)}
+                  {message.author === "me" && (message.deliveryStatus ? <span title={message.deliveryStatus === "failed" ? "Не отправлено, будет повтор" : "Отправляется"}>{message.deliveryStatus === "failed" ? "!" : "…"}</span> : <span title={message.readAt ? "Прочитано" : message.deliveredAt ? "Доставлено" : "Отправлено"}><Icon name={message.readAt || message.deliveredAt ? "done_all" : "check"} className="size-3" /></span>)}
                   {message.edited && <span>изменено</span>}
                 </div>}
               </div>

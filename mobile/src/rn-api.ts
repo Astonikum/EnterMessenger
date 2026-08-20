@@ -40,11 +40,23 @@ export type RemoteMessage = {
   conversationId: string;
   author: "me" | "them";
   createdAt: number;
+  stackId: string;
   envelope: EncryptedEnvelope;
 };
 
 export type RemoteReadReceipt = { messageId: string; readAt: number };
-export type SyncResponse = { nextCursor: number; conversations: RemoteConversation[]; messages: RemoteMessage[]; readReceipts: RemoteReadReceipt[] };
+export type RemoteDeliveryReceipt = { messageId: string; deliveredAt: number };
+export type SyncResponse = { nextCursor: number; conversations: RemoteConversation[]; messages: RemoteMessage[]; readReceipts: RemoteReadReceipt[]; deliveryReceipts: RemoteDeliveryReceipt[] };
+
+export type RealtimeEvent =
+  | { type: "ready"; version: number }
+  | ({ type: "sync" } & SyncResponse)
+  | { type: "message"; cursor: number; message: RemoteMessage }
+  | { type: "readReceipt"; cursor: number; messageId: string; readAt: number }
+  | { type: "deliveryReceipt"; cursor: number; messageId: string; deliveredAt: number }
+  | { type: "presence"; conversationId: string; online: boolean; lastSeenAt: number }
+  | { type: "pong" }
+  | { type: "error"; code: string };
 export type DeviceHistoryEntry = { conversationId: string; messageId: string; sourceKeyId?: string; envelope: EncryptedEnvelope };
 
 type PublicKeyDirectoryResponse = { id: string; handle: string; name: string; server: string; serverId?: string; devices: DeviceKeyBundle[]; accountKey?: { keyId: string; encryptionPublicKey: string } };
@@ -81,9 +93,29 @@ export async function syncProfile(profile: Profile, since: number) {
   return readJson<SyncResponse>(response);
 }
 
+export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
+  const websocket = new WebSocket(`${profile.server.replace(/^http/, "ws").replace(/\/+$/, "")}/api/v1/realtime`);
+  websocket.onopen = () => websocket.send(JSON.stringify({ type: "hello", version: 1, token: profile.token, since: Math.max(0, since) }));
+  websocket.onmessage = (event) => {
+    try {
+      const value = JSON.parse(String(event.data)) as { type?: unknown };
+      if (typeof value.type === "string") onEvent(value as RealtimeEvent);
+    } catch {
+      // Ignore malformed frames; the next snapshot repairs state.
+    }
+  };
+  websocket.onclose = onClose;
+  return websocket;
+}
+
 export async function markConversationRead(profile: Profile, conversationId: string) {
   const response = await request(apiUrl(profile, `/api/v1/conversations/${encodeURIComponent(conversationId)}/read`), { method: "POST", headers: headers(profile) });
   return readJson<{ readAt: number }>(response);
+}
+
+export async function acknowledgeMessage(profile: Profile, messageId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/messages/${encodeURIComponent(messageId)}/delivered`), { method: "POST", headers: headers(profile) });
+  return readJson<{ deliveredAt: number }>(response);
 }
 
 export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundle, accountKey?: { keyId: string; encryptionPublicKey: string }) {
@@ -112,10 +144,14 @@ export async function fetchPublicAccountKey(profile: Profile, rawAddress: string
 }
 
 export async function searchUser(profile: Profile, rawQuery: string): Promise<SearchUser> {
-  const address = parseEnterAddress(rawQuery, profile.server);
-  if (!address) throw new Error("Введите @username или @username@server");
-  const server = resolveDirectoryServer(address.server, profile.server);
-  const response = await request(`${server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
+  const raw = rawQuery.trim();
+  const address = raw.startsWith("@") || raw.includes("@") ? parseEnterAddress(raw, profile.server) : null;
+  const query = raw.replace(/^@+/, "");
+  if (!address && (!query || query.includes("@"))) throw new Error("Введите username или @username@server");
+  const server = address ? resolveDirectoryServer(address.server, profile.server) : profile.server;
+  const response = address
+    ? await request(`${server}/enter/v1/keys/${encodeURIComponent(address.handle)}`)
+    : await request(`${server}/enter/v1/keys/search?q=${encodeURIComponent(query)}`);
   const directory = await readJson<PublicKeyDirectoryResponse>(response);
   const directoryServer = resolveDirectoryServer(directory.server || server, server);
   return { id: directory.id, address: formatEnterAddress({ handle: directory.handle, server: directoryServer }), handle: directory.handle, name: directory.name, server: directoryServer, serverId: directory.serverId, avatar: directory.handle, deviceCount: directory.devices.length };
@@ -142,5 +178,5 @@ export function mapRemoteConversation(remote: RemoteConversation): Conversation 
 }
 
 export function mapRemoteMessage(remote: RemoteMessage): Message {
-  return { id: remote.envelope.message_id, author: remote.author, text: "", time: formatMessageTime(new Date(remote.createdAt)), envelope: remote.envelope };
+  return { id: remote.envelope.message_id, author: remote.author, text: "", time: formatMessageTime(new Date(remote.createdAt)), stackId: remote.stackId, envelope: remote.envelope };
 }

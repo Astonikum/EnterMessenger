@@ -36,12 +36,14 @@ export type Message = {
   author: "me" | "them";
   text: string;
   time: string;
+  stackId?: string;
   replyTo?: { id: string; text: string };
   editOf?: string;
   reaction?: string;
   pinned?: boolean;
   edited?: boolean;
   readAt?: number;
+  deliveredAt?: number;
   deliveryStatus?: "pending" | "failed";
   envelope?: import("./protocol").EncryptedEnvelope;
 };

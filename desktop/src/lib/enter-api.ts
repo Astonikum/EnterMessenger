@@ -26,6 +26,7 @@ export type RemoteMessage = {
   conversationId: string;
   author: "me" | "them";
   createdAt: number;
+  stackId: string;
   envelope: EncryptedEnvelope;
 };
 
@@ -34,12 +35,28 @@ export type RemoteReadReceipt = {
   readAt: number;
 };
 
-type SyncResponse = {
+export type RemoteDeliveryReceipt = {
+  messageId: string;
+  deliveredAt: number;
+};
+
+export type SyncResponse = {
   nextCursor: number;
   conversations: RemoteConversation[];
   messages: RemoteMessage[];
   readReceipts: RemoteReadReceipt[];
+  deliveryReceipts: RemoteDeliveryReceipt[];
 };
+
+export type RealtimeEvent =
+  | { type: "ready"; version: number }
+  | ({ type: "sync" } & SyncResponse)
+  | { type: "message"; cursor: number; message: RemoteMessage }
+  | { type: "readReceipt"; cursor: number; messageId: string; readAt: number }
+  | { type: "deliveryReceipt"; cursor: number; messageId: string; deliveredAt: number }
+  | { type: "presence"; conversationId: string; online: boolean; lastSeenAt: number }
+  | { type: "pong" }
+  | { type: "error"; code: string };
 
 type SendMessageResponse = {
   nextCursor: number;
@@ -105,7 +122,22 @@ export async function syncProfile(profile: Profile, since: number): Promise<Sync
     headers: headers(profile),
   });
   const result = await readJson<SyncResponse>(response);
-  return { ...result, readReceipts: result.readReceipts ?? [] };
+  return { ...result, readReceipts: result.readReceipts ?? [], deliveryReceipts: result.deliveryReceipts ?? [] };
+}
+
+export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
+  const websocket = new WebSocket(`${profile.server.replace(/^http/, "ws").replace(/\/+$/, "")}/api/v1/realtime`);
+  websocket.onopen = () => websocket.send(JSON.stringify({ type: "hello", version: 1, token: profile.token, since: Math.max(0, since) }));
+  websocket.onmessage = (event) => {
+    try {
+      const value = JSON.parse(String(event.data)) as { type?: unknown };
+      if (typeof value.type === "string") onEvent(value as RealtimeEvent);
+    } catch {
+      // Ignore malformed frames; the next snapshot repairs state.
+    }
+  };
+  websocket.onclose = onClose;
+  return websocket;
 }
 
 export async function markConversationRead(profile: Profile, conversationId: string) {
@@ -114,6 +146,14 @@ export async function markConversationRead(profile: Profile, conversationId: str
     headers: headers(profile),
   });
   return readJson<{ readAt: number }>(response);
+}
+
+export async function acknowledgeMessage(profile: Profile, messageId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/messages/${encodeURIComponent(messageId)}/delivered`), {
+    method: "POST",
+    headers: headers(profile),
+  });
+  return readJson<{ deliveredAt: number }>(response);
 }
 
 export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundle, accountKey?: { keyId: string; encryptionPublicKey: string }) {
@@ -147,11 +187,15 @@ export async function fetchPublicAccountKey(profile: Profile, rawAddress: string
 }
 
 export async function searchUser(profile: Profile, rawQuery: string): Promise<SearchUser> {
-  const address = parseEnterAddress(rawQuery, profile.server);
-  if (!address) throw new Error("Введите @username или @username@server");
-  const response = await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
+  const raw = rawQuery.trim();
+  const address = raw.startsWith("@") || raw.includes("@") ? parseEnterAddress(raw, profile.server) : null;
+  const query = raw.replace(/^@+/, "");
+  if (!address && (!query || query.includes("@"))) throw new Error("Введите username или @username@server");
+  const response = address
+    ? await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`)
+    : await request(`${apiUrl(profile, "/enter/v1/keys/search")}?q=${encodeURIComponent(query)}`);
   const directory = await readJson<PublicKeyDirectoryResponse>(response);
-  const server = directory.server || address.server;
+  const server = directory.server || address?.server || profile.server;
   return {
     id: directory.id,
     address: formatEnterAddress({ handle: directory.handle, server }),
@@ -225,6 +269,7 @@ export function mapRemoteMessage(remote: RemoteMessage): Message {
     author: remote.author,
     text: "",
     time: formatMessageTime(new Date(remote.createdAt)),
+    stackId: remote.stackId,
     envelope: remote.envelope,
   };
 }

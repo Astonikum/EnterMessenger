@@ -20,9 +20,11 @@ import { ProfileSheet } from "./src/components/ProfileSheet";
 import { SettingsScreen } from "./src/components/SettingsScreen";
 import { EMPTY_MESSAGES, makeId, messageTime } from "./src/data";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./src/rn-e2e";
-import { createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type RemoteMessage } from "./src/rn-api";
+import { acknowledgeMessage, createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type SyncResponse } from "./src/rn-api";
 import { colors, fonts } from "./src/theme";
 import { migrateLocalServerAddress } from "./src/rn-address";
+import { createRealtimeQueue, createSyncQueue } from "./src/sync-queue";
+import { createRealtimeLifecycle } from "./src/realtime-lifecycle";
 import type { Conversation, Message, OutboxEntry, Profile, SearchUser } from "./src/types";
 
 const PROFILES_KEY = "enter-profiles";
@@ -86,7 +88,7 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
   const sender = senderDevices.find((device) => device.deviceId === remote.envelope.sender_device);
   if (!sender) throw new Error("Ключ устройства отправителя не найден");
   const payload = decodeMessagePayload(await decryptMessage(profile, remote.envelope, sender));
-  return { id: remote.envelope.message_id, author: remote.author, text: payload.text, editOf: payload.editOf, time: messageTime(new Date(remote.envelope.created_at)), envelope: remote.envelope };
+  return { id: remote.envelope.message_id, author: remote.author, text: payload.text, editOf: payload.editOf, time: messageTime(new Date(remote.createdAt)), stackId: remote.stackId, envelope: remote.envelope };
 }
 
 function resolveMessageEdits(messages: Message[]) {
@@ -105,7 +107,7 @@ function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array
     const existing = next[conversationId] ?? [];
     const index = existing.findIndex((item) => item.id === message.id);
     if (index < 0) next[conversationId] = [...existing, message];
-    else { const replaced = [...existing]; replaced[index] = { ...replaced[index], ...message, readAt: message.readAt ?? replaced[index].readAt }; next[conversationId] = replaced; }
+    else { const replaced = [...existing]; replaced[index] = { ...replaced[index], ...message, readAt: message.readAt ?? replaced[index].readAt, deliveredAt: message.deliveredAt ?? replaced[index].deliveredAt }; next[conversationId] = replaced; }
     next[conversationId] = resolveMessageEdits(next[conversationId]);
   });
   return next;
@@ -117,6 +119,15 @@ function mergeReadReceipts(current: Record<string, Message[]>, receipts: Array<{
   return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
     const readAt = reads.get(message.id);
     return readAt && (!message.readAt || readAt > message.readAt) ? { ...message, readAt } : message;
+  })]));
+}
+
+function mergeDeliveryReceipts(current: Record<string, Message[]>, receipts: RemoteDeliveryReceipt[]) {
+  if (receipts.length === 0) return current;
+  const deliveredAtByMessage = new Map(receipts.map((receipt) => [receipt.messageId, receipt.deliveredAt]));
+  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
+    const deliveredAt = deliveredAtByMessage.get(message.id);
+    return deliveredAt && (!message.deliveredAt || deliveredAt > message.deliveredAt) ? { ...message, deliveredAt } : message;
   })]));
 }
 
@@ -253,7 +264,7 @@ export default function App() {
   useEffect(() => {
     if (!activeProfile || showAuth) { setSyncConnected(false); return; }
     let cancelled = false;
-    let syncing = false;
+    let appActive = AppState.currentState === null || AppState.currentState === "active";
     let cursor = syncCursorsRef.current[activeProfile.id] ?? 0;
     const cachedMessages = messagesByProfileRef.current[activeProfile.id] ?? EMPTY_MESSAGES;
     const hasCachedMessages = Object.values(cachedMessages).some((items) => items.length > 0);
@@ -362,67 +373,230 @@ export default function App() {
       }
     }
 
-    async function syncOnce() {
-      if (cancelled || syncing) return;
-      syncing = true;
+    const knownConversationIds = new Set(conversations.map((conversation) => conversation.id));
+    const seenMessageIds = new Set(Object.values(messagesByProfileRef.current[profile.id] ?? EMPTY_MESSAGES).flat().map((message) => message.id));
+    let retryRealtime: () => void | Promise<void> = () => undefined;
+    const advanceCursor = (nextCursor: number) => {
+      if (nextCursor <= cursor) return;
+      cursor = nextCursor;
+      syncCursorsRef.current[profile.id] = nextCursor;
+      setSyncCursors((current) => ({ ...current, [profile.id]: Math.max(current[profile.id] ?? 0, nextCursor) }));
+    };
+
+    async function applySyncResult(result: SyncResponse) {
+      if (cancelled || !appActive) return false;
+      setSyncConnected(true);
+      result.conversations.forEach((conversation) => knownConversationIds.add(conversation.id));
+      updateConversations((current) => {
+        const currentById = new Map(current.map((conversation) => [conversation.id, conversation]));
+        const currentOrder = current.map((conversation) => conversation.id);
+        return result.conversations.map((remote) => {
+          const mapped = mapRemoteConversation(remote);
+          const local = currentById.get(mapped.id);
+          return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted, folder: local.folder } : mapped;
+        }).sort((left, right) => {
+          const leftIndex = currentOrder.indexOf(left.id);
+          const rightIndex = currentOrder.indexOf(right.id);
+          if (leftIndex < 0) return rightIndex < 0 ? 0 : 1;
+          if (rightIndex < 0) return -1;
+          return leftIndex - rightIndex;
+        });
+      });
+      if (!(await ensureOwnBundle()) || cancelled || !appActive || !ownBundle) return false;
+      const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
+      const deviceMessages = result.messages.filter((remote) => ownKeyIds.has(remote.envelope.key_id));
+      const decrypted = (await Promise.all(deviceMessages.map(async (remote) => {
+        try { return { conversationId: remote.conversationId, message: await decryptRemoteMessage(profile, remote, await senderDevicesFor(remote.envelope.sender)) }; }
+        catch { return null; }
+      }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
+      const decryptFailures = deviceMessages.length - decrypted.length;
+      if (cancelled || !appActive) return false;
+      const acknowledged = [...new Set(decrypted
+        .filter(({ message }) => message.author === "them")
+        .map(({ message }) => message.id))];
+      try {
+        await Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId)));
+      } catch {
+        if (!cancelled && appActive) setMessageError("Не удалось подтвердить получение сообщения. Синхронизация повторится.");
+        return false;
+      }
+      if (cancelled || !appActive) return false;
+      decrypted.forEach(({ message }) => seenMessageIds.add(message.id));
+      setMessagesByProfile((current) => {
+        const existing = current[profile.id] ?? EMPTY_MESSAGES;
+        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
+      });
+      if (decryptFailures === 0) advanceCursor(Math.max(cursor, result.nextCursor));
+      setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
+      void backfillHistoryToAccount();
+      void backfillHistoryToDevices();
+      void retryOutboxForProfile(profile.id);
+      return decryptFailures === 0;
+    }
+
+    const syncOnce = createSyncQueue(async () => {
+      if (cancelled || !appActive) return;
       try {
         cursor = Math.max(cursor, syncCursorsRef.current[profile.id] ?? 0);
-        const result = await syncProfile(profile, cursor);
-        if (cancelled) return;
-        setSyncConnected(true);
-        updateConversations((current) => {
-          const currentById = new Map(current.map((conversation) => [conversation.id, conversation]));
-          const currentOrder = current.map((conversation) => conversation.id);
-          return result.conversations.map((remote) => {
-            const mapped = mapRemoteConversation(remote);
-            const local = currentById.get(mapped.id);
-            return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted, folder: local.folder } : mapped;
-          }).sort((left, right) => {
-            const leftIndex = currentOrder.indexOf(left.id);
-            const rightIndex = currentOrder.indexOf(right.id);
-            if (leftIndex < 0) return rightIndex < 0 ? 0 : 1;
-            if (rightIndex < 0) return -1;
-            return leftIndex - rightIndex;
-          });
-        });
-        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return;
-        const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
-        const deviceMessages = result.messages.filter((remote) => ownKeyIds.has(remote.envelope.key_id));
-        const decrypted = (await Promise.all(deviceMessages.map(async (remote) => {
-          try { return { conversationId: remote.conversationId, message: await decryptRemoteMessage(profile, remote, await senderDevicesFor(remote.envelope.sender)) }; }
-          catch { return null; }
-        }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
-        const decryptFailures = deviceMessages.length - decrypted.length;
-        if (cancelled) return;
-        setMessagesByProfile((current) => {
-          const existing = current[profile.id] ?? EMPTY_MESSAGES;
-          return { ...current, [profile.id]: mergeReadReceipts(mergeRemoteMessages(existing, decrypted), result.readReceipts ?? []) };
-        });
-        if (decryptFailures === 0) {
-          const nextCursor = Math.max(cursor, result.nextCursor);
-          cursor = nextCursor;
-          syncCursorsRef.current[profile.id] = nextCursor;
-          setSyncCursors((current) => ({ ...current, [profile.id]: Math.max(current[profile.id] ?? 0, nextCursor) }));
-        }
-        setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
-        void backfillHistoryToAccount();
-        void backfillHistoryToDevices();
-        void retryOutboxForProfile(profile.id);
+        await applySyncResult(await syncProfile(profile, cursor));
       } catch (reason) {
-        if (cancelled) return;
+        if (cancelled || !appActive) return;
         setSyncConnected(false);
         if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); }
         else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу");
-      } finally { syncing = false; }
+      }
+      if (appActive) retryRealtime();
+    });
+
+    type DirectRealtimeEvent = Extract<RealtimeEvent, { cursor: number }>;
+    async function applyRealtimeEvent(event: DirectRealtimeEvent) {
+      if (cancelled || !appActive) return false;
+      if (event.type === "message") {
+        if (!knownConversationIds.has(event.message.conversationId)) {
+          const before = cursor;
+          await syncOnce();
+          return cursor > before;
+        }
+        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+        const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
+        if (!ownKeyIds.has(event.message.envelope.key_id)) return true;
+        try {
+          const message = await decryptRemoteMessage(profile, event.message, await senderDevicesFor(event.message.envelope.sender));
+          if (message.author === "them") {
+            try {
+              await acknowledgeMessage(profile, message.id);
+            } catch {
+              setMessageError("Не удалось подтвердить получение realtime-сообщения. Синхронизация повторится.");
+              return false;
+            }
+          }
+          const isNewMessage = !seenMessageIds.has(message.id);
+          seenMessageIds.add(message.id);
+          setMessagesByProfile((current) => {
+            const existing = current[profile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }]) };
+          });
+          if (isNewMessage && event.message.author === "them") {
+            updateConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
+          }
+          setMessageError("");
+          return true;
+        } catch {
+          setMessageError("Не удалось расшифровать realtime-сообщение. Синхронизация повторится.");
+          return false;
+        }
+      }
+      setMessagesByProfile((current) => {
+        const existing = current[profile.id] ?? EMPTY_MESSAGES;
+        const messages = event.type === "readReceipt"
+          ? mergeReadReceipts(existing, [{ messageId: event.messageId, readAt: event.readAt }])
+          : mergeDeliveryReceipts(existing, [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
+        return { ...current, [profile.id]: messages };
+      });
+      return true;
     }
 
-    void (async () => {
+    const realtimeQueue = createRealtimeQueue<DirectRealtimeEvent>(() => cursor, advanceCursor, applyRealtimeEvent, syncOnce);
+    retryRealtime = realtimeQueue.retry;
+    let realtimeSnapshot = Promise.resolve();
+
+    let realtime: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let fallbackInterval: ReturnType<typeof setInterval> | null = null;
+    let reconnectDelay = 1000;
+
+    const startFallbackSync = () => {
+      if (!appActive || fallbackInterval !== null) return;
+      fallbackInterval = setInterval(() => { if (appActive) void syncOnce(); }, 500);
+    };
+    const stopFallbackSync = () => {
+      if (fallbackInterval !== null) {
+        clearInterval(fallbackInterval);
+        fallbackInterval = null;
+      }
+    };
+    const scheduleRealtimeReconnect = () => {
+      if (cancelled || !appActive || reconnectTimer !== null) return;
+      const delay = reconnectDelay;
+      reconnectDelay = Math.min(30_000, reconnectDelay * 2);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (appActive) connectRealtime();
+      }, delay);
+    };
+    const handleRealtimeClose = () => {
+      if (cancelled || !appActive) return;
+      startFallbackSync();
+      scheduleRealtimeReconnect();
+    };
+    const connectRealtime = () => {
+      if (cancelled || !appActive || realtime !== null) return;
+      let socket: WebSocket | null = null;
+      try {
+        socket = openRealtime(profile, cursor, (event) => {
+          if (cancelled || !appActive || realtime !== socket) return;
+          if (event.type === "ready") {
+            reconnectDelay = 1000;
+            stopFallbackSync();
+            setSyncConnected(true);
+          } else if (event.type === "sync") {
+            realtimeSnapshot = realtimeSnapshot.then(() => applySyncResult(event)).then(() => realtimeQueue.retry());
+          } else if (event.type === "message" || event.type === "readReceipt" || event.type === "deliveryReceipt") {
+            realtimeSnapshot = realtimeSnapshot.then(() => { realtimeQueue.enqueue(event); });
+          } else if (event.type === "presence") {
+            updateConversations((current) => current.map((conversation) => conversation.id === event.conversationId
+              ? { ...conversation, online: event.online, lastSeenAt: event.lastSeenAt }
+              : conversation));
+          } else if (event.type === "error") {
+            socket?.close();
+          }
+        }, () => {
+          if (realtime !== socket) return;
+          realtime = null;
+          handleRealtimeClose();
+        });
+        realtime = socket;
+      } catch {
+        handleRealtimeClose();
+      }
+    };
+
+    const syncInForeground = () => void (async () => {
       try { await syncOnce(); }
-      catch (reason) { if (!cancelled) { setSyncConnected(false); if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); } else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу"); } }
+      catch (reason) { if (!cancelled && appActive) { setSyncConnected(false); if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); } else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу"); } }
     })();
-    const interval = setInterval(() => void syncOnce(), 3000);
-    const appState = AppState.addEventListener("change", (state) => { if (state === "active") void syncOnce(); });
-    return () => { cancelled = true; clearInterval(interval); appState.remove(); };
+
+    const suspendRealtime = () => {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      stopFallbackSync();
+      const socket = realtime;
+      realtime = null;
+      socket?.close();
+      setSyncConnected(false);
+    };
+    // A future APNs/FCM wake-up can reuse syncInForeground(); no push transport is installed here.
+    const lifecycle = createRealtimeLifecycle(AppState.currentState, {
+      onActive: () => {
+        appActive = true;
+        reconnectDelay = 1000;
+        syncInForeground();
+        connectRealtime();
+      },
+      onInactive: () => {
+        appActive = false;
+        suspendRealtime();
+      },
+    });
+    const appState = AppState.addEventListener("change", lifecycle.change);
+    lifecycle.start();
+    return () => {
+      cancelled = true;
+      lifecycle.stop();
+      appState.remove();
+    };
   }, [activeProfileId, activeProfile?.token, showAuth]);
 
   function updateConversations(update: (current: Conversation[]) => Conversation[]) {
@@ -435,7 +609,7 @@ export default function App() {
 
   useEffect(() => {
     const value = query.trim();
-    if (!activeProfile || !value.startsWith("@") || value === "@") { setSearchUserResult(null); setSearchError(""); setSearchBusy(false); return; }
+    if (!activeProfile || !value || (value.includes("@") && !/^@[^@]+(?:@[^@]+)?$/.test(value))) { setSearchUserResult(null); setSearchError(""); setSearchBusy(false); return; }
     const requestId = ++searchRequestId.current;
     const timeout = setTimeout(async () => {
       setSearchBusy(true); setSearchError("");
@@ -552,16 +726,21 @@ export default function App() {
     }
     try {
        const { bundle, account } = await prepareProfile(activeProfile);
-      const ownDevices = await allDeviceKeys(activeProfile, bundle);
-      const recipientDevices = conversation.handle && conversation.handle !== "favorites" ? await fetchPublicDeviceKeys(activeProfile, conversation.handle) : ownDevices;
-       const recipientAccount = conversation.handle && conversation.handle !== "favorites" ? await fetchPublicAccountKey(activeProfile, conversation.handle) : account;
+      const isDirectConversation = Boolean(conversation.handle && conversation.handle !== "favorites");
+      const [ownDevices, fetchedRecipientDevices, fetchedRecipientAccount] = await Promise.all([
+        allDeviceKeys(activeProfile, bundle),
+        isDirectConversation ? fetchPublicDeviceKeys(activeProfile, conversation.handle!) : Promise.resolve<PublicDeviceKey[]>([]),
+        isDirectConversation ? fetchPublicAccountKey(activeProfile, conversation.handle!) : Promise.resolve<PublicAccountKey | undefined>(undefined),
+      ]);
+      const recipientDevices = isDirectConversation ? fetchedRecipientDevices : ownDevices;
+      const recipientAccount = isDirectConversation ? fetchedRecipientAccount : account;
        const recipients = [recipientAccount, ...recipientDevices, ...ownDevices].filter((device): device is PublicDeviceKey | PublicAccountKey => Boolean(device)).filter((device, index, devices) => devices.findIndex((item) => item.keyId === device.keyId) === index);
       const envelopes = await Promise.all(recipients.map((recipient) => encryptMessage(activeProfile, targetConversationId, message, recipient)));
        const localEnvelope = envelopes.find((envelope) => envelope.key_id === account?.keyId) ?? envelopes[0];
        const localMessage = { ...message, envelope: localEnvelope, deliveryStatus: "pending" } satisfies Message;
       updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, ...localMessage }));
-      await sendRemoteMessage(activeProfile, targetConversationId, localMessage, envelopes);
-      updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: undefined }));
+      const sent = await sendRemoteMessage(activeProfile, targetConversationId, localMessage, envelopes);
+      updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, ...localMessage, time: messageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
       removeOutbox(message.id);
     } catch (reason) {
       updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "failed" }));

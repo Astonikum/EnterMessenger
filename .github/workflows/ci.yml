@@ -71,6 +71,10 @@ jobs:
         working-directory: mobile
         run: npm run test:crypto
 
+      - name: Realtime lifecycle check
+        working-directory: mobile
+        run: npm run test:realtime
+
       - name: Export web bundle
         working-directory: mobile
         run: npx expo export --platform web

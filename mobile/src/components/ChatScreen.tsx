@@ -27,6 +27,11 @@ type Props = {
   onCancelContext: () => void;
 };
 
+function sameStack(left?: Message, right?: Message) {
+  if (!left || !right || left.author !== right.author) return false;
+  return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
+}
+
 export function ChatScreen({ conversation, messages, error = "", replyTo, editingMessage, onBack, onSend, onReply, onStartEdit, onEdit, onPin, onSave, onDelete, onReact, onForward, onCancelContext }: Props) {
   const [text, setText] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -86,8 +91,8 @@ export function ChatScreen({ conversation, messages, error = "", replyTo, editin
 }
 
 function MessageBubble({ message, previous, next, selected = false, onToggleSelection, onReply, onStartEdit, onPin, onSave, onDelete, onReact, onForward }: { message: Message; previous?: Message; next?: Message; selected?: boolean; onToggleSelection: () => void; onReply: (message: Message) => void; onStartEdit: (message: Message) => void; onPin: (message: Message) => void; onSave: (message: Message) => void; onDelete: (message: Message) => void; onReact: (message: Message, reaction: string) => void; onForward: (message: Message) => void }) {
-  const samePrevious = previous?.author === message.author && previous.time === message.time;
-  const sameNext = next?.author === message.author && next.time === message.time;
+  const samePrevious = sameStack(previous, message);
+  const sameNext = sameStack(message, next);
   const bubblePosition = samePrevious
     ? sameNext
       ? (message.author === "me" ? styles.groupMiddleOut : styles.groupMiddleIn)
@@ -114,7 +119,7 @@ function MessageBubble({ message, previous, next, selected = false, onToggleSele
 
   return <Animated.View {...swipeResponder.panHandlers} style={[styles.messageLine, message.author === "me" ? styles.outgoing : styles.incoming, !samePrevious ? styles.messageGap : styles.groupGap, { transform: [{ translateX: swipeX }] }]}><Animated.View pointerEvents="none" style={[styles.swipeReply, { opacity: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.15, 1] }), transform: [{ scale: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.7, 1] }) }] }]}><Icon name="reply" size={14} color={colors.primary} /></Animated.View><Pressable onLongPress={() => setActionsVisible(true)} delayLongPress={260} style={[styles.bubble, message.author === "me" ? styles.outBubble : styles.inBubble, bubblePosition, message.pinned && styles.pinned, selected && styles.selected]}>
     {message.replyTo && <View style={styles.replyQuote}><Text style={styles.replyQuoteLabel}>Ответ</Text><Text style={styles.replyQuoteText} numberOfLines={1}>{message.replyTo.text}</Text></View>}
-    <Text style={[styles.messageText, message.author === "me" ? styles.outMessageText : styles.inMessageText]}>{message.text}</Text>{message.reaction && <Text style={styles.reaction}>{message.reaction}</Text>}{!sameNext && <View style={styles.messageMeta}><Text style={message.author === "me" ? styles.outMeta : styles.inMeta}>{message.time}{message.edited ? " · изменено" : ""}{message.deliveryStatus === "pending" ? " · отправляется" : message.deliveryStatus === "failed" ? " · не отправлено" : ""}</Text>{message.author === "me" && message.deliveryStatus === undefined && <Icon name={message.readAt ? "checkAll" : "check"} size={13} color="#d9d1ff" />}</View>}
+    <Text style={[styles.messageText, message.author === "me" ? styles.outMessageText : styles.inMessageText]}>{message.text}</Text>{message.reaction && <Text style={styles.reaction}>{message.reaction}</Text>}{!sameNext && <View style={styles.messageMeta}><Text style={message.author === "me" ? styles.outMeta : styles.inMeta}>{message.time}{message.edited ? " · изменено" : ""}{message.deliveryStatus === "pending" ? " · отправляется" : message.deliveryStatus === "failed" ? " · не отправлено" : ""}</Text>{message.author === "me" && message.deliveryStatus === undefined && <Icon name={message.readAt || message.deliveredAt ? "checkAll" : "check"} size={13} color="#d9d1ff" />}</View>}
   </Pressable><Modal visible={actionsVisible} transparent animationType="slide" onRequestClose={() => setActionsVisible(false)}><SafeAreaSheet onClose={() => setActionsVisible(false)} sheetStyle={styles.actionSheet}><View style={styles.handle} /><Text style={styles.actionTitle}>Сообщение</Text><ScrollView bounces={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.reactionList}>{reactions.map((reaction) => <Pressable key={reaction} style={styles.reactionButton} onPress={() => run(() => onReact(message, reaction))}><Text style={styles.reactionButtonText}>{reaction}</Text></Pressable>)}</ScrollView><View style={styles.actionList}><ActionRow icon="reply" label="Ответить" onPress={() => run(() => onReply(message))} />{message.author === "me" && <ActionRow icon="edit" label="Изменить" onPress={() => run(() => onStartEdit(message))} />}<ActionRow icon="pin" label={message.pinned ? "Открепить" : "Закрепить"} onPress={() => run(() => onPin(message))} /><ActionRow icon="bookmark" label="Сохранить в Избранное" onPress={() => run(() => onSave(message))} /><ActionRow icon="copy" label="Копировать текст" onPress={() => run(() => void Clipboard.setStringAsync(message.text))} /><ActionRow icon="forward" label="Переслать" onPress={() => run(() => onForward(message))} /><ActionRow icon="share" label="Поделиться" onPress={() => run(() => void Share.share({ message: message.text }))} /><ActionRow icon="delete" label="Удалить" destructive onPress={() => run(() => onDelete(message))} /><ActionRow icon="checkCircle" label={selected ? "Снять выделение" : "Выделить"} onPress={() => run(onToggleSelection)} /></View></SafeAreaSheet></Modal></Animated.View>;
 }
 

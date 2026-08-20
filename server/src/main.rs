@@ -3,14 +3,29 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::Response,
+    extract::{
+        ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use tokio::{
+    sync::{broadcast, RwLock},
+    time::{timeout, Duration},
+};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
@@ -23,6 +38,93 @@ struct AppState {
     db: storage::Storage,
     config: config::ServerConfig,
     server_id: String,
+    realtime: RealtimeHub,
+}
+
+#[derive(Clone, Default)]
+struct RealtimeHub {
+    channels: Arc<RwLock<HashMap<String, broadcast::Sender<RealtimeEvent>>>>,
+    presence_sessions: Arc<RwLock<HashMap<String, usize>>>,
+    metrics: Arc<RealtimeMetrics>,
+}
+
+impl RealtimeHub {
+    async fn subscribe(&self, account_id: &str) -> broadcast::Receiver<RealtimeEvent> {
+        let mut channels = self.channels.write().await;
+        channels
+            .entry(account_id.to_owned())
+            .or_insert_with(|| broadcast::channel(256).0)
+            .subscribe()
+    }
+
+    async fn publish(&self, account_id: &str, event: RealtimeEvent) {
+        let channels = self.channels.read().await;
+        if let Some(channel) = channels.get(account_id) {
+            let _ = channel.send(event);
+        }
+    }
+
+    async fn unsubscribe(&self, account_id: &str) {
+        let mut channels = self.channels.write().await;
+        if channels
+            .get(account_id)
+            .is_some_and(|channel| channel.receiver_count() == 0)
+        {
+            channels.remove(account_id);
+        }
+    }
+
+    async fn try_connect(&self, account_id: &str) -> Result<bool, ()> {
+        let mut sessions = self.presence_sessions.write().await;
+        let active = self.metrics.active_connections.load(Ordering::Relaxed);
+        let account_count = sessions.get(account_id).copied().unwrap_or(0);
+        if active >= REALTIME_MAX_CONNECTIONS
+            || account_count >= REALTIME_MAX_CONNECTIONS_PER_ACCOUNT
+        {
+            self.metrics
+                .rejected_connections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        }
+        let count = sessions.entry(account_id.to_owned()).or_insert(0);
+        *count += 1;
+        self.metrics
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .accepted_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(*count == 1)
+    }
+
+    async fn presence_disconnected(&self, account_id: &str) -> bool {
+        let mut sessions = self.presence_sessions.write().await;
+        let Some(count) = sessions.get_mut(account_id) else {
+            return false;
+        };
+        self.metrics
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .closed_connections
+            .fetch_add(1, Ordering::Relaxed);
+        if *count > 1 {
+            *count -= 1;
+            return false;
+        }
+        sessions.remove(account_id);
+        true
+    }
+
+    fn metrics(&self) -> RealtimeMetricsResponse {
+        RealtimeMetricsResponse {
+            active_connections: self.metrics.active_connections.load(Ordering::Relaxed),
+            accepted_connections: self.metrics.accepted_connections.load(Ordering::Relaxed),
+            rejected_connections: self.metrics.rejected_connections.load(Ordering::Relaxed),
+            closed_connections: self.metrics.closed_connections.load(Ordering::Relaxed),
+            lagged_snapshots: self.metrics.lagged_snapshots.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -35,6 +137,7 @@ struct Health {
     #[serde(rename = "serverId")]
     server_id: String,
     logo: Option<String>,
+    realtime: RealtimeMetricsResponse,
 }
 
 #[derive(Serialize)]
@@ -64,7 +167,7 @@ struct AuthResponse {
     profile: AuthProfile,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversationResponse {
     id: String,
@@ -83,30 +186,85 @@ struct ConversationResponse {
     unread: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MessageResponse {
     id: String,
     conversation_id: String,
     author: String,
     created_at: i64,
+    stack_id: String,
     envelope: protocol::EncryptedEnvelope,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SyncResponse {
     next_cursor: i64,
     conversations: Vec<ConversationResponse>,
     messages: Vec<MessageResponse>,
     read_receipts: Vec<ReadReceiptResponse>,
+    delivery_receipts: Vec<DeliveryReceiptResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadReceiptResponse {
     message_id: String,
     read_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryReceiptResponse {
+    message_id: String,
+    delivered_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum RealtimeEvent {
+    Message {
+        cursor: i64,
+        message: MessageResponse,
+    },
+    ReadReceipt {
+        cursor: i64,
+        #[serde(rename = "messageId")]
+        message_id: String,
+        #[serde(rename = "readAt")]
+        read_at: i64,
+    },
+    DeliveryReceipt {
+        cursor: i64,
+        #[serde(rename = "messageId")]
+        message_id: String,
+        #[serde(rename = "deliveredAt")]
+        delivered_at: i64,
+    },
+    Presence {
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+        online: bool,
+        #[serde(rename = "lastSeenAt")]
+        last_seen_at: i64,
+    },
+}
+
+#[derive(Deserialize)]
+struct RealtimeHello {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u8,
+    token: String,
+    since: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RealtimeClientMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    since: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -115,9 +273,20 @@ struct MarkReadResponse {
     read_at: i64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryAckResponse {
+    delivered_at: i64,
+}
+
 #[derive(Deserialize)]
 struct SyncQuery {
     since: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct SearchQuery {
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +354,31 @@ struct ErrorResponse {
 }
 
 const PRESENCE_TIMEOUT_MS: i64 = 30_000;
+const REALTIME_PROTOCOL_VERSION: u8 = 1;
+const REALTIME_MAX_FRAME_BYTES: usize = 64 * 1024;
+const REALTIME_MAX_CONNECTIONS: usize = 256;
+const REALTIME_MAX_CONNECTIONS_PER_ACCOUNT: usize = 4;
+const REALTIME_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const REALTIME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct RealtimeMetrics {
+    active_connections: AtomicUsize,
+    accepted_connections: AtomicUsize,
+    rejected_connections: AtomicUsize,
+    closed_connections: AtomicUsize,
+    lagged_snapshots: AtomicUsize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeMetricsResponse {
+    active_connections: usize,
+    accepted_connections: usize,
+    rejected_connections: usize,
+    closed_connections: usize,
+    lagged_snapshots: usize,
+}
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
@@ -194,6 +388,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         server_name: state.config.name.clone(),
         server_id: state.server_id.clone(),
         logo: state.config.logo(),
+        realtime: state.realtime.metrics(),
     })
 }
 
@@ -340,6 +535,7 @@ async fn deliver_local_message(
     sender_account_id: &str,
     envelope: &protocol::EncryptedEnvelope,
     envelope_json: &str,
+    created_at: i64,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let Some((recipient_handle, recipient_server)) = enter_address_parts(&envelope.recipient)
     else {
@@ -370,7 +566,7 @@ async fn deliver_local_message(
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     let delivery_id = format!("{}:{}", envelope.message_id, envelope.key_id);
-    state
+    let delivered = state
         .db
         .deliver_message(
             &recipient.id,
@@ -383,10 +579,20 @@ async fn deliver_local_message(
             sender_handle,
             &delivery_id,
             envelope_json,
-            storage::now_ms(),
+            created_at,
         )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(message) = delivered {
+        if let Some(event) = state
+            .db
+            .event_for_message(&recipient.id, &message.id)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        {
+            publish_stored_event(state, event).await;
+        }
+    }
     Ok(())
 }
 
@@ -529,34 +735,100 @@ fn message_response(value: storage::StoredMessage) -> Result<MessageResponse, se
         conversation_id: value.conversation_id,
         author: value.author,
         created_at: value.created_at,
+        stack_id: value.stack_id,
         envelope: serde_json::from_str(&value.envelope_json)?,
     })
 }
 
-async fn sync(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<SyncQuery>,
-) -> Result<Json<SyncResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let account_id = bearer_account_id(&state, &headers).await?;
+fn realtime_event(value: storage::StoredEvent) -> Option<RealtimeEvent> {
+    match value {
+        storage::StoredEvent::Message {
+            cursor, message, ..
+        } => Some(RealtimeEvent::Message {
+            cursor,
+            message: message_response(message).ok()?,
+        }),
+        storage::StoredEvent::ReadReceipt {
+            cursor,
+            message_id,
+            read_at,
+            ..
+        } => Some(RealtimeEvent::ReadReceipt {
+            cursor,
+            message_id,
+            read_at,
+        }),
+        storage::StoredEvent::DeliveryReceipt {
+            cursor,
+            message_id,
+            delivered_at,
+            ..
+        } => Some(RealtimeEvent::DeliveryReceipt {
+            cursor,
+            message_id,
+            delivered_at,
+        }),
+    }
+}
+
+async fn publish_stored_event(state: &AppState, event: storage::StoredEvent) {
+    let account_id = event.account_id().to_owned();
+    if let Some(event) = realtime_event(event) {
+        state.realtime.publish(&account_id, event).await;
+    }
+}
+
+async fn publish_presence(state: &AppState, account_id: &str, online: bool, last_seen_at: i64) {
+    let Ok(watchers) = state.db.presence_watchers(account_id).await else {
+        return;
+    };
+    for watcher in watchers {
+        state
+            .realtime
+            .publish(
+                &watcher.owner_account_id,
+                RealtimeEvent::Presence {
+                    conversation_id: watcher.conversation_id,
+                    online,
+                    last_seen_at,
+                },
+            )
+            .await;
+    }
+}
+
+async fn disconnect_presence(state: &AppState, account_id: &str) {
+    if !state.realtime.presence_disconnected(account_id).await {
+        return;
+    }
+    let now = storage::now_ms();
+    let _ = state.db.touch_presence(account_id, now).await;
+    publish_presence(state, account_id, false, now).await;
+}
+
+async fn sync_payload(
+    state: &AppState,
+    account_id: &str,
+    since: i64,
+) -> Result<SyncResponse, &'static str> {
     let now = storage::now_ms();
     state
         .db
-        .touch_presence(&account_id, now)
+        .touch_presence(account_id, now)
         .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+        .map_err(|_| "storage_failed")?;
     let snapshot = state
         .db
-        .sync(&account_id, query.since.unwrap_or(0).max(0))
+        .sync(account_id, since.max(0))
         .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+        .map_err(|_| "storage_failed")?;
     let messages = snapshot
         .messages
         .into_iter()
         .map(message_response)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_envelope"))?;
-    Ok(Json(SyncResponse {
+        .map_err(|_| "invalid_stored_envelope")?;
+    Ok(SyncResponse {
         next_cursor: snapshot.cursor,
         conversations: snapshot
             .conversations
@@ -579,7 +851,269 @@ async fn sync(
                 read_at: receipt.read_at,
             })
             .collect(),
-    }))
+        delivery_receipts: snapshot
+            .delivery_receipts
+            .into_iter()
+            .map(|receipt| DeliveryReceiptResponse {
+                message_id: receipt.message_id,
+                delivered_at: receipt.delivered_at,
+            })
+            .collect(),
+    })
+}
+
+async fn send_realtime_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    account_id: &str,
+    since: i64,
+) -> bool {
+    let Ok(snapshot) = sync_payload(state, account_id, since).await else {
+        return false;
+    };
+    let Ok(mut payload) = serde_json::to_value(snapshot) else {
+        return false;
+    };
+    payload["type"] = serde_json::Value::String("sync".to_owned());
+    send_realtime_payload(socket, payload.to_string()).await
+}
+
+async fn send_realtime_event(socket: &mut WebSocket, event: RealtimeEvent) -> bool {
+    let Ok(payload) = serde_json::to_string(&event) else {
+        return false;
+    };
+    send_realtime_payload(socket, payload).await
+}
+
+async fn send_realtime_payload(socket: &mut WebSocket, payload: String) -> bool {
+    timeout(REALTIME_SEND_TIMEOUT, socket.send(WsMessage::Text(payload)))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+async fn close_realtime(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let _ = timeout(
+        REALTIME_SEND_TIMEOUT,
+        socket.send(WsMessage::Close(Some(CloseFrame {
+            code,
+            reason: Cow::Borrowed(reason),
+        }))),
+    )
+    .await;
+}
+
+fn realtime_error_payload(error_code: &'static str) -> String {
+    serde_json::json!({ "type": "error", "code": error_code }).to_string()
+}
+
+async fn fail_realtime(socket: &mut WebSocket, error_code: &'static str, close_code: u16) {
+    if send_realtime_payload(socket, realtime_error_payload(error_code)).await {
+        close_realtime(socket, close_code, error_code).await;
+    }
+}
+
+fn realtime_hello_error(hello: &RealtimeHello) -> Option<&'static str> {
+    (hello.kind != "hello"
+        || hello.version != REALTIME_PROTOCOL_VERSION
+        || hello.token.trim().is_empty())
+    .then_some("unsupported_protocol")
+}
+
+fn origin(value: &str) -> Option<String> {
+    let uri = value.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = uri.authority()?.as_str().to_ascii_lowercase();
+    (!authority.is_empty() && !authority.contains('@')).then(|| format!("{scheme}://{authority}"))
+}
+
+fn parse_request_origin(value: &str) -> Option<String> {
+    let uri = value.parse::<Uri>().ok()?;
+    if (!uri.path().is_empty() && uri.path() != "/") || uri.query().is_some() {
+        return None;
+    }
+    origin(value)
+}
+
+fn is_embedded_app_origin(value: &str) -> bool {
+    matches!(
+        value,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    )
+}
+
+fn realtime_origin_allowed(headers: &HeaderMap, public_url: &str) -> bool {
+    let Some(request_origin) = headers.get(header::ORIGIN) else {
+        // Native clients do not send Origin. Browser clients must send the configured origin.
+        return true;
+    };
+    let Some(request_origin) = request_origin.to_str().ok() else {
+        return false;
+    };
+    if is_embedded_app_origin(request_origin) {
+        return true;
+    }
+    let Some(request_origin) = parse_request_origin(request_origin) else {
+        return false;
+    };
+    origin(public_url).is_some_and(|expected| expected == request_origin)
+}
+
+async fn realtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if !realtime_origin_allowed(&headers, &state.config.public_url) {
+        return Err(error(StatusCode::FORBIDDEN, "origin_not_allowed"));
+    }
+    Ok(websocket
+        .max_frame_size(REALTIME_MAX_FRAME_BYTES)
+        .max_message_size(REALTIME_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| realtime_session(socket, state))
+        .into_response())
+}
+
+async fn realtime_session(mut socket: WebSocket, state: AppState) {
+    let hello_text = match timeout(REALTIME_HELLO_TIMEOUT, socket.recv()).await {
+        Err(_) => {
+            fail_realtime(&mut socket, "hello_timeout", 1002).await;
+            return;
+        }
+        Ok(Some(Ok(WsMessage::Text(text)))) if text.len() <= REALTIME_MAX_FRAME_BYTES => text,
+        Ok(Some(Ok(WsMessage::Text(_)))) => {
+            fail_realtime(&mut socket, "frame_too_large", 1009).await;
+            return;
+        }
+        Ok(Some(Ok(_))) => {
+            fail_realtime(&mut socket, "invalid_hello", 1002).await;
+            return;
+        }
+        Ok(Some(Err(_))) | Ok(None) => return,
+    };
+    let Ok(hello) = serde_json::from_str::<RealtimeHello>(&hello_text) else {
+        fail_realtime(&mut socket, "invalid_hello", 1002).await;
+        return;
+    };
+    if let Some(error_code) = realtime_hello_error(&hello) {
+        fail_realtime(&mut socket, error_code, 1002).await;
+        return;
+    }
+    let Ok(Some(account_id)) = state.db.account_id_for_session(&hello.token).await else {
+        fail_realtime(&mut socket, "unauthorized", 1008).await;
+        return;
+    };
+    let first_presence_session = match state.realtime.try_connect(&account_id).await {
+        Ok(first) => first,
+        Err(()) => {
+            fail_realtime(&mut socket, "too_many_connections", 1013).await;
+            return;
+        }
+    };
+    let mut events = state.realtime.subscribe(&account_id).await;
+    if !send_realtime_payload(
+        &mut socket,
+        serde_json::json!({ "type": "ready", "version": REALTIME_PROTOCOL_VERSION }).to_string(),
+    )
+    .await
+    {
+        disconnect_presence(&state, &account_id).await;
+        return;
+    }
+    if !send_realtime_snapshot(&mut socket, &state, &account_id, hello.since.unwrap_or(0)).await {
+        disconnect_presence(&state, &account_id).await;
+        return;
+    }
+    if first_presence_session {
+        publish_presence(&state, &account_id, true, storage::now_ms()).await;
+    }
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if state.db.touch_presence(&account_id, storage::now_ms()).await.is_err() {
+                    break;
+                }
+                if timeout(
+                    REALTIME_SEND_TIMEOUT,
+                    socket.send(WsMessage::Ping(Vec::new())),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if text.len() > REALTIME_MAX_FRAME_BYTES {
+                            fail_realtime(&mut socket, "frame_too_large", 1009).await;
+                            break;
+                        }
+                        let Ok(command) = serde_json::from_str::<RealtimeClientMessage>(&text) else {
+                            fail_realtime(&mut socket, "invalid_command", 1002).await;
+                            break;
+                        };
+                        match command.kind.as_str() {
+                            "ping" => {
+                                if !send_realtime_payload(&mut socket, serde_json::json!({ "type": "pong" }).to_string()).await { break; }
+                            }
+                            "sync" => {
+                                if !send_realtime_snapshot(&mut socket, &state, &account_id, command.since.unwrap_or(0)).await { break; }
+                            }
+                            _ => {
+                                fail_realtime(&mut socket, "unsupported_command", 1002).await;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if !timeout(REALTIME_SEND_TIMEOUT, socket.send(WsMessage::Pong(payload)))
+                            .await
+                            .is_ok_and(|result| result.is_ok()) { break; }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(WsMessage::Binary(_))) => {
+                        fail_realtime(&mut socket, "unsupported_frame", 1003).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if !send_realtime_event(&mut socket, event).await { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        state.realtime.metrics.lagged_snapshots.fetch_add(1, Ordering::Relaxed);
+                        let cursor = state.db.cursor(&account_id).await.unwrap_or(0);
+                        if !send_realtime_snapshot(&mut socket, &state, &account_id, cursor.saturating_sub(256)).await { break; }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    drop(events);
+    disconnect_presence(&state, &account_id).await;
+    state.realtime.unsubscribe(&account_id).await;
+}
+
+async fn sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Result<Json<SyncResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    sync_payload(&state, &account_id, query.since.unwrap_or(0))
+        .await
+        .map(Json)
+        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))
 }
 
 async fn mark_conversation_read(
@@ -589,20 +1123,50 @@ async fn mark_conversation_read(
 ) -> Result<Json<MarkReadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
     let read_at = storage::now_ms();
-    let marked = state
+    let message_ids = state
         .db
         .mark_conversation_read(&account_id, conversation_id.trim(), read_at)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
-    if !marked {
+    let Some(message_ids) = message_ids else {
         return Err(error(StatusCode::NOT_FOUND, "conversation_not_found"));
-    }
+    };
     state
         .db
         .touch_presence(&account_id, read_at)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    for event in message_ids {
+        publish_stored_event(&state, event).await;
+    }
     Ok(Json(MarkReadResponse { read_at }))
+}
+
+async fn mark_message_delivered(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DeliveryAckResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let delivered_at = storage::now_ms();
+    let event = state
+        .db
+        .mark_message_delivered(message_id.trim(), &account_id, delivered_at)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(event) = event {
+        publish_stored_event(&state, event).await;
+        return Ok(Json(DeliveryAckResponse { delivered_at }));
+    }
+
+    let already_delivered = state
+        .db
+        .delivery_receipt(message_id.trim(), &account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    already_delivered
+        .map(|delivered_at| Json(DeliveryAckResponse { delivered_at }))
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "message_not_found"))
 }
 
 async fn send_message(
@@ -654,6 +1218,7 @@ async fn send_message(
     }
     let primary_json = serde_json::to_string(primary)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
+    let created_at = storage::now_ms();
     let message = state
         .db
         .insert_message(
@@ -661,7 +1226,7 @@ async fn send_message(
             conversation_id,
             client_message_id,
             &primary_json,
-            storage::now_ms(),
+            created_at,
         )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
@@ -680,16 +1245,24 @@ async fn send_message(
                 conversation_id,
                 &copy_id,
                 &envelope_json,
-                storage::now_ms(),
+                created_at,
             )
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
             .ok_or_else(|| error(StatusCode::NOT_FOUND, "conversation_not_found"))?;
     }
+    if let Some(event) = state
+        .db
+        .event_for_message(&account_id, &message.id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        publish_stored_event(&state, event).await;
+    }
     for envelope in &envelopes {
         let envelope_json = serde_json::to_string(envelope)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
-        deliver_local_message(&state, &account_id, envelope, &envelope_json).await?;
+        deliver_local_message(&state, &account_id, envelope, &envelope_json, created_at).await?;
     }
     let cursor = state
         .db
@@ -774,7 +1347,12 @@ async fn device_history(
 
 #[cfg(test)]
 mod tests {
-    use super::{conversation_response, enter_address_parts, normalize_server, same_server};
+    use super::{
+        conversation_response, enter_address_parts, is_embedded_app_origin, normalize_server,
+        origin, realtime_error_payload, realtime_hello_error, realtime_origin_allowed, same_server,
+        RealtimeEvent, RealtimeHello, RealtimeHub, REALTIME_PROTOCOL_VERSION,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn local_server_aliases_match() {
@@ -819,6 +1397,106 @@ mod tests {
         );
         assert!(response.online);
         assert_eq!(response.last_seen_at, Some(99_500));
+    }
+
+    #[test]
+    fn realtime_receipt_events_keep_wire_names() {
+        let value = serde_json::to_value(RealtimeEvent::ReadReceipt {
+            cursor: 2,
+            message_id: "message-1".to_owned(),
+            read_at: 42,
+        })
+        .expect("serialize realtime event");
+        assert_eq!(value["type"], "readReceipt");
+        assert_eq!(value["messageId"], "message-1");
+        assert_eq!(value["readAt"], 42);
+    }
+
+    #[test]
+    fn realtime_presence_events_keep_wire_names() {
+        let value = serde_json::to_value(RealtimeEvent::Presence {
+            conversation_id: "conversation-1".to_owned(),
+            online: false,
+            last_seen_at: 42,
+        })
+        .expect("serialize realtime presence event");
+        assert_eq!(value["type"], "presence");
+        assert_eq!(value["conversationId"], "conversation-1");
+        assert_eq!(value["online"], false);
+        assert_eq!(value["lastSeenAt"], 42);
+    }
+
+    #[test]
+    fn realtime_origin_requires_the_configured_scheme_and_authority() {
+        assert_eq!(
+            origin("https://example.test/path"),
+            Some("https://example.test".to_owned())
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://example.test"));
+        assert!(realtime_origin_allowed(&headers, "https://example.test"));
+        headers.insert("origin", HeaderValue::from_static("http://example.test"));
+        assert!(!realtime_origin_allowed(&headers, "https://example.test"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://example.test/not-an-origin"),
+        );
+        assert!(!realtime_origin_allowed(&headers, "https://example.test"));
+        headers.insert("origin", HeaderValue::from_static("http://tauri.localhost"));
+        assert!(realtime_origin_allowed(&headers, "https://example.test"));
+        assert!(is_embedded_app_origin("tauri://localhost"));
+        assert!(!is_embedded_app_origin("https://evil.example"));
+        assert!(realtime_origin_allowed(
+            &HeaderMap::new(),
+            "https://example.test"
+        ));
+    }
+
+    #[test]
+    fn realtime_handshake_errors_are_stable_and_secret_free() {
+        let valid = RealtimeHello {
+            kind: "hello".to_owned(),
+            version: REALTIME_PROTOCOL_VERSION,
+            token: "opaque-token".to_owned(),
+            since: Some(7),
+        };
+        assert_eq!(realtime_hello_error(&valid), None);
+        assert_eq!(
+            realtime_hello_error(&RealtimeHello {
+                kind: "hello".to_owned(),
+                version: 99,
+                ..valid
+            }),
+            Some("unsupported_protocol")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&realtime_error_payload("unauthorized")).expect("error JSON");
+        assert_eq!(payload["type"], "error");
+        assert_eq!(payload["code"], "unauthorized");
+        assert!(payload.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn presence_stays_online_until_last_realtime_session_closes() {
+        let hub = RealtimeHub::default();
+        assert!(hub.try_connect("account-1").await.is_ok_and(|first| first));
+        assert!(hub.try_connect("account-1").await.is_ok_and(|first| !first));
+        assert!(!hub.presence_disconnected("account-1").await);
+        assert!(hub.presence_disconnected("account-1").await);
+        assert!(!hub.presence_disconnected("account-1").await);
+    }
+
+    #[tokio::test]
+    async fn realtime_limits_connections_per_account() {
+        let hub = RealtimeHub::default();
+        for _ in 0..4 {
+            assert!(hub.try_connect("account-1").await.is_ok());
+        }
+        assert!(hub.try_connect("account-1").await.is_err());
+        assert!(!hub.presence_disconnected("account-1").await);
+        assert!(!hub.presence_disconnected("account-1").await);
+        assert!(!hub.presence_disconnected("account-1").await);
+        assert!(hub.presence_disconnected("account-1").await);
     }
 }
 
@@ -920,19 +1598,26 @@ async fn register_device_key(
 async fn public_keys(
     State(state): State<AppState>,
     Path(handle): Path<String>,
+    Query(query): Query<SearchQuery>,
 ) -> Result<Json<protocol::PublicKeyDirectory>, (StatusCode, Json<ErrorResponse>)> {
-    let handle = handle.trim().trim_start_matches('@').to_lowercase();
-    if handle.is_empty() {
+    let requested_handle = handle.trim().trim_start_matches('@').to_lowercase();
+    let search_prefix = query
+        .q
+        .as_deref()
+        .map(|value| value.trim().trim_start_matches('@').to_lowercase())
+        .filter(|value| !value.is_empty());
+    if requested_handle.is_empty() && search_prefix.is_none() {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_handle"));
     }
-    let Some(account) = state
-        .db
-        .account_by_handle(&handle)
-        .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    let Some(account) = match search_prefix.as_deref() {
+        Some(prefix) => state.db.account_by_handle_prefix(prefix).await,
+        None => state.db.account_by_handle(&requested_handle).await,
+    }
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
     else {
         return Err(error(StatusCode::NOT_FOUND, "user_not_found"));
     };
+    let handle = account.handle;
     let keys = state
         .db
         .device_keys_for_handle(&handle)
@@ -986,6 +1671,7 @@ async fn main() {
         db: storage,
         config: config.clone(),
         server_id,
+        realtime: RealtimeHub::default(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -994,10 +1680,15 @@ async fn main() {
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/api/v1/sync", get(sync))
+        .route("/api/v1/realtime", get(realtime))
         .route("/api/v1/messages", post(send_message))
         .route(
             "/api/v1/conversations/:conversation_id/read",
             post(mark_conversation_read),
+        )
+        .route(
+            "/api/v1/messages/:message_id/delivered",
+            post(mark_message_delivered),
         )
         .route("/api/v1/device-history", post(device_history))
         .route("/api/v1/conversations", post(create_conversation))
