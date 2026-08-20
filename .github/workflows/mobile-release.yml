@@ -149,7 +149,7 @@ jobs:
               -f "tag_name=$tag" \
               -f "name=$title" \
               -f "body=$notes" \
-              -F draft=true \
+              -F draft=false \
               -F prerelease=false >/dev/null
           else
             release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
@@ -157,7 +157,7 @@ jobs:
               -f "target_commitish=$GITHUB_SHA" \
               -f "name=$title" \
               -f "body=$notes" \
-              -F draft=true \
+              -F draft=false \
               -F prerelease=false --jq .id)"
           fi
 
@@ -172,7 +172,7 @@ jobs:
           done <<< "$existing_assets"
 
           gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset_name" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset_name" \
             -H "Content-Type: application/octet-stream" \
             --input "$artifact_path" >/dev/null
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
