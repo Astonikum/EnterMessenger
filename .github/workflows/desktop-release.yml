@@ -26,9 +26,7 @@ jobs:
           tag="desktop-v$version"
           title="Enter Desktop v$version"
           notes="Desktop bundles built from the committed desktop version."
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id 2>/dev/null || true)"
-
-          if [[ -n "$release_id" ]]; then
+          if release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id 2>/dev/null)"; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
               -f "name=$title" \
               -f "body=$notes" \
