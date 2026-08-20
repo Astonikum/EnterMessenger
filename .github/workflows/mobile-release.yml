@@ -102,31 +102,14 @@ jobs:
           echo "path=release/$artifact_name" >> "$GITHUB_OUTPUT"
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update mobile draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Upload mobile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Enter-Mobile-v${{ steps.version.outputs.version }}-${{ steps.artifact.outputs.profile }}
+          path: mobile/${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+
+      - name: Add mobile artifact summary
         run: |
-          tag=mobile
-          title="Enter Mobile v${{ steps.version.outputs.version }}"
-          notes="Android ${{ steps.artifact.outputs.profile }} artifact created by EAS."
-
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$title" \
-              --notes "$notes"
-          else
-            gh release create "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "$title" \
-              --notes "$notes" \
-              --draft
-          fi
-
-          gh release upload "$tag" "${{ steps.artifact.outputs.path }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
           echo "### Mobile artifact" >> "$GITHUB_STEP_SUMMARY"
-          echo "[$(basename "${{ steps.artifact.outputs.path }}")](https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$(basename "${{ steps.artifact.outputs.path }}"))" >> "$GITHUB_STEP_SUMMARY"
+          echo "Uploaded Enter-Mobile-v${{ steps.version.outputs.version }}-${{ steps.artifact.outputs.profile }}." >> "$GITHUB_STEP_SUMMARY"
