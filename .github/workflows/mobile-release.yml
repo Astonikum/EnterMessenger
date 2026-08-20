@@ -133,13 +133,16 @@ jobs:
           fi
 
           query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){releases(first:100,orderBy:{field:CREATED_AT,direction:DESC}){nodes{databaseId,tagName,name,isDraft,isPrerelease}}}}'
-          repo_name="${GITHUB_REPOSITORY#*/}"
-          release_id="$(gh api graphql \
-            -F owner="$GITHUB_REPOSITORY_OWNER" \
-            -F name="$repo_name" \
+          release_rows="$(gh api graphql \
+            -F owner=Astonikum \
+            -F name=EnterMessenger \
             -f query="$query" \
-            --jq '.data.repository.releases.nodes[] | [.databaseId, .tagName, .name] | @tsv' | \
-            awk -F '\t' -v tag="$tag" -v title="$title" '$2 == tag || $3 == title {print $1; exit}')"
+            --jq '.data.repository.releases.nodes[] | [.databaseId, .tagName, .name] | @tsv')"
+          echo "Release lookup: $release_rows"
+          release_id="$(printf '%s\n' "$release_rows" | grep -F "$tag" | cut -f1 | head -n 1 || true)"
+          if [[ -z "$release_id" ]]; then
+            release_id="$(printf '%s\n' "$release_rows" | grep -F "$title" | cut -f1 | head -n 1 || true)"
+          fi
 
           if [[ -n "$release_id" ]]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
