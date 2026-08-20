@@ -13,7 +13,7 @@
 - desktop: `desktop/package.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/tauri.conf.json`;
 - mobile: `mobile/package.json`, `mobile/app.json`.
 
-Desktop action создает draft-релиз с тегом `desktop-v<version>`. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
+Desktop action создает draft-релиз с тегом `desktop-v<version>`, а Mobile action — draft-релиз с тегом `mobile-v<version>`. Версия берется отдельно из manifest соответствующей платформы. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
 
 ## Хранение данных
 

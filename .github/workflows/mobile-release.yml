@@ -16,7 +16,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   release:
@@ -58,6 +58,13 @@ jobs:
       - name: Crypto self-check
         run: npm run test:crypto
 
+      - name: Read mobile version
+        id: version
+        shell: bash
+        run: |
+          version="$(node -p "require('./app.json').expo.version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Build without submitting
         if: ${{ !inputs.submit }}
         run: eas build --platform "${{ inputs.platform }}" --profile production --non-interactive --no-wait
@@ -67,3 +74,15 @@ jobs:
         run: |
           eas build --platform android --profile production --non-interactive
           eas submit --platform android --profile production --latest --non-interactive
+
+      - name: Create mobile draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="mobile-v${{ steps.version.outputs.version }}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Enter Mobile v${{ steps.version.outputs.version }}" \
+            --notes "Android build created by EAS." \
+            --draft
