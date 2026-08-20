@@ -7,8 +7,46 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Prepare desktop draft release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate release token
+        shell: bash
+        run: test -n "$GH_TOKEN" || { echo "RELEASE_TOKEN is required"; exit 1; }
+
+      - name: Create or update desktop draft release
+        shell: bash
+        run: |
+          version="$(node -p "require('./desktop/package.json').version")"
+          tag="desktop-v$version"
+          title="Enter Desktop v$version"
+          notes="Desktop bundles built from the committed desktop version."
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id 2>/dev/null || true)"
+
+          if [[ -n "$release_id" ]]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f "name=$title" \
+              -f "body=$notes" \
+              -F draft=true \
+              -F prerelease=false
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f "tag_name=$tag" \
+              -f "target_commitish=$GITHUB_SHA" \
+              -f "name=$title" \
+              -f "body=$notes" \
+              -F draft=true \
+              -F prerelease=false
+          fi
+
   release:
     name: ${{ matrix.name }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +106,7 @@ jobs:
       - name: Build and publish desktop bundle
         uses: tauri-apps/tauri-action@v0.6.2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         with:
           projectPath: desktop
           tagName: desktop-v__VERSION__
