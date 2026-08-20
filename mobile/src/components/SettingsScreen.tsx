@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { colors, fonts, radii } from "../theme";
 import { Icon, type IconName } from "./Icon";
+import { readNotificationSettings, writeNotificationSettings, type NotificationSettings } from "../notifications";
 
 type CategoryId = "security" | "devices" | "notifications" | "storage" | "interface";
 type Category = { id: CategoryId; label: string; icon: IconName };
@@ -16,9 +17,18 @@ const categories: Category[] = [
 
 export function SettingsScreen({ onClose }: { onClose: () => void }) {
   const [category, setCategory] = useState<CategoryId | null>(null);
-  const [notifications, setNotifications] = useState({ desktop: true, sound: false, preview: true });
+  const [notifications, setNotifications] = useState<NotificationSettings>({ desktop: true, sound: false, preview: true });
+  const notificationSettingsLoaded = useRef(false);
   const [interfaceSettings, setInterfaceSettings] = useState({ animations: true, compact: false });
   const current = categories.find((item) => item.id === category);
+
+  useEffect(() => {
+    let mounted = true;
+    void readNotificationSettings().then((value) => { if (mounted) { setNotifications(value); notificationSettingsLoaded.current = true; } });
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => { if (notificationSettingsLoaded.current) void writeNotificationSettings(notifications); }, [notifications]);
 
   if (!current) return <View style={styles.root}><View style={styles.header}><Pressable onPress={onClose} style={styles.back}><Icon name="arrowBack" size={21} color={colors.foreground} /></Pressable><View><Text style={styles.headerTitle}>Настройки</Text><Text style={styles.headerSubtitle}>Приватность и внешний вид</Text></View></View><ScrollView bounces={false} contentContainerStyle={styles.categoryList} showsVerticalScrollIndicator={false}>{categories.map((item) => <Pressable key={item.id} onPress={() => setCategory(item.id)} style={({ pressed }) => [styles.category, pressed && styles.pressed]}><View style={styles.categoryIcon}><Icon name={item.icon} size={21} color={colors.primary} /></View><View style={styles.categoryCopy}><Text style={styles.categoryLabel}>{item.label}</Text><Text style={styles.categoryDescription}>{descriptionFor(item.id)}</Text></View><Icon name="arrowForward" size={19} color={colors.muted} /></Pressable>)}</ScrollView></View>;
 

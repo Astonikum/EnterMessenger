@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon } from "./ui/icon";
+import { readNotificationSettings, requestDesktopNotificationPermission, writeNotificationSettings, type NotificationSettings } from "../lib/notifications";
 
 type SettingsCategoryId = "security" | "devices" | "notifications" | "storage" | "interface";
 
@@ -64,9 +65,14 @@ function SettingsContent({ category, notifications, setNotifications, interfaceS
 // #preview SettingsPanel {}
 export function SettingsPanel({ onClose = () => undefined }: { onClose?: () => void }) {
   const [activeCategory, setActiveCategory] = useState<SettingsCategoryId>("security");
-  const [notifications, setNotifications] = useState({ desktop: true, sound: false, preview: true });
+  const [notifications, setNotifications] = useState<NotificationSettings>(readNotificationSettings);
   const [interfaceSettings, setInterfaceSettings] = useState({ animations: true, compact: false });
   const category = categories.find((item) => item.id === activeCategory) ?? categories[0];
+
+  useEffect(() => {
+    writeNotificationSettings(notifications);
+    if (notifications.desktop) void requestDesktopNotificationPermission();
+  }, [notifications]);
 
   function selectCategory(id: SettingsCategoryId) {
     setActiveCategory(id);

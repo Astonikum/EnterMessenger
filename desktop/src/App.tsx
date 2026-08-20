@@ -4,11 +4,14 @@ import { MessengerView } from "./views/messenger-view";
 import { readTabState, writeTabState } from "./lib/app-state";
 import { EMPTY_MESSAGES } from "./lib/empty-messages";
 import { clearMessageCache, MESSAGE_CACHE_KEY_PREFIX, readMessageCache, readMessageCacheAsync, writeMessageCache } from "./lib/message-cache";
-import { acknowledgeMessage, createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type DeviceHistoryEntry, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse } from "./lib/enter-api";
+import { acknowledgeMessage, createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type DeviceHistoryEntry, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./lib/e2e";
+import { encryptMedia } from "./lib/media";
+import type { PendingMedia } from "./components/message-composer";
 import { formatMessageTime, makeId } from "./lib/utils";
 import { migrateLocalServerAddress } from "./lib/server-address";
 import { createRealtimeQueue, createSyncQueue } from "./lib/sync-queue";
+import { notifyIncomingMessage, subscribeToNotificationActions } from "./lib/notifications";
 import type { Conversation, Message, OutboxEntry, Profile } from "./types";
 
 const LEGACY_OUTBOX_KEY = "enter-outbox";
@@ -18,6 +21,15 @@ const DEFAULT_FOLDER = "Личное";
 
 function folderNames(conversations: Conversation[]) {
   return [...new Set([DEFAULT_FOLDER, ...conversations.map((conversation) => conversation.folder).filter((folder): folder is string => Boolean(folder))])];
+}
+
+function messagePreview(message: Message) {
+  if (message.text.trim()) return message.text;
+  const attachments = message.attachments ?? [];
+  if (attachments.some(({ kind }) => kind === "image")) return "[Фото]";
+  if (attachments.some(({ kind }) => kind === "video")) return "[Видео]";
+  if (attachments.some(({ kind }) => kind === "audio")) return "[Аудио]";
+  return attachments.length > 0 ? "[Файлы]" : "";
 }
 
 function readProfiles() {
@@ -99,6 +111,7 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
     author: remote.author,
     text: payload.text,
     editOf: payload.editOf,
+    attachments: payload.attachments,
     time: formatMessageTime(new Date(remote.createdAt)),
     stackId: remote.stackId,
     envelope: remote.envelope,
@@ -181,7 +194,9 @@ export default function App() {
   const [searchError, setSearchError] = useState("");
   const searchRequestId = useRef(0);
   const [messageError, setMessageError] = useState("");
+  const [mediaUploadProgress, setMediaUploadProgress] = useState<number | null>(null);
   const messagesByProfileRef = useRef(messagesByProfile);
+  const activeConversationIdRef = useRef(activeConversationId);
   const syncCursorsRef = useRef(syncCursors);
   const outboxRef = useRef(outboxByProfile);
   const retryingOutbox = useRef(new Set<string>());
@@ -201,12 +216,43 @@ export default function App() {
   const conversationsWithPreviews = conversations.map((conversation) => {
     const conversationMessages = (activeProfileMessages[conversation.id] ?? []).filter((message) => !message.editOf);
     const latestMessage = conversationMessages[conversationMessages.length - 1];
-    return latestMessage ? { ...conversation, lastMessage: latestMessage.text, time: latestMessage.time } : { ...conversation, lastMessage: "", time: "" };
+    return latestMessage ? { ...conversation, lastMessage: messagePreview(latestMessage), time: latestMessage.time } : { ...conversation, lastMessage: "", time: "" };
   });
 
   useEffect(() => {
     messagesByProfileRef.current = messagesByProfile;
   }, [messagesByProfile]);
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    let active = true;
+    let dispose: (() => void) | null = null;
+    void subscribeToNotificationActions((profileId, conversationId) => {
+      if (!profiles.some((profile) => profile.id === profileId)) return;
+      setActiveProfileId(profileId);
+      setActiveConversationId(conversationId);
+      setShowSettings(false);
+    }).then((cleanup) => {
+      if (active) dispose = cleanup;
+      else cleanup();
+    });
+    const openConversation = (event: Event) => {
+      const detail = (event as CustomEvent<{ profileId?: string; conversationId?: string }>).detail;
+      if (!detail?.profileId || !detail.conversationId || !profiles.some((profile) => profile.id === detail.profileId)) return;
+      setActiveProfileId(detail.profileId);
+      setActiveConversationId(detail.conversationId);
+      setShowSettings(false);
+    };
+    window.addEventListener("enter:open-conversation", openConversation);
+    return () => {
+      active = false;
+      dispose?.();
+      window.removeEventListener("enter:open-conversation", openConversation);
+    };
+  }, [profiles]);
 
   useEffect(() => {
     syncCursorsRef.current = syncCursors;
@@ -583,6 +629,10 @@ export default function App() {
           });
           if (isNewMessage && event.message.author === "them") {
             setConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
+            if (activeConversationIdRef.current !== event.message.conversationId || document.visibilityState !== "visible" || !document.hasFocus()) {
+              const conversation = conversations.find((item) => item.id === event.message.conversationId);
+              void notifyIncomingMessage({ profileId: profile.id, conversationId: event.message.conversationId, title: conversation?.name ?? "Enter", text: message.text });
+            }
           }
           setMessageError("");
           return true;
@@ -820,7 +870,7 @@ export default function App() {
     });
   }
 
-  async function sendMessageToConversation(conversationId: string, message: Message, fromOutbox = false) {
+  async function sendMessageToConversation(conversationId: string, message: Message, pendingMedia: PendingMedia[] = [], fromOutbox = false) {
     if (!activeProfileId || !activeProfile) return;
     const profile = activeProfile;
     const conversation = conversations.find((item) => item.id === conversationId || (conversationId === "favorites" && item.handle === "favorites"));
@@ -828,16 +878,18 @@ export default function App() {
     const targetConversationId = conversation.id;
     const isEdit = Boolean(message.editOf);
     setMessageError("");
-    queueOutbox(activeProfile.id, targetConversationId, message);
+    const hasPendingMedia = pendingMedia.length > 0 && !fromOutbox;
+    if (hasPendingMedia) setMediaUploadProgress(0);
+    if (!hasPendingMedia) queueOutbox(activeProfile.id, targetConversationId, message);
     if (fromOutbox) {
       updateLocalMessage(activeProfile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "pending" }));
-    } else if (!isEdit) {
+    } else if (!isEdit && !hasPendingMedia) {
       const pendingMessage = { ...message, deliveryStatus: "pending" } satisfies Message;
       setMessagesByProfile((current) => {
         const profileMessages = current[activeProfile.id] ?? EMPTY_MESSAGES;
         return { ...current, [activeProfile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
       });
-      setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: message.text, time: message.time } : item));
+      setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(message), time: message.time } : item));
     }
     try {
       const { bundle, account } = await prepareProfile(profile);
@@ -850,15 +902,41 @@ export default function App() {
       const recipientDevices = isDirectConversation ? fetchedRecipientDevices : ownDevices;
       const recipientAccount = isDirectConversation ? fetchedRecipientAccount : account;
       const recipients = [recipientAccount, ...recipientDevices, ...ownDevices].filter((device): device is PublicDeviceKey | PublicAccountKey => Boolean(device)).filter((device, index, devices) => devices.findIndex((item) => item.keyId === device.keyId) === index);
-      const envelopes = await Promise.all(recipients.map((recipient) => encryptMessage(profile, targetConversationId, message, recipient)));
+      const mediaRecipient = recipients[0]?.address;
+      if (hasPendingMedia && !mediaRecipient) throw new Error("Не найден получатель вложения");
+      let uploadedAttachments = message.attachments;
+      if (hasPendingMedia) {
+        uploadedAttachments = [];
+        for (const [index, { file }] of pendingMedia.entries()) {
+          const encrypted = await encryptMedia(file);
+          await uploadMedia(profile, targetConversationId, encrypted.attachment.id, mediaRecipient!, encrypted.ciphertext, (progress) => setMediaUploadProgress(Math.round(((index + progress / 100) / pendingMedia.length) * 100)));
+          uploadedAttachments.push(encrypted.attachment);
+        }
+        setMediaUploadProgress(100);
+      }
+      const messageToSend: Message = uploadedAttachments ? { ...message, attachments: uploadedAttachments } : message;
+      if (hasPendingMedia) {
+        queueOutbox(activeProfile.id, targetConversationId, messageToSend);
+        if (!isEdit) {
+          const pendingMessage = { ...messageToSend, deliveryStatus: "pending" } satisfies Message;
+          setMessagesByProfile((current) => {
+            const profileMessages = current[activeProfile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [activeProfile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
+          });
+          setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(messageToSend), time: messageToSend.time } : item));
+        }
+      }
+      const envelopes = await Promise.all(recipients.map((recipient) => encryptMessage(profile, targetConversationId, messageToSend, recipient)));
       const localEnvelope = envelopes.find((envelope) => envelope.key_id === account?.keyId) ?? envelopes[0];
-      const localMessage: Message = { ...message, envelope: localEnvelope, deliveryStatus: "pending" };
-      updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, ...localMessage }));
+      const localMessage: Message = { ...messageToSend, envelope: localEnvelope, deliveryStatus: "pending" };
+      updateLocalMessage(profile.id, targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage }));
       const sent = await sendRemoteMessage(profile, targetConversationId, localMessage, envelopes);
-      updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, ...localMessage, time: formatMessageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
-      removeOutbox(profile.id, message.id);
+      updateLocalMessage(profile.id, targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage, time: formatMessageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
+      removeOutbox(profile.id, messageToSend.id);
       setMessageError("");
+      setMediaUploadProgress(null);
     } catch (reason) {
+      setMediaUploadProgress(null);
       updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "failed" }));
       failOutbox(profile.id, message.id);
       if (isUnauthorized(reason)) {
@@ -866,7 +944,7 @@ export default function App() {
         setMessageError("Сессия сервера истекла. Войдите снова");
         return;
       }
-      setMessageError("Сообщение сохранено локально. Повторю отправку после восстановления соединения.");
+      setMessageError(hasPendingMedia ? "Не удалось загрузить вложение. Сообщение не отправлено." : "Сообщение сохранено локально. Повторю отправку после восстановления соединения.");
     }
   }
 
@@ -876,12 +954,12 @@ export default function App() {
     for (const entry of outboxRef.current[profileId] ?? []) {
       if (entry.nextAttemptAt > now || retryingOutbox.current.has(entry.id)) continue;
       retryingOutbox.current.add(entry.id);
-      void sendMessageToConversation(entry.conversationId, entry.message, true).finally(() => retryingOutbox.current.delete(entry.id));
+      void sendMessageToConversation(entry.conversationId, entry.message, [], true).finally(() => retryingOutbox.current.delete(entry.id));
     }
   }
 
-  function sendMessage(message: Message) {
-    if (activeConversationId) void sendMessageToConversation(activeConversationId, message);
+  function sendMessage(message: Message, pendingMedia?: PendingMedia[]) {
+    if (activeConversationId) void sendMessageToConversation(activeConversationId, message, pendingMedia);
   }
 
   function updateActiveMessage(messageId: string, update: (message: Message) => Message | null) {
@@ -1028,6 +1106,7 @@ export default function App() {
       messageToForward={messageToForward}
       showSettings={showSettings}
       messageError={messageError}
+      mediaUploadProgress={mediaUploadProgress}
       replyTo={replyTo}
       editingMessage={editingMessage}
       onSelectProfile={selectProfile}

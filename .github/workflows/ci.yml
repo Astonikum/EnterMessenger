@@ -78,3 +78,12 @@ jobs:
       - name: Export web bundle
         working-directory: mobile
         run: npx expo export --platform web
+
+  server:
+    name: Server Docker image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build server image
+        run: docker build --build-arg APP_VERSION=0.2.0 --tag enter-server:ci --file server/Dockerfile .

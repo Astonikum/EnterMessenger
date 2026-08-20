@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Animated, Easing, FlatList, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View } from "react-native";
+import { Animated, Easing, FlatList, Image, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
-import type { Conversation, Message } from "../types";
+import * as DocumentPicker from "expo-document-picker";
+import * as ImagePicker from "expo-image-picker";
+import type { Conversation, Message, MessageAttachment, Profile } from "../types";
+import { MediaBubble, MediaGroup } from "./MediaBubble";
+import type { MobileMediaSource } from "../media";
 import { makeId } from "../data";
 import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
@@ -9,13 +13,15 @@ import { ConversationAvatar } from "./Avatar";
 import { SafeAreaSheet } from "./SafeAreaSheet";
 
 type Props = {
+  profile: Profile;
   conversation: Conversation;
   messages: Message[];
   error?: string;
+  uploadProgress?: number | null;
   replyTo?: Message | null;
   editingMessage?: Message | null;
   onBack: () => void;
-  onSend: (message: Message) => void;
+  onSend: (message: Message, pendingMedia?: PendingMedia[]) => void;
   onReply: (message: Message) => void;
   onStartEdit?: (message: Message) => void;
   onEdit: (message: Message) => void;
@@ -27,18 +33,29 @@ type Props = {
   onCancelContext: () => void;
 };
 
+export type PendingMedia = { source: MobileMediaSource };
+
+function formatFileSize(size?: number) {
+  if (!size) return "";
+  if (size < 1024) return `${size} Б`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
+  return `${(size / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
 function sameStack(left?: Message, right?: Message) {
   if (!left || !right || left.author !== right.author) return false;
   return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
 }
 
-export function ChatScreen({ conversation, messages, error = "", replyTo, editingMessage, onBack, onSend, onReply, onStartEdit, onEdit, onPin, onSave, onDelete, onReact, onForward, onCancelContext }: Props) {
+export function ChatScreen({ profile, conversation, messages, error = "", uploadProgress = null, replyTo, editingMessage, onBack, onSend, onReply, onStartEdit, onEdit, onPin, onSave, onDelete, onReact, onForward, onCancelContext }: Props) {
   const [text, setText] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [localEditingMessage, setLocalEditingMessage] = useState<Message | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [inputHeight, setInputHeight] = useState(36);
+  const [pendingMedia, setPendingMedia] = useState<PendingMedia[]>([]);
+  const [attachmentMenuVisible, setAttachmentMenuVisible] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
   const contextMotion = useRef(new Animated.Value(0)).current;
   const activeEditingMessage = editingMessage ?? localEditingMessage;
@@ -62,10 +79,26 @@ export function ChatScreen({ conversation, messages, error = "", replyTo, editin
 
   function submit() {
     const value = text.trim();
-    if (!value || conversation.canWrite === false) return;
+    if (uploadProgress !== null || ((!value && pendingMedia.length === 0) || conversation.canWrite === false)) return;
     if (activeEditingMessage) onEdit({ ...activeEditingMessage, text: value, edited: true });
-    else onSend({ id: makeId(), author: "me", text: value, time: new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" }).format(new Date()), replyTo: replyTo ? { id: replyTo.id, text: replyTo.text } : undefined });
-    setText(""); setInputHeight(36); setLocalEditingMessage(null); onCancelContext();
+    else onSend({ id: makeId(), author: "me", text: value, time: new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" }).format(new Date()), replyTo: replyTo ? { id: replyTo.id, text: replyTo.text } : undefined }, pendingMedia);
+    setText(""); setPendingMedia([]); setInputHeight(36); setLocalEditingMessage(null); onCancelContext();
+  }
+
+  function appendSources(sources: MobileMediaSource[]) {
+    setPendingMedia((current) => [...current, ...sources.map((source) => ({ source }))].slice(0, 10));
+  }
+
+  async function pickGallery() {
+    setAttachmentMenuVisible(false);
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: true, quality: 1 });
+    if (!result.canceled) appendSources(result.assets.map((asset) => ({ uri: asset.uri, name: asset.fileName ?? `Медиа-${Date.now()}`, mimeType: asset.mimeType ?? "application/octet-stream", size: asset.fileSize })));
+  }
+
+  async function pickFiles() {
+    setAttachmentMenuVisible(false);
+    const result = await DocumentPicker.getDocumentAsync({ type: "*/*", multiple: true, copyToCacheDirectory: true });
+    if (!result.canceled) appendSources(result.assets.map((asset) => ({ uri: asset.uri, name: asset.name, mimeType: asset.mimeType ?? "application/octet-stream", size: asset.size })));
   }
 
   return <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={Platform.OS === "ios" ? 4 : 0}>
@@ -82,23 +115,32 @@ export function ChatScreen({ conversation, messages, error = "", replyTo, editin
         showsVerticalScrollIndicator={false}
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
         ListHeaderComponent={<Text style={styles.day}>{searchQuery.trim() ? "РЕЗУЛЬТАТЫ ПОИСКА" : "СЕГОДНЯ"}</Text>}
-        renderItem={({ item, index }) => <MessageBubble message={item} previous={visibleMessages[index - 1]} next={visibleMessages[index + 1]} selected={selectedIds.includes(item.id)} onToggleSelection={() => toggleSelection(item.id)} onReply={onReply} onStartEdit={startEditing} onPin={onPin} onSave={onSave} onDelete={onDelete} onReact={onReact} onForward={onForward} />}
+        renderItem={({ item, index }) => <MessageBubble profile={profile} message={item} previous={visibleMessages[index - 1]} next={visibleMessages[index + 1]} selected={selectedIds.includes(item.id)} onToggleSelection={() => toggleSelection(item.id)} onReply={onReply} onStartEdit={startEditing} onPin={onPin} onSave={onSave} onDelete={onDelete} onReact={onReact} onForward={onForward} />}
       />
     </View> : <View style={styles.emptyChat}><View style={styles.emptyChatIcon}><Icon name={searchQuery.trim() ? "search" : conversation.canWrite === false ? "info" : "chat"} size={28} color={colors.primary} /></View><Text style={styles.emptyChatTitle}>{searchQuery.trim() ? "Ничего не найдено" : "Нет сообщений"}</Text><Text style={styles.emptyChatText}>{searchQuery.trim() ? "Попробуйте изменить запрос." : conversation.canWrite === false ? "Обновления появятся здесь." : "Начните общение"}</Text></View>}
     {error ? <Text style={styles.error}>{error}</Text> : null}
-    {conversation.canWrite === false ? <View style={styles.readOnly}><Text style={styles.readOnlyText}>Этот чат доступен только для чтения</Text></View> : <View style={styles.composerWrap}>{(replyTo || activeEditingMessage) && <Animated.View style={{ opacity: contextMotion, transform: [{ translateX: contextMotion.interpolate({ inputRange: [0, 1], outputRange: [6, 0] }) }] }}><View style={styles.context}><View style={styles.contextAccent} /><View style={styles.contextCopy}><Text style={styles.contextTitle}>{activeEditingMessage ? "Редактирование сообщения" : "Ответ на сообщение"}</Text><Text style={styles.contextText} numberOfLines={1}>{activeEditingMessage?.text ?? replyTo?.text}</Text></View><Pressable onPress={() => { setText(""); setLocalEditingMessage(null); setInputHeight(36); onCancelContext(); }} hitSlop={10}><Icon name="close" size={18} color={colors.muted} /></Pressable></View></Animated.View>}<View style={styles.composer}><Pressable style={[styles.composerButton, styles.disabledAction]} disabled><Icon name="plus" size={21} color={colors.muted} /></Pressable><TextInput value={text} onChangeText={setText} placeholder="Написать сообщение…" placeholderTextColor={colors.muted} multiline maxLength={4000} scrollEnabled={inputHeight >= 112} onContentSizeChange={(event) => setInputHeight(Math.min(112, Math.max(36, event.nativeEvent.contentSize.height)))} style={[styles.messageInput, { height: inputHeight }]} onSubmitEditing={(event) => { if (Platform.OS !== "ios" && !event.nativeEvent.text.includes("\n")) submit(); }} blurOnSubmit={false} /><Pressable style={[styles.send, !text.trim() && styles.sendDisabled]} onPress={submit} disabled={!text.trim()}><Icon name="send" size={18} color={colors.primaryText} /></Pressable></View></View>}
+    {conversation.canWrite === false ? <View style={styles.readOnly}><Text style={styles.readOnlyText}>Этот чат доступен только для чтения</Text></View> : <View style={styles.composerWrap}>{(replyTo || activeEditingMessage) && <Animated.View style={{ opacity: contextMotion, transform: [{ translateX: contextMotion.interpolate({ inputRange: [0, 1], outputRange: [6, 0] }) }] }}><View style={styles.context}><View style={styles.contextAccent} /><View style={styles.contextCopy}><Text style={styles.contextTitle}>{activeEditingMessage ? "Редактирование сообщения" : "Ответ на сообщение"}</Text><Text style={styles.contextText} numberOfLines={1}>{activeEditingMessage?.text ?? replyTo?.text}</Text></View><Pressable onPress={() => { setText(""); setLocalEditingMessage(null); setInputHeight(36); onCancelContext(); }} hitSlop={10}><Icon name="close" size={18} color={colors.muted} /></Pressable></View></Animated.View>}{uploadProgress !== null && <View style={styles.uploadProgress}><View style={styles.uploadProgressHeader}><Text style={styles.uploadProgressLabel}>{uploadProgress < 1 ? "Подготовка вложения…" : "Отправка вложения…"}</Text><Text style={styles.uploadProgressValue}>{uploadProgress}%</Text></View><View style={styles.uploadTrack}><View style={[styles.uploadFill, { width: `${uploadProgress}%` }]} /></View></View>}{pendingMedia.length > 0 && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pendingList}>{pendingMedia.map(({ source }, index) => <View key={`${source.name}-${index}`} style={styles.pendingItem}>{source.mimeType.startsWith("image/") ? <Image source={{ uri: source.uri }} style={styles.pendingThumb} /> : <View style={styles.pendingIcon}><Icon name={source.mimeType.startsWith("video/") ? "videocam" : "attach"} size={16} color={colors.primary} /></View>}<View style={styles.pendingCopy}><Text style={styles.pendingName} numberOfLines={1}>{source.name}</Text><Text style={styles.pendingSize}>{formatFileSize(source.size)}</Text></View><Pressable onPress={() => setPendingMedia((current) => current.filter((_, itemIndex) => itemIndex !== index))} hitSlop={8}><Icon name="close" size={15} color={colors.muted} /></Pressable></View>)}</ScrollView>}<View style={styles.composer}><Pressable style={[styles.composerButton, activeEditingMessage && styles.disabledAction]} onPress={() => setAttachmentMenuVisible(true)} disabled={Boolean(activeEditingMessage) || uploadProgress !== null}><Icon name="attach" size={20} color={colors.muted} /></Pressable><TextInput value={text} onChangeText={setText} placeholder="Написать сообщение…" placeholderTextColor={colors.muted} multiline maxLength={4000} scrollEnabled={inputHeight >= 112} onContentSizeChange={(event) => setInputHeight(text.trim().length === 0 ? 36 : Math.min(112, Math.max(36, event.nativeEvent.contentSize.height)))} style={[styles.messageInput, inputHeight <= 36 ? styles.messageInputSingle : styles.messageInputMulti, { height: inputHeight }]} onSubmitEditing={(event) => { if (Platform.OS !== "ios" && !event.nativeEvent.text.includes("\n")) submit(); }} blurOnSubmit={false} /><Pressable style={[styles.send, (uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)) && styles.sendDisabled]} onPress={submit} disabled={uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)}><Icon name="send" size={18} color={colors.primaryText} /></Pressable></View><Modal visible={attachmentMenuVisible} transparent animationType="slide" onRequestClose={() => setAttachmentMenuVisible(false)}><SafeAreaSheet onClose={() => setAttachmentMenuVisible(false)} sheetStyle={styles.attachmentSheet}><View style={styles.handle} /><Text style={styles.sheetTitle}>Добавить контент</Text><Pressable style={styles.attachmentOption} onPress={() => void pickGallery()}><View style={styles.attachmentIcon}><Icon name="videocam" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Фото и видео</Text><Text style={styles.attachmentSubtitle}>Выбрать из галереи</Text></View></Pressable><Pressable style={styles.attachmentOption} onPress={() => void pickFiles()}><View style={styles.attachmentIcon}><Icon name="attach" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Файл</Text><Text style={styles.attachmentSubtitle}>Открыть файловый менеджер</Text></View></Pressable></SafeAreaSheet></Modal></View>}
   </KeyboardAvoidingView>;
 }
 
-function MessageBubble({ message, previous, next, selected = false, onToggleSelection, onReply, onStartEdit, onPin, onSave, onDelete, onReact, onForward }: { message: Message; previous?: Message; next?: Message; selected?: boolean; onToggleSelection: () => void; onReply: (message: Message) => void; onStartEdit: (message: Message) => void; onPin: (message: Message) => void; onSave: (message: Message) => void; onDelete: (message: Message) => void; onReact: (message: Message, reaction: string) => void; onForward: (message: Message) => void }) {
+function MessageBubble({ profile, message, previous, next, selected = false, onToggleSelection, onReply, onStartEdit, onPin, onSave, onDelete, onReact, onForward }: { profile: Profile; message: Message; previous?: Message; next?: Message; selected?: boolean; onToggleSelection: () => void; onReply: (message: Message) => void; onStartEdit: (message: Message) => void; onPin: (message: Message) => void; onSave: (message: Message) => void; onDelete: (message: Message) => void; onReact: (message: Message, reaction: string) => void; onForward: (message: Message) => void }) {
   const samePrevious = sameStack(previous, message);
   const sameNext = sameStack(message, next);
   const bubblePosition = samePrevious
     ? sameNext
       ? (message.author === "me" ? styles.groupMiddleOut : styles.groupMiddleIn)
       : (message.author === "me" ? styles.groupBottomOut : styles.groupBottomIn)
-    : styles.groupTop;
+      : styles.groupTop;
+  const visualAttachments = message.attachments?.filter((attachment) => attachment.kind === "image" || attachment.kind === "video") ?? [];
+  const otherAttachments = message.attachments?.filter((attachment) => attachment.kind !== "image" && attachment.kind !== "video") ?? [];
+  const mediaOnly = Boolean(visualAttachments.length && !otherAttachments.length && !message.text && !message.replyTo && !message.reaction);
+  const mediaCaption = Boolean(visualAttachments.length && (message.text || message.reaction));
+  const mediaOverlay = mediaOnly && !sameNext ? <View style={styles.mediaMetaOverlay}><Text style={styles.mediaMetaOverlayText}>{message.time}{message.edited ? " · изменено" : ""}{message.deliveryStatus === "pending" ? " · отправляется" : message.deliveryStatus === "failed" ? " · не отправлено" : ""}</Text>{message.author === "me" && (message.deliveryStatus ? <Text style={styles.mediaMetaOverlayText}>{message.deliveryStatus === "failed" ? "!" : "…"}</Text> : <Icon name={message.readAt || message.deliveredAt ? "checkAll" : "check"} size={12} color="#fff" />)}</View> : undefined;
+  const messageMeta = !sameNext && !mediaOnly ? <View style={styles.messageMeta}><Text style={message.author === "me" ? styles.outMeta : styles.inMeta}>{message.time}{message.edited ? " · изменено" : ""}{message.deliveryStatus === "pending" ? " · отправляется" : message.deliveryStatus === "failed" ? " · не отправлено" : ""}</Text>{message.author === "me" && message.deliveryStatus === undefined && <Icon name={message.readAt || message.deliveredAt ? "checkAll" : "check"} size={13} color="#54458f" />}</View> : null;
+  const messageTextAndReaction = <>{message.text ? <Text style={[styles.messageText, message.author === "me" ? styles.outMessageText : styles.inMessageText]}>{message.text}</Text> : null}{message.reaction && <Text style={styles.reaction}>{message.reaction}</Text>}</>;
   const [actionsVisible, setActionsVisible] = useState(false);
+  const [contextAttachment, setContextAttachment] = useState<{ attachment: MessageAttachment; save: () => void } | null>(null);
+  const fileList = otherAttachments.length > 0 ? <View style={[styles.fileList, visualAttachments.length > 0 && styles.fileListSpaced, Boolean(message.text) && styles.fileListBeforeText]}>{otherAttachments.map((attachment) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} outgoing={message.author === "me"} onAttachmentLongPress={(selectedAttachment, save) => { setContextAttachment({ attachment: selectedAttachment, save }); setActionsVisible(true); }} />)}</View> : null;
   const swipeX = useRef(new Animated.Value(0)).current;
   const reactions = ["❤️", "💥", "👌", "👍", "👎", "🔥", "🥰", "👋"];
 
@@ -114,13 +156,14 @@ function MessageBubble({ message, previous, next, selected = false, onToggleSele
 
   function run(action: () => void) {
     setActionsVisible(false);
+    setContextAttachment(null);
     action();
   }
 
-  return <Animated.View {...swipeResponder.panHandlers} style={[styles.messageLine, message.author === "me" ? styles.outgoing : styles.incoming, !samePrevious ? styles.messageGap : styles.groupGap, { transform: [{ translateX: swipeX }] }]}><Animated.View pointerEvents="none" style={[styles.swipeReply, { opacity: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.15, 1] }), transform: [{ scale: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.7, 1] }) }] }]}><Icon name="reply" size={14} color={colors.primary} /></Animated.View><Pressable onLongPress={() => setActionsVisible(true)} delayLongPress={260} style={[styles.bubble, message.author === "me" ? styles.outBubble : styles.inBubble, bubblePosition, message.pinned && styles.pinned, selected && styles.selected]}>
-    {message.replyTo && <View style={styles.replyQuote}><Text style={styles.replyQuoteLabel}>Ответ</Text><Text style={styles.replyQuoteText} numberOfLines={1}>{message.replyTo.text}</Text></View>}
-    <Text style={[styles.messageText, message.author === "me" ? styles.outMessageText : styles.inMessageText]}>{message.text}</Text>{message.reaction && <Text style={styles.reaction}>{message.reaction}</Text>}{!sameNext && <View style={styles.messageMeta}><Text style={message.author === "me" ? styles.outMeta : styles.inMeta}>{message.time}{message.edited ? " · изменено" : ""}{message.deliveryStatus === "pending" ? " · отправляется" : message.deliveryStatus === "failed" ? " · не отправлено" : ""}</Text>{message.author === "me" && message.deliveryStatus === undefined && <Icon name={message.readAt || message.deliveredAt ? "checkAll" : "check"} size={13} color="#d9d1ff" />}</View>}
-  </Pressable><Modal visible={actionsVisible} transparent animationType="slide" onRequestClose={() => setActionsVisible(false)}><SafeAreaSheet onClose={() => setActionsVisible(false)} sheetStyle={styles.actionSheet}><View style={styles.handle} /><Text style={styles.actionTitle}>Сообщение</Text><ScrollView bounces={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.reactionList}>{reactions.map((reaction) => <Pressable key={reaction} style={styles.reactionButton} onPress={() => run(() => onReact(message, reaction))}><Text style={styles.reactionButtonText}>{reaction}</Text></Pressable>)}</ScrollView><View style={styles.actionList}><ActionRow icon="reply" label="Ответить" onPress={() => run(() => onReply(message))} />{message.author === "me" && <ActionRow icon="edit" label="Изменить" onPress={() => run(() => onStartEdit(message))} />}<ActionRow icon="pin" label={message.pinned ? "Открепить" : "Закрепить"} onPress={() => run(() => onPin(message))} /><ActionRow icon="bookmark" label="Сохранить в Избранное" onPress={() => run(() => onSave(message))} /><ActionRow icon="copy" label="Копировать текст" onPress={() => run(() => void Clipboard.setStringAsync(message.text))} /><ActionRow icon="forward" label="Переслать" onPress={() => run(() => onForward(message))} /><ActionRow icon="share" label="Поделиться" onPress={() => run(() => void Share.share({ message: message.text }))} /><ActionRow icon="delete" label="Удалить" destructive onPress={() => run(() => onDelete(message))} /><ActionRow icon="checkCircle" label={selected ? "Снять выделение" : "Выделить"} onPress={() => run(onToggleSelection)} /></View></SafeAreaSheet></Modal></Animated.View>;
+  return <Animated.View {...swipeResponder.panHandlers} style={[styles.messageLine, message.author === "me" ? styles.outgoing : styles.incoming, !samePrevious ? styles.messageGap : styles.groupGap, { transform: [{ translateX: swipeX }] }]}><Animated.View pointerEvents="none" style={[styles.swipeReply, { opacity: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.15, 1] }), transform: [{ scale: swipeX.interpolate({ inputRange: [0, 52], outputRange: [0.7, 1] }) }] }]}><Icon name="reply" size={14} color={colors.primary} /></Animated.View><Pressable onLongPress={() => { setContextAttachment(null); setActionsVisible(true); }} delayLongPress={260} style={[styles.bubble, message.author === "me" ? styles.outBubble : styles.inBubble, bubblePosition, visualAttachments.length > 0 && styles.mediaOnlyBubble, visualAttachments.length > 0 && otherAttachments.length > 0 && (message.author === "me" ? styles.outBubble : styles.inBubble), visualAttachments.length > 1 && styles.mediaGridBubble, message.pinned && styles.pinned, selected && styles.selected]}>
+    {message.replyTo && <View style={styles.replyQuote}><Text style={[styles.replyQuoteLabel, message.author === "me" && styles.outReplyQuoteText]}>Ответ</Text><Text style={[styles.replyQuoteText, message.author === "me" && styles.outReplyQuoteText]} numberOfLines={1}>{message.replyTo.text}</Text></View>}
+    {visualAttachments.length ? <MediaGroup profile={profile} attachments={visualAttachments} overlay={mediaOverlay} captioned={mediaCaption} outgoing={message.author === "me"} onAttachmentLongPress={(selectedAttachment, save) => { setContextAttachment({ attachment: selectedAttachment, save }); setActionsVisible(true); }} /> : null}{fileList}{mediaCaption ? <View style={[styles.mediaCaption, message.author === "me" ? styles.outBubble : styles.inBubble]}>{messageTextAndReaction}{messageMeta}</View> : <>{messageTextAndReaction}{messageMeta}</>}
+  </Pressable><Modal visible={actionsVisible} transparent animationType="slide" onRequestClose={() => { setActionsVisible(false); setContextAttachment(null); }}><SafeAreaSheet onClose={() => { setActionsVisible(false); setContextAttachment(null); }} sheetStyle={styles.actionSheet}><View style={styles.handle} /><Text style={styles.actionTitle}>Сообщение</Text><ScrollView bounces={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.reactionList}>{reactions.map((reaction) => <Pressable key={reaction} style={styles.reactionButton} onPress={() => run(() => onReact(message, reaction))}><Text style={styles.reactionButtonText}>{reaction}</Text></Pressable>)}</ScrollView><View style={styles.actionList}>{contextAttachment && <ActionRow icon="share" label="Сохранить в загрузки" onPress={() => run(contextAttachment.save)} />}<ActionRow icon="reply" label="Ответить" onPress={() => run(() => onReply(message))} />{message.author === "me" && <ActionRow icon="edit" label="Изменить" onPress={() => run(() => onStartEdit(message))} />}<ActionRow icon="pin" label={message.pinned ? "Открепить" : "Закрепить"} onPress={() => run(() => onPin(message))} /><ActionRow icon="bookmark" label="Сохранить в Избранное" onPress={() => run(() => onSave(message))} /><ActionRow icon="copy" label="Копировать текст" onPress={() => run(() => void Clipboard.setStringAsync(message.text))} /><ActionRow icon="forward" label="Переслать" onPress={() => run(() => onForward(message))} /><ActionRow icon="share" label="Поделиться" onPress={() => run(() => void Share.share({ message: message.text }))} /><ActionRow icon="delete" label="Удалить" destructive onPress={() => run(() => onDelete(message))} /><ActionRow icon="checkCircle" label={selected ? "Снять выделение" : "Выделить"} onPress={() => run(onToggleSelection)} /></View></SafeAreaSheet></Modal></Animated.View>;
 }
 
 function ActionRow({ icon, label, onPress, destructive = false }: { icon: "reply" | "edit" | "pin" | "bookmark" | "copy" | "forward" | "share" | "delete" | "checkCircle"; label: string; onPress: () => void; destructive?: boolean }) {
@@ -161,6 +204,8 @@ const styles = StyleSheet.create({
   bubble: { maxWidth: "90%", paddingHorizontal: 14, paddingVertical: 10, borderRadius: 19 },
   inBubble: { backgroundColor: colors.surfaceRaised, borderBottomLeftRadius: 6 },
   outBubble: { backgroundColor: colors.primary, borderBottomRightRadius: 6 },
+  mediaOnlyBubble: { paddingHorizontal: 0, paddingVertical: 0, backgroundColor: "transparent", overflow: "hidden" },
+  mediaCaption: { marginTop: 0, paddingHorizontal: 14, paddingVertical: 10, borderTopLeftRadius: 0, borderTopRightRadius: 0, borderBottomLeftRadius: 19, borderBottomRightRadius: 19 },
   groupTop: {},
   groupMiddleOut: { borderTopRightRadius: 6, borderBottomRightRadius: 6 },
   groupMiddleIn: { borderTopLeftRadius: 6, borderBottomLeftRadius: 6 },
@@ -172,12 +217,19 @@ const styles = StyleSheet.create({
   outMessageText: { color: colors.primaryText },
   inMessageText: { color: colors.foreground },
   messageMeta: { marginTop: 5, alignItems: "center", justifyContent: "flex-end", flexDirection: "row", gap: 4 },
+  mediaMetaOverlay: { position: "absolute", right: 6, bottom: 6, borderRadius: 12, backgroundColor: "rgba(0,0,0,0.56)", paddingHorizontal: 8, paddingVertical: 4, alignItems: "center", flexDirection: "row", gap: 4 },
+  mediaMetaOverlayText: { color: "#fff", fontFamily: fonts.body, fontSize: 10 },
+  fileList: { gap: 6 },
+  fileListSpaced: { marginTop: 8 },
+  fileListBeforeText: { marginBottom: 8 },
+  mediaGridBubble: { width: "90%", maxWidth: "90%" },
   outMeta: { color: "#635b8d", fontFamily: fonts.body, fontSize: 10 },
   inMeta: { color: colors.muted, fontFamily: fonts.body, fontSize: 10 },
   reaction: { alignSelf: "flex-start", marginTop: 4, backgroundColor: "rgba(0,0,0,0.12)", borderRadius: 12, paddingHorizontal: 6, paddingVertical: 2, fontSize: 15 },
   replyQuote: { borderLeftWidth: 2, borderLeftColor: colors.primary, paddingLeft: 8, marginBottom: 6, gap: 2 },
   replyQuoteLabel: { color: colors.primary, fontFamily: fonts.bodyBold, fontSize: 10 },
   replyQuoteText: { color: colors.muted, fontFamily: fonts.body, fontSize: 11 },
+  outReplyQuoteText: { color: colors.primaryText },
   emptyChat: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 34, gap: 10 },
   emptyChatIcon: { width: 64, height: 64, borderRadius: 32, backgroundColor: "#29224d", alignItems: "center", justifyContent: "center", marginBottom: 2 },
   emptyChatTitle: { color: colors.foreground, fontFamily: fonts.headingBold, fontSize: 18 },
@@ -186,9 +238,24 @@ const styles = StyleSheet.create({
   readOnly: { minHeight: 56, borderTopWidth: 1, borderTopColor: colors.border, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 8 },
   readOnlyText: { color: colors.muted, fontFamily: fonts.body, fontSize: 12 },
   composerWrap: { borderTopWidth: 1, borderTopColor: colors.border, paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
+  uploadProgress: { gap: 5 },
+  uploadProgressHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  uploadProgressLabel: { color: colors.foreground, fontFamily: fonts.body, fontSize: 11 },
+  uploadProgressValue: { color: colors.muted, fontFamily: fonts.bodySemibold, fontSize: 11 },
+  uploadTrack: { height: 5, borderRadius: 3, backgroundColor: colors.surfaceRaised, overflow: "hidden" },
+  uploadFill: { height: "100%", borderRadius: 3, backgroundColor: colors.primary },
+  pendingList: { gap: 7, paddingHorizontal: 2 },
+  pendingItem: { maxWidth: 250, minHeight: 48, borderRadius: radii.sm, backgroundColor: colors.surfaceRaised, paddingHorizontal: 7, paddingVertical: 5, flexDirection: "row", alignItems: "center", gap: 7 },
+  pendingThumb: { width: 38, height: 38, borderRadius: 8 },
+  pendingIcon: { width: 38, height: 38, borderRadius: 8, backgroundColor: "rgba(179,164,255,0.14)", alignItems: "center", justifyContent: "center" },
+  pendingCopy: { maxWidth: 160, gap: 2 },
+  pendingName: { color: colors.foreground, fontFamily: fonts.bodySemibold, fontSize: 12 },
+  pendingSize: { color: colors.muted, fontFamily: fonts.body, fontSize: 10 },
   composer: { minHeight: 48, borderWidth: 1, borderColor: colors.border, borderRadius: 24, backgroundColor: colors.surface, flexDirection: "row", alignItems: "flex-end", padding: 5, gap: 4 },
   composerButton: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
-  messageInput: { flex: 1, color: "#ffffff", fontFamily: fonts.body, fontSize: 15, minHeight: 36, maxHeight: 112, paddingHorizontal: 6, paddingVertical: 8 },
+  messageInput: { flex: 1, color: "#ffffff", fontFamily: fonts.body, fontSize: 15, minHeight: 36, maxHeight: 112, paddingHorizontal: 6 },
+  messageInputSingle: { paddingVertical: 0, textAlignVertical: "center" },
+  messageInputMulti: { paddingVertical: 6, textAlignVertical: "top" },
   send: { width: 38, height: 38, borderRadius: 19, backgroundColor: colors.primary, alignItems: "center", justifyContent: "center" },
   sendDisabled: { opacity: 0.42 },
   context: { minHeight: 48, backgroundColor: colors.surfaceRaised, borderRadius: radii.sm, padding: 8, flexDirection: "row", alignItems: "center", gap: 8 },
@@ -196,6 +263,11 @@ const styles = StyleSheet.create({
   contextCopy: { flex: 1, gap: 3 },
   contextTitle: { color: colors.primary, fontFamily: fonts.bodyBold, fontSize: 11 },
   contextText: { color: colors.muted, fontFamily: fonts.body, fontSize: 12 },
+  attachmentSheet: { backgroundColor: colors.surface, borderTopLeftRadius: 26, borderTopRightRadius: 26, padding: 18, paddingBottom: 28, borderWidth: 1, borderColor: colors.border },
+  attachmentOption: { minHeight: 64, borderBottomWidth: 1, borderBottomColor: colors.border, flexDirection: "row", alignItems: "center", gap: 12 },
+  attachmentIcon: { width: 42, height: 42, borderRadius: 13, backgroundColor: "rgba(179,164,255,0.14)", alignItems: "center", justifyContent: "center" },
+  attachmentTitle: { color: colors.foreground, fontFamily: fonts.bodySemibold, fontSize: 14 },
+  attachmentSubtitle: { color: colors.muted, fontFamily: fonts.body, fontSize: 12, marginTop: 3 },
   actionSheet: { maxHeight: "88%", backgroundColor: colors.surface, borderTopLeftRadius: 26, borderTopRightRadius: 26, padding: 18, paddingBottom: 28, borderWidth: 1, borderColor: colors.border },
   actionTitle: { color: colors.foreground, fontFamily: fonts.headingBold, fontSize: 19, marginBottom: 10 },
   reactionList: { gap: 8, paddingBottom: 14 },

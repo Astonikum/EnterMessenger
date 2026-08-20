@@ -9,7 +9,7 @@ import { getRandomBytesAsync } from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ENTER_PROTOCOL_VERSION, type EncryptedEnvelope } from "./protocol";
-import type { Message, Profile } from "./types";
+import type { Message, MessageAttachment, Profile } from "./types";
 
 const DEVICE_KEY_PREFIX = "enter-native-device-";
 const FALLBACK_DEVICE_KEY_PREFIX = "enter-fallback-device-";
@@ -48,16 +48,29 @@ export type PublicAccountKey = { keyId: string; encryptionPublicKey: string; add
 export type PublicEncryptionKey = Pick<PublicDeviceKey, "keyId" | "encryptionPublicKey" | "address">;
 
 const EDIT_PAYLOAD_PREFIX = "ENTER_EDIT_V1:";
+const MESSAGE_PAYLOAD_PREFIX = "ENTER_MESSAGE_V2:";
 
 export function encodeMessagePayload(message: Message) {
-  return message.editOf ? `${EDIT_PAYLOAD_PREFIX}${JSON.stringify({ targetId: message.editOf, text: message.text })}` : message.text;
+  if (!message.editOf && !message.attachments?.length) return message.text;
+  return `${MESSAGE_PAYLOAD_PREFIX}${JSON.stringify({ text: message.text, editOf: message.editOf, attachments: message.attachments ?? [] })}`;
 }
 
-export function decodeMessagePayload(value: string): { text: string; editOf?: string } {
-  if (!value.startsWith(EDIT_PAYLOAD_PREFIX)) return { text: value };
+function isAttachment(value: unknown): value is MessageAttachment {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<MessageAttachment>;
+  return typeof item.id === "string" && typeof item.kind === "string" && typeof item.name === "string" && typeof item.mimeType === "string" && typeof item.size === "number" && typeof item.sha256 === "string" && typeof item.key === "string" && typeof item.nonce === "string";
+}
+
+export function decodeMessagePayload(value: string): { text: string; editOf?: string; attachments?: MessageAttachment[] } {
+  if (!value.startsWith(EDIT_PAYLOAD_PREFIX) && !value.startsWith(MESSAGE_PAYLOAD_PREFIX)) return { text: value };
   try {
-    const payload = JSON.parse(value.slice(EDIT_PAYLOAD_PREFIX.length)) as { targetId?: unknown; text?: unknown };
-    if (typeof payload.targetId === "string" && typeof payload.text === "string") return { text: payload.text, editOf: payload.targetId };
+    if (value.startsWith(EDIT_PAYLOAD_PREFIX)) {
+      const payload = JSON.parse(value.slice(EDIT_PAYLOAD_PREFIX.length)) as { targetId?: unknown; text?: unknown };
+      if (typeof payload.targetId === "string" && typeof payload.text === "string") return { text: payload.text, editOf: payload.targetId };
+    } else {
+      const payload = JSON.parse(value.slice(MESSAGE_PAYLOAD_PREFIX.length)) as { text?: unknown; editOf?: unknown; attachments?: unknown };
+      if (typeof payload.text === "string") return { text: payload.text, editOf: typeof payload.editOf === "string" ? payload.editOf : undefined, attachments: Array.isArray(payload.attachments) ? payload.attachments.filter(isAttachment) : undefined };
+    }
   } catch {
     // Keep malformed or legacy payloads as regular message text.
   }

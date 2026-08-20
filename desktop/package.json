@@ -1,7 +1,7 @@
 {
   "name": "enter-messenger",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -15,7 +15,9 @@
     "@noble/curves": "^1.9.7",
     "@noble/hashes": "^1.8.0",
     "@radix-ui/react-context-menu": "^2.3.7",
+    "@radix-ui/react-dialog": "^1.1.23",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "boring-avatars": "^1.11.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",

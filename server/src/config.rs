@@ -4,6 +4,9 @@ use std::{
     path::PathBuf,
 };
 
+pub const DEFAULT_MEDIA_MAX_BYTES: usize = 200 * 1024 * 1024;
+const MEDIA_MAX_BYTES_PER_MB: u64 = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub public_url: String,
@@ -11,6 +14,9 @@ pub struct ServerConfig {
     pub logo_url: Option<String>,
     pub logo_path: Option<PathBuf>,
     pub database_url: String,
+    pub expo_push_url: String,
+    /// Maximum plaintext media size. The upload body may be 16 bytes larger for AES-GCM auth data.
+    pub media_max_bytes: usize,
     pub address: SocketAddr,
 }
 
@@ -40,6 +46,11 @@ impl ServerConfig {
                 format!("sqlite://{path}")
             }
         });
+        let expo_push_url = env::var("ENTER_EXPO_PUSH_URL")
+            .unwrap_or_else(|_| "https://exp.host/--/api/v2/push/send".to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let media_max_bytes = media_limit_bytes(env::var("ENTER_MEDIA_MAX_MB").ok().as_deref());
         let port = env::var("ENTER_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -52,6 +63,8 @@ impl ServerConfig {
             logo_url,
             logo_path,
             database_url,
+            expo_push_url,
+            media_max_bytes,
             address: bind_address,
         }
     }
@@ -63,6 +76,15 @@ impl ServerConfig {
                 .map(|_| format!("{}/server/logo", self.public_url))
         })
     }
+}
+
+fn media_limit_bytes(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|megabytes| *megabytes > 0)
+        .and_then(|megabytes| megabytes.checked_mul(MEDIA_MAX_BYTES_PER_MB))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(DEFAULT_MEDIA_MAX_BYTES)
 }
 
 fn configured_address(value: Option<&str>, port: u16) -> SocketAddr {
@@ -98,5 +120,13 @@ mod tests {
             configured_address(Some("not-an-ip"), 50121),
             SocketAddr::from(([127, 0, 0, 1], 50121))
         );
+    }
+
+    #[test]
+    fn media_limit_defaults_to_200_mb_and_accepts_custom_mb() {
+        assert_eq!(media_limit_bytes(None), 200 * 1024 * 1024);
+        assert_eq!(media_limit_bytes(Some("32")), 32 * 1024 * 1024);
+        assert_eq!(media_limit_bytes(Some("invalid")), 200 * 1024 * 1024);
+        assert_eq!(media_limit_bytes(Some("0")), 200 * 1024 * 1024);
     }
 }

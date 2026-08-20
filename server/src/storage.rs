@@ -491,6 +491,16 @@ impl SqliteStorage {
                  UNIQUE(owner_account_id, client_message_id)
              );
              CREATE INDEX IF NOT EXISTS messages_owner_cursor ON messages(owner_account_id, seq ASC);
+             CREATE TABLE IF NOT EXISTS media_objects (
+                 id TEXT PRIMARY KEY,
+                 owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 recipient_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 conversation_id TEXT NOT NULL,
+                 ciphertext BLOB NOT NULL,
+                 byte_size INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS media_objects_recipient ON media_objects(recipient_account_id, created_at ASC);
              CREATE TABLE IF NOT EXISTS realtime_event_cursors (
                  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
                  cursor INTEGER NOT NULL
@@ -535,6 +545,16 @@ impl SqliteStorage {
                  PRIMARY KEY(owner_account_id, device_id),
                  UNIQUE(owner_account_id, key_id)
              );
+             CREATE TABLE IF NOT EXISTS push_tokens (
+                 owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 device_id TEXT NOT NULL,
+                 token TEXT NOT NULL UNIQUE,
+                 platform TEXT NOT NULL CHECK(platform IN ('android', 'ios')),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY(owner_account_id, device_id)
+             );
+             CREATE INDEX IF NOT EXISTS push_tokens_owner ON push_tokens(owner_account_id);
              CREATE TABLE IF NOT EXISTS account_keys (
                  owner_account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
                  key_id TEXT NOT NULL UNIQUE,
@@ -840,6 +860,37 @@ impl SqliteStorage {
             .optional()
     }
 
+    pub fn register_push_token(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        token: &str,
+        platform: &str,
+        updated_at: i64,
+    ) -> SqlResult<()> {
+        self.connection.execute(
+            "DELETE FROM push_tokens WHERE token = ?1 AND NOT (owner_account_id = ?2 AND device_id = ?3)",
+            params![token, account_id, device_id],
+        )?;
+        self.connection.execute(
+            "INSERT INTO push_tokens (owner_account_id, device_id, token, platform, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(owner_account_id, device_id) DO UPDATE SET token = excluded.token, platform = excluded.platform, updated_at = excluded.updated_at",
+            params![account_id, device_id, token, platform, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn push_tokens(&self, account_id: &str) -> SqlResult<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT token FROM push_tokens WHERE owner_account_id = ?1")?;
+        let tokens = statement
+            .query_map(params![account_id], |row| row.get(0))?
+            .collect();
+        tokens
+    }
+
     pub fn touch_presence(&mut self, account_id: &str, now: i64) -> SqlResult<()> {
         self.connection.execute(
             "UPDATE accounts SET last_seen_at = ?1 WHERE id = ?2",
@@ -1018,6 +1069,32 @@ impl SqliteStorage {
                 "SELECT can_write FROM conversations WHERE owner_account_id = ?1 AND id = ?2",
                 params![account_id, conversation_id],
                 |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+    }
+
+    pub fn store_media(
+        &mut self,
+        owner_account_id: &str,
+        recipient_account_id: &str,
+        conversation_id: &str,
+        media_id: &str,
+        ciphertext: &[u8],
+        created_at: i64,
+    ) -> SqlResult<bool> {
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO media_objects (id, owner_account_id, recipient_account_id, conversation_id, ciphertext, byte_size, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![media_id, owner_account_id, recipient_account_id, conversation_id, ciphertext, ciphertext.len() as i64, created_at],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    pub fn media_bytes(&self, account_id: &str, media_id: &str) -> SqlResult<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT ciphertext FROM media_objects WHERE id = ?1 AND (owner_account_id = ?2 OR recipient_account_id = ?2)",
+                params![media_id, account_id],
+                |row| row.get(0),
             )
             .optional()
     }
@@ -1628,6 +1705,98 @@ mod tests {
                 .messages
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn replaces_push_token_for_a_device() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open memory database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        storage
+            .register_push_token(
+                &account.id,
+                "device-1",
+                "ExponentPushToken[first]",
+                "android",
+                2,
+            )
+            .expect("register first token");
+        storage
+            .register_push_token(
+                &account.id,
+                "device-1",
+                "ExponentPushToken[second]",
+                "android",
+                3,
+            )
+            .expect("replace token");
+        assert_eq!(
+            storage.push_tokens(&account.id).expect("list tokens"),
+            vec!["ExponentPushToken[second]".to_owned()]
+        );
+    }
+
+    #[test]
+    fn media_is_idempotent_and_scoped_to_sender_or_recipient() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open media database");
+        let owner = account();
+        let recipient = StoredAccount {
+            id: "account-2".to_owned(),
+            name: "Bob".to_owned(),
+            handle: "bob".to_owned(),
+            password_hash: "hash".to_owned(),
+        };
+        let stranger = StoredAccount {
+            id: "account-3".to_owned(),
+            name: "Eve".to_owned(),
+            handle: "eve".to_owned(),
+            password_hash: "hash".to_owned(),
+        };
+        storage.create_account(&owner, 1).expect("create owner");
+        storage
+            .create_account(&recipient, 1)
+            .expect("create recipient");
+        storage
+            .create_account(&stranger, 1)
+            .expect("create stranger");
+        assert!(storage
+            .store_media(
+                &owner.id,
+                &recipient.id,
+                "direct-1",
+                "media-1",
+                b"ciphertext",
+                2
+            )
+            .expect("store media"));
+        assert!(!storage
+            .store_media(
+                &owner.id,
+                &recipient.id,
+                "direct-1",
+                "media-1",
+                b"changed",
+                3
+            )
+            .expect("repeat media"));
+        assert_eq!(
+            storage
+                .media_bytes(&owner.id, "media-1")
+                .expect("owner media"),
+            Some(b"ciphertext".to_vec())
+        );
+        assert_eq!(
+            storage
+                .media_bytes(&recipient.id, "media-1")
+                .expect("recipient media"),
+            Some(b"ciphertext".to_vec())
+        );
+        assert_eq!(
+            storage
+                .media_bytes(&stranger.id, "media-1")
+                .expect("stranger media"),
+            None
         );
     }
 
@@ -2430,6 +2599,64 @@ impl Storage {
         }
     }
 
+    pub async fn register_push_token(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        token: &str,
+        platform: &str,
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .register_push_token(account_id, device_id, token, platform, updated_at)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                sqlx::query("DELETE FROM push_tokens WHERE token = $1 AND NOT (owner_account_id = $2 AND device_id = $3)")
+                    .bind(token)
+                    .bind(account_id)
+                    .bind(device_id)
+                    .execute(pool)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO push_tokens (owner_account_id, device_id, token, platform, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $5)
+                     ON CONFLICT (owner_account_id, device_id) DO UPDATE SET token = EXCLUDED.token, platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(account_id)
+                .bind(device_id)
+                .bind(token)
+                .bind(platform)
+                .bind(updated_at)
+                .execute(pool)
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn push_tokens(&self, account_id: &str) -> Result<Vec<String>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .push_tokens(account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let rows = sqlx::query("SELECT token FROM push_tokens WHERE owner_account_id = $1")
+                    .bind(account_id)
+                    .fetch_all(pool)
+                    .await?;
+                rows.into_iter()
+                    .map(|row| row.try_get("token"))
+                    .collect::<Result<Vec<String>, sqlx::Error>>()
+                    .map_err(Into::into)
+            }
+        }
+    }
+
     pub async fn touch_presence(&self, account_id: &str, now: i64) -> Result<(), StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
@@ -2801,6 +3028,60 @@ impl Storage {
             .fetch_optional(pool)
             .await?
             .map(|row| row.try_get("can_write"))
+            .transpose()?),
+        }
+    }
+
+    pub async fn store_media(
+        &self,
+        owner_account_id: &str,
+        recipient_account_id: &str,
+        conversation_id: &str,
+        media_id: &str,
+        ciphertext: &[u8],
+        created_at: i64,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .store_media(owner_account_id, recipient_account_id, conversation_id, media_id, ciphertext, created_at)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "INSERT INTO media_objects (id, owner_account_id, recipient_account_id, conversation_id, ciphertext, byte_size, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(media_id)
+            .bind(owner_account_id)
+            .bind(recipient_account_id)
+            .bind(conversation_id)
+            .bind(ciphertext)
+            .bind(ciphertext.len() as i64)
+            .bind(created_at)
+            .execute(pool)
+            .await?
+            .rows_affected() > 0),
+        }
+    }
+
+    pub async fn media_bytes(
+        &self,
+        account_id: &str,
+        media_id: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .media_bytes(account_id, media_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "SELECT ciphertext FROM media_objects WHERE id = $1 AND (owner_account_id = $2 OR recipient_account_id = $2)",
+            )
+            .bind(media_id)
+            .bind(account_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|row| row.try_get("ciphertext"))
             .transpose()?),
         }
     }
@@ -3493,6 +3774,8 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_handle ON conversations(owner_account_id, handle) WHERE handle IS NOT NULL;\
          CREATE TABLE IF NOT EXISTS messages (seq BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author TEXT NOT NULL CHECK(author IN ('me', 'them')), text TEXT NOT NULL DEFAULT '', envelope_json TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, stack_id TEXT NOT NULL DEFAULT '', client_message_id TEXT NOT NULL, UNIQUE(owner_account_id, client_message_id));\
          CREATE INDEX IF NOT EXISTS messages_owner_cursor ON messages(owner_account_id, seq ASC);\
+         CREATE TABLE IF NOT EXISTS media_objects (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, recipient_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, conversation_id TEXT NOT NULL, ciphertext BYTEA NOT NULL, byte_size BIGINT NOT NULL, created_at BIGINT NOT NULL);\
+         CREATE INDEX IF NOT EXISTS media_objects_recipient ON media_objects(recipient_account_id, created_at ASC);\
          CREATE TABLE IF NOT EXISTS realtime_event_cursors (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, cursor BIGINT NOT NULL);\
          CREATE TABLE IF NOT EXISTS realtime_events (account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, cursor BIGINT NOT NULL, kind TEXT NOT NULL, source_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(account_id, cursor), UNIQUE(account_id, kind, source_id));\
          CREATE INDEX IF NOT EXISTS realtime_events_account_cursor ON realtime_events(account_id, cursor ASC);\
@@ -3501,6 +3784,8 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          CREATE TABLE IF NOT EXISTS message_read_receipts (message_id TEXT NOT NULL, reader_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, read_at BIGINT NOT NULL, PRIMARY KEY(message_id, reader_account_id));\
          CREATE TABLE IF NOT EXISTS message_delivery_receipts (message_id TEXT NOT NULL, recipient_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, delivered_at BIGINT NOT NULL, PRIMARY KEY(message_id, recipient_account_id));\
          CREATE TABLE IF NOT EXISTS device_keys (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, key_id TEXT NOT NULL, encryption_public_key TEXT NOT NULL, signing_public_key TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY(owner_account_id, device_id), UNIQUE(owner_account_id, key_id));\
+         CREATE TABLE IF NOT EXISTS push_tokens (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE, platform TEXT NOT NULL CHECK(platform IN ('android', 'ios')), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY(owner_account_id, device_id));\
+         CREATE INDEX IF NOT EXISTS push_tokens_owner ON push_tokens(owner_account_id);\
          CREATE TABLE IF NOT EXISTS account_keys (owner_account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, key_id TEXT NOT NULL UNIQUE, encryption_public_key TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
          ALTER TABLE messages ADD COLUMN IF NOT EXISTS envelope_json TEXT NOT NULL DEFAULT '';\
          ALTER TABLE messages ADD COLUMN IF NOT EXISTS stack_id TEXT NOT NULL DEFAULT '';\

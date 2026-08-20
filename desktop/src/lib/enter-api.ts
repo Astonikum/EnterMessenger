@@ -235,6 +235,42 @@ export async function sendMessage(profile: Profile, conversationId: string, mess
   return readJson<SendMessageResponse>(response);
 }
 
+export function uploadMedia(profile: Profile, conversationId: string, mediaId: string, recipient: string, ciphertext: Uint8Array, onProgress?: (progress: number) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", apiUrl(profile, "/api/v1/media"));
+    xhr.timeout = REQUEST_TIMEOUT_MS;
+    xhr.setRequestHeader("authorization", `Bearer ${profile.token}`);
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    xhr.setRequestHeader("x-enter-media-id", mediaId);
+    xhr.setRequestHeader("x-enter-conversation-id", conversationId);
+    xhr.setRequestHeader("x-enter-recipient", recipient);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else {
+        let detail = "";
+        try {
+          const payload = JSON.parse(xhr.responseText) as { error?: unknown };
+          if (typeof payload.error === "string") detail = `: ${payload.error}`;
+        } catch { /* Keep the HTTP status. */ }
+        reject(new Error(`Enter media request failed: ${xhr.status}${detail}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Не удалось загрузить вложение"));
+    xhr.ontimeout = () => reject(new Error("Загрузка вложения превысила тайм-аут"));
+    xhr.send(ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength) as ArrayBuffer);
+  });
+}
+
+export async function downloadMedia(profile: Profile, mediaId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/media/${encodeURIComponent(mediaId)}`), { headers: { authorization: `Bearer ${profile.token}` } });
+  if (!response.ok) throw new Error(`Enter media request failed: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 export async function syncDeviceHistory(profile: Profile, entries: DeviceHistoryEntry[]) {
   if (entries.length === 0) return;
   const response = await request(apiUrl(profile, "/api/v1/device-history"), {

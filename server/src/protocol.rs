@@ -23,6 +23,8 @@ pub struct DiscoveryEndpoints {
     pub keys: &'static str,
     pub federation_delivery: &'static str,
     pub realtime: &'static str,
+    pub media_upload: &'static str,
+    pub media_download: &'static str,
 }
 
 #[derive(Serialize)]
@@ -107,12 +109,15 @@ pub fn discovery(
             "message-relay",
             "federation",
             "encrypted-messages",
+            "encrypted-media",
             "realtime",
         ],
         endpoints: DiscoveryEndpoints {
             keys: "/enter/v1/keys/{handle}",
             federation_delivery: "/enter/v1/federation/deliveries",
             realtime: "/api/v1/realtime",
+            media_upload: "/api/v1/media",
+            media_download: "/api/v1/media/{media_id}",
         },
         crypto: CryptoProfile {
             identity_signature: "ECDSA-P256-SHA256",

@@ -3,9 +3,10 @@ use argon2::{
     Argon2,
 };
 use axum::{
+    body::{Body, Bytes},
     extract::{
         ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        DefaultBodyLimit, Path, Query, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -306,6 +307,12 @@ struct SendMessageResponse {
     message: MessageResponse,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaUploadResponse {
+    accepted: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceHistoryEntry {
@@ -337,6 +344,19 @@ struct RegisterDeviceKeyRequest {
     created_at: i64,
     account_key_id: Option<String>,
     account_encryption_public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterPushTokenRequest {
+    token: String,
+    device_id: String,
+    platform: String,
+}
+
+#[derive(Serialize)]
+struct PushTokenResponse {
+    accepted: bool,
 }
 
 #[derive(Deserialize)]
@@ -536,6 +556,7 @@ async fn deliver_local_message(
     envelope: &protocol::EncryptedEnvelope,
     envelope_json: &str,
     created_at: i64,
+    notify: bool,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let Some((recipient_handle, recipient_server)) = enter_address_parts(&envelope.recipient)
     else {
@@ -592,8 +613,72 @@ async fn deliver_local_message(
         {
             publish_stored_event(state, event).await;
         }
+        let title = sender
+            .as_ref()
+            .map(|value| value.name.as_str())
+            .unwrap_or(sender_handle);
+        if notify {
+            tokio::spawn(send_push_notification(
+                state.clone(),
+                recipient.id.clone(),
+                title.to_owned(),
+                envelope.conversation_id.clone(),
+                message.id.clone(),
+            ));
+        }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpoPushMessage {
+    to: String,
+    title: String,
+    body: String,
+    data: serde_json::Value,
+    channel_id: String,
+}
+
+async fn send_push_notification(
+    state: AppState,
+    account_id: String,
+    title: String,
+    conversation_id: String,
+    message_id: String,
+) {
+    let Ok(tokens) = state.db.push_tokens(&account_id).await else {
+        return;
+    };
+    if tokens.is_empty() {
+        return;
+    }
+    let payload = tokens
+        .into_iter()
+        .map(|token| ExpoPushMessage {
+            to: token,
+            title: title.clone(),
+            body: "Новое сообщение".to_owned(),
+            data: serde_json::json!({
+                "profileId": account_id,
+                "conversationId": conversation_id,
+                "messageId": message_id,
+            }),
+            channel_id: "messages".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    match reqwest::Client::new()
+        .post(&state.config.expo_push_url)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(response) if !response.status().is_success() => {
+            eprintln!("push provider returned {}", response.status());
+        }
+        Err(error) => eprintln!("push delivery failed: {error}"),
+        _ => {}
+    }
 }
 
 fn auth_response(account: &storage::StoredAccount, server_id: &str) -> AuthResponse {
@@ -1169,6 +1254,31 @@ async fn mark_message_delivered(
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "message_not_found"))
 }
 
+async fn register_push_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterPushTokenRequest>,
+) -> Result<Json<PushTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let token = request.token.trim();
+    let device_id = request.device_id.trim();
+    let platform = request.platform.trim().to_ascii_lowercase();
+    if token.len() < 10
+        || token.len() > 512
+        || device_id.is_empty()
+        || device_id.len() > 128
+        || !matches!(platform.as_str(), "android" | "ios")
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_push_token"));
+    }
+    state
+        .db
+        .register_push_token(&account_id, device_id, token, &platform, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(PushTokenResponse { accepted: true }))
+}
+
 async fn send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1259,10 +1369,18 @@ async fn send_message(
     {
         publish_stored_event(&state, event).await;
     }
-    for envelope in &envelopes {
+    for (index, envelope) in envelopes.iter().enumerate() {
         let envelope_json = serde_json::to_string(envelope)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
-        deliver_local_message(&state, &account_id, envelope, &envelope_json, created_at).await?;
+        deliver_local_message(
+            &state,
+            &account_id,
+            envelope,
+            &envelope_json,
+            created_at,
+            index == 0,
+        )
+        .await?;
     }
     let cursor = state
         .db
@@ -1275,6 +1393,112 @@ async fn send_message(
         next_cursor: cursor,
         message,
     }))
+}
+
+fn valid_media_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+async fn upload_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<MediaUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let max_media_body = state.config.media_max_bytes.saturating_add(16);
+    if body.is_empty() || body.len() > max_media_body {
+        return Err(error(StatusCode::PAYLOAD_TOO_LARGE, "media_too_large"));
+    }
+    let media_id = headers
+        .get("x-enter-media-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    let conversation_id = headers
+        .get("x-enter-conversation-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    let recipient_address = headers
+        .get("x-enter-recipient")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if !valid_media_id(media_id) || conversation_id.is_empty() || conversation_id.len() > 256 {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_media_metadata"));
+    }
+    match state
+        .db
+        .can_write(&account_id, conversation_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        None => return Err(error(StatusCode::NOT_FOUND, "conversation_not_found")),
+        Some(false) => return Err(error(StatusCode::FORBIDDEN, "conversation_read_only")),
+        Some(true) => {}
+    }
+
+    let recipient_account_id = if recipient_address.is_empty() {
+        account_id.clone()
+    } else {
+        let Some((handle, server)) = enter_address_parts(recipient_address) else {
+            return Err(error(StatusCode::BAD_REQUEST, "invalid_media_recipient"));
+        };
+        if !same_server(&state.config.public_url, server) {
+            return Err(error(StatusCode::BAD_REQUEST, "media_recipient_remote"));
+        }
+        let Some(recipient) = state
+            .db
+            .account_by_handle(handle)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        else {
+            return Err(error(StatusCode::NOT_FOUND, "media_recipient_not_found"));
+        };
+        recipient.id
+    };
+    state
+        .db
+        .store_media(
+            &account_id,
+            &recipient_account_id,
+            conversation_id,
+            media_id,
+            &body,
+            storage::now_ms(),
+        )
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(MediaUploadResponse { accepted: true }))
+}
+
+async fn download_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(media_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    if !valid_media_id(&media_id) {
+        return Err(error(StatusCode::NOT_FOUND, "media_not_found"));
+    }
+    let Some(bytes) = state
+        .db
+        .media_bytes(&account_id, &media_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    else {
+        return Err(error(StatusCode::NOT_FOUND, "media_not_found"));
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(Body::from(bytes))
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "media_response_failed"))
 }
 
 async fn device_history(
@@ -1673,6 +1897,7 @@ async fn main() {
         server_id,
         realtime: RealtimeHub::default(),
     };
+    let max_media_body = state.config.media_max_bytes.saturating_add(16);
     let app = Router::new()
         .route("/health", get(health))
         .route("/.well-known/enter", get(protocol_discovery))
@@ -1682,6 +1907,8 @@ async fn main() {
         .route("/api/v1/sync", get(sync))
         .route("/api/v1/realtime", get(realtime))
         .route("/api/v1/messages", post(send_message))
+        .route("/api/v1/media", post(upload_media))
+        .route("/api/v1/media/:media_id", get(download_media))
         .route(
             "/api/v1/conversations/:conversation_id/read",
             post(mark_conversation_read),
@@ -1690,12 +1917,14 @@ async fn main() {
             "/api/v1/messages/:message_id/delivered",
             post(mark_message_delivered),
         )
+        .route("/api/v1/push-tokens", post(register_push_token))
         .route("/api/v1/device-history", post(device_history))
         .route("/api/v1/conversations", post(create_conversation))
         .route("/enter/v1/keys", post(register_device_key))
         .route("/enter/v1/keys/:handle", get(public_keys))
         .route("/enter/v1/federation/deliveries", post(federation_delivery))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(max_media_body))
         .layer(CorsLayer::permissive());
     let listener = tokio::net::TcpListener::bind(config.address)
         .await

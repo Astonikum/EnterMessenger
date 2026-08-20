@@ -9,5 +9,6 @@ mobile/.expo-export-check*/
 mobile/.expo-export-*/
 server/target/
 server/data/
+desktop/server/data/
 deploy/enter/data/
 *.log

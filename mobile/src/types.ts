@@ -31,11 +31,26 @@ export type Conversation = {
   lastSeenAt?: number;
 };
 
+export type MessageAttachment = {
+  id: string;
+  kind: "image" | "video" | "audio" | "file";
+  name: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  key: string;
+  nonce: string;
+  width?: number;
+  height?: number;
+  durationMs?: number;
+};
+
 export type Message = {
   id: string;
   author: "me" | "them";
   text: string;
   time: string;
+  attachments?: MessageAttachment[];
   stackId?: string;
   replyTo?: { id: string; text: string };
   editOf?: string;

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Enter",
     "slug": "enter-client",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "scheme": "enter",
@@ -19,7 +19,8 @@
     "plugins": [
       "expo-font",
       "expo-asset",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-notifications"
     ]
   }
 }

@@ -6,7 +6,7 @@ import { ChatReadOnlyState } from "../components/chat-read-only-state";
 import { AppRail } from "../components/app-rail";
 import { ConversationList } from "../components/conversation-list";
 import { ForwardMessageDialog } from "../components/forward-message-dialog";
-import { MessageComposer } from "../components/message-composer";
+import { MessageComposer, type PendingMedia } from "../components/message-composer";
 import { MessageList } from "../components/message-list";
 import { SettingsPanel } from "../components/settings-panel";
 import type { SearchUser } from "../lib/enter-api";
@@ -78,7 +78,8 @@ type MessengerViewProps = {
   onCloseSettings?: () => void;
   onSearchUser?: (query: string) => void | Promise<void>;
   onOpenSearchUser?: (user: SearchUser) => void | Promise<void>;
-  onSendMessage?: (message: Message) => void;
+  onSendMessage?: (message: Message, pendingMedia?: PendingMedia[]) => void;
+  mediaUploadProgress?: number | null;
   onReply?: (message: Message) => void;
   onEditMessage?: (message: Message) => void;
   onToggleMessagePinned?: (message: Message) => void;
@@ -110,6 +111,7 @@ export function MessengerView({
   messagesLoading = false,
   showSettings = false,
   messageError = "",
+  mediaUploadProgress = null,
   searchUser = null,
   searchBusy = false,
   searchError = "",
@@ -220,7 +222,7 @@ export function MessengerView({
       </div>
       <section className="app-chat flex min-w-0 flex-col overflow-hidden">
         <ChatHeader conversation={activeConversation} searchOpen={searchOpen} searchQuery={searchQuery} searchResultsCount={visibleMessages.length} onSearchOpen={() => setSearchOpen(true)} onSearchClose={() => { setSearchOpen(false); setSearchQuery(""); }} onSearchQueryChange={setSearchQuery} />
-        {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
+        {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} profile={activeProfile} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} uploadProgress={mediaUploadProgress} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
       </section>
       {showSettings && <SettingsPanel onClose={onCloseSettings} />}
       {messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
