@@ -133,11 +133,12 @@ jobs:
           fi
 
           release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | [.id, .tag_name] | @tsv' | \
-            awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
+            --jq '.[] | [.id, .tag_name, .name] | @tsv' | \
+            awk -F '\t' -v tag="$tag" -v title="$title" '$2 == tag || $3 == title {print $1; exit}')"
 
           if [[ -n "$release_id" ]]; then
             gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f "tag_name=$tag" \
               -f "name=$title" \
               -f "body=$notes" \
               -F draft=true \
@@ -167,6 +168,7 @@ jobs:
             -H "Content-Type: application/octet-stream" \
             --input "$artifact_path" >/dev/null
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -f "tag_name=$tag" \
             -F draft=true \
             -F prerelease=false >/dev/null
           release_url="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq .html_url)"
