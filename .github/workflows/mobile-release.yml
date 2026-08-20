@@ -70,6 +70,7 @@ jobs:
         run: |
           version="$(node -p "require('./app.json').expo.version")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=mobile-v$version" >> "$GITHUB_OUTPUT"
 
       - name: Build Android artifact
         id: artifact
@@ -113,3 +114,18 @@ jobs:
         run: |
           echo "### Mobile artifact" >> "$GITHUB_STEP_SUMMARY"
           echo "Uploaded Enter-Mobile-v${{ steps.version.outputs.version }}-${{ steps.artifact.outputs.profile }}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create versioned mobile tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists."
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$tag" \
+              -f "sha=$GITHUB_SHA"
+            echo "Created tag $tag."
+          fi
+          echo "Tag: $tag" >> "$GITHUB_STEP_SUMMARY"
