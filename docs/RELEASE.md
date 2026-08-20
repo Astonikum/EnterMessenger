@@ -3,7 +3,7 @@
 Релизы запускаются вручную из GitHub Actions:
 
 - `Desktop release` — Windows x64, Linux x64, macOS Intel и macOS Apple Silicon.
-- `Mobile release` — Android/iOS через EAS; параметр `submit` отдельно включает отправку в магазины.
+- `Mobile release` — Android через EAS; параметр `submit` отдельно включает отправку в Google Play.
 - `CI` запускается на pull request и push в `main` и проверяет desktop/mobile production-сборки.
 
 ## Версии
@@ -45,7 +45,7 @@ npx eas-cli build:configure
 Project ID `aaa033ad-a37f-4ad4-b608-394d0a21320e` зафиксирован в
 `mobile/app.config.js`; отдельный secret для него не нужен.
 
-Для `submit: true` также должны быть настроены Android keystore и Google Play service account, а для iOS — App Store Connect credentials. Без этих секретов action может собрать артефакт, но не сможет отправить его в store.
+Для `submit: true` должны быть настроены Android keystore и Google Play service account. Без этих секретов action может собрать артефакт, но не сможет отправить его в Google Play.
 
 ## Подпись desktop
 
