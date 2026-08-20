@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Enter",
-    "slug": "enter-messenger",
+    "slug": "enter-client",
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
