@@ -1,0 +1,13 @@
+node_modules/
+.env
+server/.env
+dist/
+desktop/.vite/
+desktop/src-tauri/target/
+mobile/.expo/
+mobile/.expo-export-check*/
+mobile/.expo-export-*/
+server/target/
+server/data/
+deploy/enter/data/
+*.log

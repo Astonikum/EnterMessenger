@@ -1,0 +1,61 @@
+# Production releases
+
+Релизы запускаются вручную из GitHub Actions:
+
+- `Desktop release` — Windows x64, Linux x64, macOS Intel и macOS Apple Silicon.
+- `Mobile release` — Android/iOS через EAS; параметр `submit` отдельно включает отправку в магазины.
+- `CI` запускается на pull request и push в `main` и проверяет desktop/mobile production-сборки.
+
+## Версии
+
+Перед запуском действия версия должна быть изменена в соответствующих manifest-файлах и закоммичена:
+
+- desktop: `desktop/package.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/tauri.conf.json`;
+- mobile: `mobile/package.json`, `mobile/app.json`.
+
+Desktop action создает draft-релиз с тегом `desktop-v<version>`. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
+
+## Хранение данных
+
+Desktop использует стабильный Tauri identifier `com.enter.messenger`. `localStorage`, IndexedDB, кэш сообщений, outbox и локальные E2E-ключи живут в каталоге данных WebView приложения и не зависят от папки установки:
+
+- Windows: `%LOCALAPPDATA%\com.enter.messenger`;
+- Linux: `~/.local/share/com.enter.messenger`;
+- macOS: `~/Library/Application Support/com.enter.messenger`.
+
+Обновления не должны менять identifier и не должны очищать WebView data directory — иначе пользователь потеряет локальную сессию, кэш и ключи.
+
+Mobile хранит обычное состояние и кэш через AsyncStorage, а приватные device/account keys — через SecureStore. Удаление приложения может удалить эти данные согласно политике ОС.
+
+## Одноразовая настройка EAS
+
+В Expo нужно один раз создать/связать EAS project и настроить store credentials:
+
+```bash
+cd mobile
+npx eas-cli login
+npx eas-cli build:configure
+```
+
+После этого добавь в GitHub Actions secrets:
+
+- `EXPO_TOKEN` — токен Expo;
+- `EXPO_OWNER` — Expo account/organization, если owner не задан в конфиге.
+
+Project ID `aaa033ad-a37f-4ad4-b608-394d0a21320e` зафиксирован в
+`mobile/app.config.js`; отдельный secret для него не нужен.
+
+Для `submit: true` также должны быть настроены Android keystore и Google Play service account, а для iOS — App Store Connect credentials. Без этих секретов action может собрать артефакт, но не сможет отправить его в store.
+
+## Подпись desktop
+
+Текущий action готовит release-артефакты, но signing secrets еще не заведены. Перед публичным распространением нужно добавить code-signing для Windows и Apple Developer signing/notarization для macOS. Linux-пакеты можно выпускать без отдельного store signing.
+
+## Security follow-up
+
+`npm ci` для desktop проходит без advisories. Mobile собирается и проходит typecheck,
+но текущий Expo SDK 52 дает 23 транзитивных npm advisories (включая 1 critical)
+в инструментах Expo/Metro. Автоматический `npm audit fix --force` требует breaking
+upgrade Expo/React Native, поэтому он намеренно не применен вслепую. Перед публичным
+релизом нужно отдельно обновить Expo SDK, прогнать native smoke tests и закрыть этот
+audit debt.

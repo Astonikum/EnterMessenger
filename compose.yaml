@@ -1,0 +1,20 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: enter-server:local
+    restart: unless-stopped
+    ports:
+      - "${ENTER_PORT:-50121}:50121"
+    environment:
+      ENTER_BIND_ADDRESS: 0.0.0.0
+      ENTER_PORT: "50121"
+      ENTER_SERVER_URL: "${ENTER_SERVER_URL:-http://127.0.0.1:50121}"
+      ENTER_SERVER_NAME: "${ENTER_SERVER_NAME:-Enter}"
+      ENTER_DATABASE_URL: sqlite:///data/enter.sqlite3
+    volumes:
+      - enter-server-data:/data
+
+volumes:
+  enter-server-data:

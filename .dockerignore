@@ -1,0 +1,10 @@
+.git
+.env
+server/.env
+**/node_modules
+**/target
+**/dist
+**/.expo
+**/.vite
+**/*.log
+server/data/*

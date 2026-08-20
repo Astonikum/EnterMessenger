@@ -1,0 +1,64 @@
+{
+  "name": "react-component-preview",
+  "displayName": "React Component Preview",
+  "description": "Preview React components directly from TSX and JSX files.",
+  "version": "0.0.5",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:reactPreview.open",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescriptreact"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "React Preview bundles and executes workspace source in a webview, so the workspace must be trusted."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "reactPreview.open",
+        "title": "React Preview: Open Preview"
+      },
+      {
+        "command": "reactPreview.refresh",
+        "title": "React Preview: Reload Current Preview"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "reactPreview.open",
+          "when": "editorLangId == javascriptreact || editorLangId == typescriptreact",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "React Preview",
+      "properties": {
+        "reactPreview.refreshOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refresh the open preview after saving its source file."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/previewParser.test.js && node test/previewCompiler.test.js && node test/extension.test.js",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

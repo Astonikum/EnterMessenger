@@ -1,0 +1,22 @@
+services:
+  server:
+    image: astonikum/enter-server:latest
+    container_name: enter-server
+    restart: unless-stopped
+    ports:
+      - "50121:50121"
+    env_file:
+      - .env
+    environment:
+      ENTER_BIND_ADDRESS: 0.0.0.0
+      ENTER_PORT: "50121"
+      ENTER_DATABASE_URL: sqlite:///data/enter.sqlite3
+    volumes:
+      - ./data:/data
+      - ./server-logo.png:/opt/enter/server-logo.png:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:50121/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
