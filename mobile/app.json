@@ -11,7 +11,10 @@
       "package": "com.enter.messenger"
     },
     "ios": {
-      "bundleIdentifier": "com.enter.messenger"
+      "bundleIdentifier": "com.enter.messenger",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "plugins": [
       "expo-font",
