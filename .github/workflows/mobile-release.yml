@@ -14,6 +14,12 @@ on:
         type: boolean
         default: false
         required: true
+      profile:
+        description: EAS build profile (preview creates an installable APK)
+        type: choice
+        options: [preview, production]
+        default: preview
+        required: true
 
 permissions:
   contents: write
@@ -65,24 +71,62 @@ jobs:
           version="$(node -p "require('./app.json').expo.version")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build without submitting
-        if: ${{ !inputs.submit }}
-        run: eas build --platform "${{ inputs.platform }}" --profile production --non-interactive --no-wait
-
-      - name: Build and submit
-        if: ${{ inputs.submit }}
+      - name: Build Android artifact
+        id: artifact
         run: |
-          eas build --platform android --profile production --non-interactive
-          eas submit --platform android --profile production --latest --non-interactive
+          profile="${{ inputs.profile }}"
+          if [[ "${{ inputs.submit }}" == "true" ]]; then
+            profile=production
+          fi
 
-      - name: Create mobile draft release
+          eas build \
+            --platform "${{ inputs.platform }}" \
+            --profile "$profile" \
+            --non-interactive \
+            --wait \
+            --json > build.json
+
+          if [[ "${{ inputs.submit }}" == "true" ]]; then
+            eas submit --platform android --profile production --latest --non-interactive
+          fi
+
+          artifact_url="$(node -e 'const fs=require("fs"); const builds=JSON.parse(fs.readFileSync("build.json", "utf8")); const url=builds[0]?.artifacts?.applicationArchiveUrl; if (!url) process.exit(1); process.stdout.write(url);')"
+          extension=apk
+          if [[ "$profile" == "production" ]]; then
+            extension=aab
+          fi
+          artifact_name="Enter-Mobile-v${{ steps.version.outputs.version }}.${extension}"
+          mkdir -p release
+          curl --fail --location --retry 3 "$artifact_url" --output "release/$artifact_name"
+          rm -f build.json
+          echo "path=release/$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update mobile draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="mobile-v${{ steps.version.outputs.version }}"
-          gh release create "$tag" \
+          title="Enter Mobile v${{ steps.version.outputs.version }}"
+          notes="Android ${{ steps.artifact.outputs.profile }} artifact created by EAS."
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes "$notes"
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --draft
+          fi
+
+          gh release upload "$tag" "${{ steps.artifact.outputs.path }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Enter Mobile v${{ steps.version.outputs.version }}" \
-            --notes "Android build created by EAS." \
-            --draft
+            --clobber
+
+          echo "### Mobile artifact" >> "$GITHUB_STEP_SUMMARY"
+          echo "[$(basename "${{ steps.artifact.outputs.path }}")](https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$(basename "${{ steps.artifact.outputs.path }}"))" >> "$GITHUB_STEP_SUMMARY"

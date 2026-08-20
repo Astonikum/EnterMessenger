@@ -3,7 +3,7 @@
 Релизы запускаются вручную из GitHub Actions:
 
 - `Desktop release` — Windows x64, Linux x64, macOS Intel и macOS Apple Silicon.
-- `Mobile release` — Android через EAS; параметр `submit` отдельно включает отправку в Google Play.
+- `Mobile release` — Android через EAS; по умолчанию профиль `preview` создает устанавливаемый `.apk` и прикрепляет его к draft-релизу. Профиль `production` создает `.aab` для Google Play; параметр `submit` отдельно включает отправку в Google Play.
 - `CI` запускается на pull request и push в `main` и проверяет desktop/mobile production-сборки.
 
 ## Версии
@@ -14,6 +14,8 @@
 - mobile: `mobile/package.json`, `mobile/app.json`.
 
 Desktop action создает draft-релиз с тегом `desktop-v<version>`, а Mobile action — draft-релиз с тегом `mobile-v<version>`. Версия берется отдельно из manifest соответствующей платформы. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
+
+Для мобильного тестового релиза выбери `platform: android`, `profile: preview` и `submit: false`. APK появится во вкладке Assets draft-релиза. Для Google Play выбери `profile: production` и включи `submit` — этот вариант выпускает AAB.
 
 ## Хранение данных
 

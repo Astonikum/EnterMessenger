@@ -4,6 +4,12 @@
     "appVersionSource": "local"
   },
   "build": {
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
     "production": {
       "distribution": "store",
       "autoIncrement": true
