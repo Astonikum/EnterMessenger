@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_NAME: &str = "enter";
-pub const PROTOCOL_VERSION: &str = "enter/0.1";
+pub const PROTOCOL_VERSION: &str = "enter/0.2";
 
 #[derive(Serialize)]
 pub struct DiscoveryDocument {

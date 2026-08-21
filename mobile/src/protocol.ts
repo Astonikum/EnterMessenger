@@ -1,4 +1,4 @@
-export const ENTER_PROTOCOL_VERSION = "enter/0.1" as const;
+export const ENTER_PROTOCOL_VERSION = "enter/0.2" as const;
 
 export type EncryptedEnvelope = {
   protocol: typeof ENTER_PROTOCOL_VERSION;

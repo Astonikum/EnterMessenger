@@ -188,6 +188,7 @@ export default function App() {
   const [outboxByProfile, setOutboxByProfile] = useState<Record<string, OutboxEntry[]>>(readOutbox);
   const [syncConnected, setSyncConnected] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
+  const [showProfile, setShowProfile] = useState(() => readTabState().showProfile ?? false);
   const [showSettings, setShowSettings] = useState(() => readTabState().showSettings ?? false);
   const [searchResult, setSearchResult] = useState<SearchUser | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
@@ -303,9 +304,10 @@ export default function App() {
       activeFolderByProfile: activeProfileId
         ? { ...state.activeFolderByProfile, [activeProfileId]: activeFolder }
         : state.activeFolderByProfile,
+      showProfile,
       showSettings,
     });
-  }, [activeConversationId, activeFolder, activeProfileId, showSettings]);
+  }, [activeConversationId, activeFolder, activeProfileId, showProfile, showSettings]);
 
   useEffect(() => {
     const cached = activeProfileId ? readMessageCache(activeProfileId) : null;
@@ -1104,6 +1106,7 @@ export default function App() {
       activeConversation={activeConversation}
       messages={messages}
       messageToForward={messageToForward}
+      showProfile={showProfile}
       showSettings={showSettings}
       messageError={messageError}
       mediaUploadProgress={mediaUploadProgress}
@@ -1126,8 +1129,10 @@ export default function App() {
       onAddToFolder={addToFolder}
       onDelete={deleteConversation}
       onReorder={reorderConversations}
-      onBack={() => setActiveConversationId(null)}
-      onToggleSettings={() => setShowSettings((value) => !value)}
+      onBack={() => { setActiveConversationId(null); setShowProfile(false); setShowSettings(false); }}
+      onToggleProfile={() => { setShowProfile((value) => !value); setShowSettings(false); }}
+      onCloseProfile={() => setShowProfile(false)}
+      onToggleSettings={() => { setShowSettings((value) => !value); setShowProfile(false); }}
       onCloseSettings={() => setShowSettings(false)}
       onSendMessage={sendMessage}
       onReply={replyToMessage}

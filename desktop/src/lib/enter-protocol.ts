@@ -1,5 +1,5 @@
 export const ENTER_PROTOCOL = "enter";
-export const ENTER_PROTOCOL_VERSION = "enter/0.1";
+export const ENTER_PROTOCOL_VERSION = "enter/0.2";
 
 export type EnterAddress = {
   handle: string;

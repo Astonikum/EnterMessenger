@@ -8,6 +8,7 @@ import { ConversationList } from "../components/conversation-list";
 import { ForwardMessageDialog } from "../components/forward-message-dialog";
 import { MessageComposer, type PendingMedia } from "../components/message-composer";
 import { MessageList } from "../components/message-list";
+import { ProfilePanel } from "../components/profile-panel";
 import { SettingsPanel } from "../components/settings-panel";
 import type { SearchUser } from "../lib/enter-api";
 import type { Conversation, Message, Profile } from "../types";
@@ -56,6 +57,7 @@ type MessengerViewProps = {
   replyTo?: Message | null;
   editingMessage?: Message | null;
   messagesLoading?: boolean;
+  showProfile?: boolean;
   showSettings?: boolean;
   messageError?: string;
   searchUser?: SearchUser | null;
@@ -74,6 +76,8 @@ type MessengerViewProps = {
   onDelete?: (id: string) => void;
   onReorder?: (sourceId: string, targetId: string) => void;
   onBack?: () => void;
+  onToggleProfile?: () => void;
+  onCloseProfile?: () => void;
   onToggleSettings?: () => void;
   onCloseSettings?: () => void;
   onSearchUser?: (query: string) => void | Promise<void>;
@@ -109,6 +113,7 @@ export function MessengerView({
   replyTo = null,
   editingMessage = null,
   messagesLoading = false,
+  showProfile = false,
   showSettings = false,
   messageError = "",
   mediaUploadProgress = null,
@@ -128,6 +133,8 @@ export function MessengerView({
   onDelete = () => undefined,
   onReorder = () => undefined,
   onBack = () => undefined,
+  onToggleProfile = () => undefined,
+  onCloseProfile = () => undefined,
   onToggleSettings = () => undefined,
   onCloseSettings = () => undefined,
   onSearchUser = () => undefined,
@@ -215,7 +222,7 @@ export function MessengerView({
 
   return (
     <main className="app-shell bg-background text-foreground" data-settings={showSettings} data-resizing={isResizing} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
-      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showSettings={showSettings} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleSettings={onToggleSettings} />
+      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showProfile={showProfile} showSettings={showSettings} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleProfile={onToggleProfile} onToggleSettings={onToggleSettings} />
       <div className="app-conversations-shell">
         <ConversationList className="app-conversations" conversations={conversations} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onAddToFolder={onAddToFolder} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
         <div className="app-conversations-resizer" role="separator" aria-label="Изменить ширину списка чатов" aria-orientation="vertical" aria-valuemin={MIN_CONVERSATIONS_WIDTH} aria-valuemax={maxConversationsWidth()} aria-valuenow={conversationsWidth} tabIndex={0} onPointerDown={beginConversationsResize} onKeyDown={handleConversationsResizeKeyDown} title="Изменить ширину списка чатов" />
@@ -224,6 +231,7 @@ export function MessengerView({
         <ChatHeader conversation={activeConversation} searchOpen={searchOpen} searchQuery={searchQuery} searchResultsCount={visibleMessages.length} onSearchOpen={() => setSearchOpen(true)} onSearchClose={() => { setSearchOpen(false); setSearchQuery(""); }} onSearchQueryChange={setSearchQuery} />
         {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} profile={activeProfile} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} uploadProgress={mediaUploadProgress} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
       </section>
+      {showProfile && <ProfilePanel profile={activeProfile} onClose={onCloseProfile} onAddProfile={onAddProfile} />}
       {showSettings && <SettingsPanel onClose={onCloseSettings} />}
       {messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
     </main>

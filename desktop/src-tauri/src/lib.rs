@@ -17,6 +17,10 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            #[cfg(desktop)]
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             #[cfg(desktop)]

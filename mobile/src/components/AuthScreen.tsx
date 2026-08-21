@@ -6,9 +6,11 @@ import type { Profile } from "../types";
 import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
 import { normalizeServerAddress } from "../rn-address";
+import { ENTER_PROTOCOL_VERSION } from "../protocol";
 
 type Props = { onAuthenticated: (profile: Profile, password: string) => void | Promise<void>; onCancel?: () => void };
 type Mode = "login" | "register";
+const SERVER_CHECK_TIMEOUT_MS = 5000;
 
 function Field({ label, value, onChangeText, placeholder, secureTextEntry, autoCapitalize = "none", autoFocus, keyboardType = "default", returnKeyType = "next", blurOnSubmit = true, onSubmitEditing, inputRef }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; secureTextEntry?: boolean; autoCapitalize?: "none" | "words"; autoFocus?: boolean; keyboardType?: "default" | "url"; returnKeyType?: "next" | "done" | "go"; blurOnSubmit?: boolean; onSubmitEditing?: () => void; inputRef?: (instance: TextInput | null) => void }) {
   return <View style={styles.field}><Text style={styles.label}>{label}</Text><TextInput ref={inputRef} value={value} onChangeText={onChangeText} placeholder={placeholder} placeholderTextColor={colors.muted} secureTextEntry={secureTextEntry} autoCapitalize={autoCapitalize} autoFocus={autoFocus} keyboardType={keyboardType} returnKeyType={returnKeyType} blurOnSubmit={blurOnSubmit} onSubmitEditing={onSubmitEditing} style={styles.input} /></View>;
@@ -47,13 +49,22 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     const url = normalizeServerAddress(serverInput);
     if (!url) { setError("Введите IP, домен или полный URL сервера"); return; }
     setBusy(true); setError("");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SERVER_CHECK_TIMEOUT_MS);
     try {
-      const response = await fetch(`${url}/health`);
-      const health = await response.json() as { status?: string; serverName?: string; logo?: string };
-      if (!response.ok || health.status !== "ok") throw new Error();
+      const response = await fetch(`${url}/health`, { signal: controller.signal });
+      if (!response.ok) throw new Error("unavailable");
+      const health = await response.json() as { status?: string; protocol?: string; serverName?: string; logo?: string };
+      if (health.status !== "ok") throw new Error("unavailable");
+      if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
       setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? new URL(health.logo, `${url}/`).toString() : undefined); transitionToStep("auth", "forward");
-    } catch { setError("Сервер недоступен или не поддерживает Enter API"); }
-    finally { setBusy(false); }
+    } catch (reason) {
+      setError(reason instanceof Error && reason.message === "unsupported_protocol"
+        ? `Сервер использует другую версию Enter API (нужна ${ENTER_PROTOCOL_VERSION})`
+        : reason instanceof Error && reason.name === "AbortError"
+          ? "Сервер не отвечает в течение 5 секунд"
+          : "Сервер недоступен или не поддерживает Enter API");
+    } finally { clearTimeout(timeout); setBusy(false); }
   }
 
   async function submitAuth() {

@@ -8,7 +8,8 @@
     "scheme": "enter",
     "icon": "./assets/enter-icon.png",
     "android": {
-      "package": "com.enter.messenger"
+      "package": "com.enter.messenger",
+      "usesCleartextTraffic": true
     },
     "ios": {
       "bundleIdentifier": "com.enter.messenger",

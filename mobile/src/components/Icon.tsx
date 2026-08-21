@@ -43,6 +43,7 @@ import {
   Video,
   Volume2,
   VolumeX,
+  UserRound,
   X,
   type LucideIcon,
 } from "lucide-react-native";
@@ -79,6 +80,7 @@ const names = {
   more: MoreHorizontal,
   notifications: Bell,
   notificationsOff: BellOff,
+  person: UserRound,
   phone: Phone,
   pause: Pause,
   pin: Pin,

@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import type { Profile } from "../types";
 import { normalizeServerAddress } from "../lib/server-address";
+import { ENTER_PROTOCOL_VERSION } from "../lib/enter-protocol";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Icon } from "./ui/icon";
@@ -12,6 +13,7 @@ type AuthPageProps = {
 
 type AuthMode = "login" | "register";
 type StepDirection = "forward" | "backward";
+const SERVER_CHECK_TIMEOUT_MS = 5000;
 
 type AuthResponse = {
   token: string;
@@ -42,18 +44,27 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
     }
     setBusy(true);
     setError("");
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), SERVER_CHECK_TIMEOUT_MS);
     try {
-      const response = await fetch(`${url}/health`);
-      const health = await response.json() as { status?: string; serverName?: string; logo?: string };
-      if (!response.ok || health.status !== "ok") throw new Error("Сервер не прошёл проверку");
+      const response = await fetch(`${url}/health`, { signal: controller.signal });
+      if (!response.ok) throw new Error("unavailable");
+      const health = await response.json() as { status?: string; protocol?: string; serverName?: string; logo?: string };
+      if (health.status !== "ok") throw new Error("unavailable");
+      if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
       setServerUrl(url);
       setServerName(health.serverName || "Enter");
       setServerLogo(health.logo);
       setStepDirection("forward");
       setStep("auth");
-    } catch {
-      setError("Сервер недоступен или не поддерживает Enter API");
+    } catch (reason) {
+      setError(reason instanceof Error && reason.message === "unsupported_protocol"
+        ? `Сервер использует другую версию Enter API (нужна ${ENTER_PROTOCOL_VERSION})`
+        : reason instanceof Error && reason.name === "AbortError"
+          ? "Сервер не отвечает в течение 5 секунд"
+          : "Сервер недоступен или не поддерживает Enter API");
     } finally {
+      window.clearTimeout(timeout);
       setBusy(false);
     }
   }

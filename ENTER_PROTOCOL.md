@@ -34,7 +34,7 @@ Enter — это federated messaging protocol для мессенджера: у 
 
 ## Первый контракт
 
-- `enter/0.1` — текущая версия discovery и message contract.
+- `enter/0.2` — текущая версия discovery и message contract.
 - `/.well-known/enter` — server discovery и cryptographic profile.
 - `POST /enter/v1/keys` — публикация публичного device key bundle после авторизации.
 - `GET /enter/v1/keys/{handle}` — публичный каталог ключей получателя.
