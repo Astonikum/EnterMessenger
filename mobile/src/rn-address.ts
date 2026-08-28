@@ -17,6 +17,11 @@ export function formatEnterAddress(address: EnterAddress) {
   return `${address.handle}@${address.server.replace(/^https?:\/\//, "")}`;
 }
 
+export function getSuggestedServerAddress(hostname = runtimeHostname()) {
+  const host = hostname.trim();
+  return host && host !== "0.0.0.0" ? `${host}:50121` : "";
+}
+
 export function normalizeServerAddress(raw: string) {
   const value = raw.trim();
   if (!value) return null;
@@ -50,4 +55,10 @@ function isLocalHost(hostname: string) {
   const octets = host.split(".").map(Number);
   if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
   return octets[0] === 10 || octets[0] === 127 || octets[0] === 169 && octets[1] === 254 || octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31 || octets[0] === 192 && octets[1] === 168;
+}
+
+function runtimeHostname() {
+  if (typeof globalThis === "undefined") return "";
+  const location = (globalThis as typeof globalThis & { location?: { hostname?: unknown } }).location;
+  return typeof location?.hostname === "string" ? location.hostname : "";
 }

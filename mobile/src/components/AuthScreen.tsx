@@ -5,7 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { Profile } from "../types";
 import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
-import { normalizeServerAddress } from "../rn-address";
+import { getSuggestedServerAddress, normalizeServerAddress } from "../rn-address";
 import { ENTER_PROTOCOL_VERSION } from "../protocol";
 
 type Props = { onAuthenticated: (profile: Profile, password: string) => void | Promise<void>; onCancel?: () => void };
@@ -40,7 +40,7 @@ function Field({ label, value, onChangeText, placeholder, secureTextEntry, autoC
 export function AuthScreen({ onAuthenticated, onCancel }: Props) {
   const [step, setStep] = useState<"server" | "auth">("server");
   const [mode, setMode] = useState<Mode>("login");
-  const [serverInput, setServerInput] = useState("");
+  const [serverInput, setServerInput] = useState(getSuggestedServerAddress);
   const [serverUrl, setServerUrl] = useState("");
   const [serverName, setServerName] = useState("Enter");
   const [serverLogo, setServerLogo] = useState<string>();
@@ -115,7 +115,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     <StepIndicator step={step} />
     {step === "server" ? <View style={styles.form}>
       <Text style={styles.title}>Найдём ваш сервер</Text><Text style={styles.description}>Enter не использует встроенный сервер. Укажите адрес своего сервера — сначала проверим его доступность.</Text>
-      <Field label="Адрес сервера" value={serverInput} onChangeText={setServerInput} placeholder="192.168.1.12:50121" autoFocus keyboardType="url" returnKeyType="go" onSubmitEditing={() => void checkServer()} />
+      <Field label="Адрес сервера" value={serverInput} onChangeText={setServerInput} placeholder="IP компьютера:50121" autoFocus keyboardType="url" returnKeyType="go" onSubmitEditing={() => void checkServer()} />
       {!!error && <ErrorMessage text={error} />}
       <PrimaryButton label="Проверить сервер" icon="checkCircle" busy={busy} onPress={checkServer} />
     </View> : <View style={styles.form}>

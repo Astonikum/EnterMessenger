@@ -1674,6 +1674,36 @@ fn is_embedded_app_origin(value: &str) -> bool {
     )
 }
 
+fn is_local_dev_origin(value: &str) -> bool {
+    let Ok(uri) = value.parse::<Uri>() else {
+        return false;
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let Some(port) = uri.port_u16() else {
+        return false;
+    };
+    if scheme != "http" && scheme != "https" || !matches!(port, 8081 | 1420 | 19006) {
+        return false;
+    }
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "::1") || host.starts_with("127.") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = address.octets();
+    octets[0] == 10
+        || octets[0] == 192 && octets[1] == 168
+        || octets[0] == 172 && (16..=31).contains(&octets[1])
+        || octets[0] == 169 && octets[1] == 254
+}
+
 fn realtime_origin_allowed(headers: &HeaderMap, public_url: &str) -> bool {
     let Some(request_origin) = headers.get(header::ORIGIN) else {
         // Native clients do not send Origin. Browser clients must send the configured origin.
@@ -1682,7 +1712,7 @@ fn realtime_origin_allowed(headers: &HeaderMap, public_url: &str) -> bool {
     let Some(request_origin) = request_origin.to_str().ok() else {
         return false;
     };
-    if is_embedded_app_origin(request_origin) {
+    if is_embedded_app_origin(request_origin) || is_local_dev_origin(request_origin) {
         return true;
     }
     let Some(request_origin) = parse_request_origin(request_origin) else {
@@ -2282,9 +2312,9 @@ mod tests {
     use super::{
         constant_time_equal, conversation_response, enter_address_parts,
         envelope_belongs_to_account, federation_authorized, federation_delivery_error,
-        federation_urls, is_embedded_app_origin, normalize_server, origin, realtime_error_payload,
-        realtime_hello_error, realtime_origin_allowed, same_server, valid_envelope_batch,
-        RealtimeEvent, RealtimeHello, RealtimeHub, MAX_ENVELOPES_PER_MESSAGE,
+        federation_urls, is_embedded_app_origin, is_local_dev_origin, normalize_server, origin,
+        realtime_error_payload, realtime_hello_error, realtime_origin_allowed, same_server,
+        valid_envelope_batch, RealtimeEvent, RealtimeHello, RealtimeHub, MAX_ENVELOPES_PER_MESSAGE,
         REALTIME_PROTOCOL_VERSION,
     };
     use axum::http::{HeaderMap, HeaderValue};
@@ -2519,6 +2549,16 @@ mod tests {
         assert!(realtime_origin_allowed(&headers, "https://example.test"));
         assert!(is_embedded_app_origin("tauri://localhost"));
         assert!(!is_embedded_app_origin("https://evil.example"));
+        assert!(is_local_dev_origin("http://localhost:8081"));
+        assert!(is_local_dev_origin("http://192.168.0.160:8081"));
+        assert!(is_local_dev_origin("http://127.0.0.1:1420"));
+        assert!(!is_local_dev_origin("http://evil.example:8081"));
+        assert!(!is_local_dev_origin("http://192.168.0.160:3000"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("http://192.168.0.160:8081"),
+        );
+        assert!(realtime_origin_allowed(&headers, "http://127.0.0.1:50121"));
         assert!(realtime_origin_allowed(
             &HeaderMap::new(),
             "https://example.test"

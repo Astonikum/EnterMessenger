@@ -17,6 +17,7 @@ import {
   readSettings,
   writeSettings,
 } from "../src/settings.ts";
+import { getSuggestedServerAddress } from "../src/rn-address.ts";
 
 const SENSITIVE_E2E_KEY_NAMES = [
   "encryptionPrivateKey",
@@ -72,6 +73,8 @@ assert.deepEqual(normalizeSettings(JSON.parse("{\"theme\":\"neon\",\"textSize\":
 });
 assert.deepEqual(normalizeSettings({ cache: { retentionDays: -4.6 } }), { ...DEFAULT_SETTINGS, cache: { ...DEFAULT_SETTINGS.cache, retentionDays: 0 } });
 assert.deepEqual(normalizeSettings(null), DEFAULT_SETTINGS);
+assert.equal(getSuggestedServerAddress("192.168.0.160"), "192.168.0.160:50121");
+assert.equal(getSuggestedServerAddress("0.0.0.0"), "");
 
 await storage.setItem(SETTINGS_STORAGE_KEY, "{not-json");
 assert.deepEqual(await readSettings(), DEFAULT_SETTINGS);
