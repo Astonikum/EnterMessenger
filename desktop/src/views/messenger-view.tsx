@@ -220,7 +220,7 @@ export function MessengerView({
   }
 
   return (
-    <main className="app-shell bg-background text-foreground" data-resizing={isResizing} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
+    <main className="app-shell bg-background text-foreground" data-resizing={isResizing} data-settings={showSettings ? "true" : "false"} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
       <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showProfile={showProfile} showSettings={showSettings} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleProfile={onToggleProfile} onOpenSettings={onOpenSettings} />
       <div className="app-conversations-shell">
         <ConversationList className="app-conversations" conversations={conversations} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onAddToFolder={onAddToFolder} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
