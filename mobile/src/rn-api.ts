@@ -66,6 +66,45 @@ export type RealtimeEvent =
   | { type: "error"; code: string };
 export type DeviceHistoryEntry = { conversationId: string; messageId: string; sourceKeyId?: string; envelope: EncryptedEnvelope };
 
+export type AccountSettings = {
+  id: string;
+  name: string;
+  handle: string;
+  showOnline: boolean;
+  showLastSeen: boolean;
+  readReceipts: boolean;
+  typingIndicators: boolean;
+};
+
+export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators">>;
+
+export type ChangePasswordPayload = {
+  currentPassword: string;
+  newPassword: string;
+};
+
+export type AccountDevice = {
+  deviceId: string;
+  platform: string;
+  name: string | null;
+  appVersion: string | null;
+  createdAt: number;
+  lastSeenAt: number | null;
+  revokedAt: number | null;
+};
+
+export type AccountSession = {
+  id: string;
+  deviceId: string | null;
+  platform: string;
+  deviceName: string | null;
+  appVersion: string | null;
+  createdAt: number;
+  expiresAt: number;
+  lastSeenAt: number | null;
+  current: boolean;
+};
+
 type PublicKeyDirectoryResponse = { id: string; handle: string; name: string; server: string; serverId?: string; devices: DeviceKeyBundle[]; accountKey?: { keyId: string; encryptionPublicKey: string } | null };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -76,8 +115,20 @@ function isString(value: unknown, maxLength = 4096): value is string {
   return typeof value === "string" && value.length <= maxLength;
 }
 
+function isIdentifier(value: unknown, maxLength = 128): value is string {
+  return isString(value, maxLength) && value.length > 0 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function isUnixMillis(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function isNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function isEnvelope(value: unknown): value is EncryptedEnvelope {
@@ -167,6 +218,62 @@ function isAcceptedResponse(value: unknown): value is { accepted: boolean } {
   return isRecord(value) && typeof value.accepted === "boolean";
 }
 
+function isNullableString(value: unknown, maxLength = 4096): value is string | null {
+  return value === null || isString(value, maxLength);
+}
+
+function isAccountSettings(value: unknown): value is AccountSettings {
+  return isRecord(value)
+    && isIdentifier(value.id)
+    && isString(value.name, 160)
+    && isIdentifier(value.handle)
+    && typeof value.showOnline === "boolean"
+    && typeof value.showLastSeen === "boolean"
+    && typeof value.readReceipts === "boolean"
+    && typeof value.typingIndicators === "boolean";
+}
+
+function isAccountDevice(value: unknown): value is AccountDevice {
+  return isRecord(value)
+    && isIdentifier(value.deviceId)
+    && isString(value.platform, 64)
+    && isNullableString(value.name, 256)
+    && isNullableString(value.appVersion, 128)
+    && isUnixMillis(value.createdAt)
+    && (value.lastSeenAt === null || isUnixMillis(value.lastSeenAt))
+    && (value.revokedAt === null || isUnixMillis(value.revokedAt));
+}
+
+function isAccountSession(value: unknown): value is AccountSession {
+  return isRecord(value)
+    && isIdentifier(value.id)
+    && (value.deviceId === null || isIdentifier(value.deviceId))
+    && isString(value.platform, 64)
+    && (value.deviceName === null || isString(value.deviceName, 256))
+    && (value.appVersion === null || isString(value.appVersion, 128))
+    && isUnixMillis(value.createdAt)
+    && isUnixMillis(value.expiresAt)
+    && (value.lastSeenAt === null || isUnixMillis(value.lastSeenAt))
+    && typeof value.current === "boolean";
+}
+
+function isAccountDeviceList(value: unknown): value is AccountDevice[] {
+  return Array.isArray(value) && value.length <= MAX_SYNC_ITEMS && value.every(isAccountDevice);
+}
+
+function isAccountSessionList(value: unknown): value is AccountSession[] {
+  return Array.isArray(value) && value.length <= MAX_SYNC_ITEMS && value.every(isAccountSession);
+}
+
+function isRevokedSessionsResponse(value: unknown): value is { revoked: number } {
+  return isRecord(value) && isNonNegativeInteger(value.revoked);
+}
+
+function resourceId(id: string, label: string) {
+  if (!isIdentifier(id)) throw new Error(`Некорректный идентификатор ${label}`);
+  return encodeURIComponent(id);
+}
+
 function isTimestampResponse(value: unknown, field: "readAt" | "deliveredAt"): value is Record<string, number> {
   return isRecord(value) && isNumber(value[field]);
 }
@@ -206,6 +313,63 @@ async function readJson<T>(response: Response, validate: (value: unknown) => val
   const payload: unknown = await response.json().catch(() => undefined);
   if (!validate(payload)) throw new Error("Enter API вернул некорректный ответ");
   return payload;
+}
+
+export async function fetchAccountSettings(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/account/settings"), { headers: headers(profile) });
+  return readJson<AccountSettings>(response, isAccountSettings);
+}
+
+export async function updateAccountSettings(profile: Profile, patch: AccountSettingsPatch) {
+  const response = await request(apiUrl(profile, "/api/v1/account/settings"), {
+    method: "PATCH",
+    headers: headers(profile),
+    body: JSON.stringify(patch),
+  });
+  return readJson<AccountSettings>(response, isAccountSettings);
+}
+
+export async function changePassword(profile: Profile, payload: ChangePasswordPayload) {
+  const response = await request(apiUrl(profile, "/auth/change-password"), {
+    method: "POST",
+    headers: headers(profile),
+    body: JSON.stringify(payload),
+  });
+  return readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
+export async function fetchDevices(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/devices"), { headers: headers(profile) });
+  return readJson<AccountDevice[]>(response, isAccountDeviceList);
+}
+
+export async function deleteDevice(profile: Profile, deviceId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/devices/${resourceId(deviceId, "устройства")}`), {
+    method: "DELETE",
+    headers: headers(profile),
+  });
+  return readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
+export async function fetchSessions(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/sessions"), { headers: headers(profile) });
+  return readJson<AccountSession[]>(response, isAccountSessionList);
+}
+
+export async function deleteSession(profile: Profile, sessionId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/sessions/${resourceId(sessionId, "сессии")}`), {
+    method: "DELETE",
+    headers: headers(profile),
+  });
+  return readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
+export async function revokeOtherSessions(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/sessions/revoke-others"), {
+    method: "POST",
+    headers: headers(profile),
+  });
+  return readJson<{ revoked: number }>(response, isRevokedSessionsResponse);
 }
 
 export async function syncProfile(profile: Profile, since: number) {

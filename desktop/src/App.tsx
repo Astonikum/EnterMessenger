@@ -12,6 +12,8 @@ import { formatMessageTime, makeId } from "./lib/utils";
 import { migrateLocalServerAddress, normalizeServerAddress } from "./lib/server-address";
 import { createRealtimeQueue, createSyncQueue } from "./lib/sync-queue";
 import { notifyIncomingMessage, subscribeToNotificationActions } from "./lib/notifications";
+import { applyLocalSettings, readLocalSettings, writeLocalSettings, type LocalClientSettings } from "./lib/local-settings";
+import { SettingsPanel } from "./components/settings-panel";
 import type { Conversation, Message, OutboxEntry, Profile } from "./types";
 
 const LEGACY_OUTBOX_KEY = "enter-outbox";
@@ -242,6 +244,8 @@ export default function App() {
   const [syncConnected, setSyncConnected] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
   const [showProfile, setShowProfile] = useState(() => readTabState().showProfile ?? false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [localSettings, setLocalSettings] = useState<LocalClientSettings>(() => readLocalSettings());
   const [searchResult, setSearchResult] = useState<SearchUser | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -258,6 +262,10 @@ export default function App() {
   const persistedOutboxProfilesRef = useRef(new Set(Object.keys(outboxByProfile)));
   const mediaOperationRef = useRef(0);
   const mediaAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    applyLocalSettings(localSettings);
+  }, [localSettings]);
 
   function cancelMediaOperation() {
     mediaOperationRef.current += 1;
@@ -283,6 +291,8 @@ export default function App() {
   const availableFolders = folderNames(conversations);
   const activeProfileMessages = activeProfileId ? messagesByProfile[activeProfileId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES;
   const messages = activeConversationId ? (activeProfileMessages[activeConversationId] ?? []).filter((message) => !message.editOf) : [];
+  const cachedMessageCount = Object.values(activeProfileMessages).reduce((total, items) => total + items.length, 0);
+  const activeOutboxCount = activeProfileId ? outboxByProfile[activeProfileId]?.length ?? 0 : 0;
   const conversationsWithPreviews = conversations.map((conversation) => {
     const conversationMessages = (activeProfileMessages[conversation.id] ?? []).filter((message) => !message.editOf);
     const latestMessage = conversationMessages[conversationMessages.length - 1];
@@ -893,7 +903,29 @@ export default function App() {
       setActiveFolder(ALL_FOLDER);
       setReplyTo(null);
       setEditingMessage(null);
+      setShowSettings(false);
     }
+  }
+
+  function updateLocalSettings(settings: LocalClientSettings) {
+    setLocalSettings(settings);
+    writeLocalSettings(settings);
+  }
+
+  function clearActiveMessageCache() {
+    if (!activeProfileId) return;
+    clearMessageCache(activeProfileId);
+    skipNextCacheWriteRef.current = true;
+    cacheUpdatedAtRef.current[activeProfileId] = Date.now();
+    syncCursorsRef.current[activeProfileId] = 0;
+    setMessagesByProfile((current) => ({ ...current, [activeProfileId]: EMPTY_MESSAGES }));
+    setSyncCursors((current) => ({ ...current, [activeProfileId]: 0 }));
+    setConversations([]);
+    setActiveConversationId(null);
+  }
+
+  function clearActiveOutbox() {
+    if (activeProfileId) setOutboxProfile(activeProfileId, []);
   }
 
   async function searchForUser(rawQuery: string) {
@@ -1240,54 +1272,59 @@ export default function App() {
   }
 
   return (
-    <MessengerView
-      profiles={profiles}
-      activeProfile={activeProfile}
-      folders={availableFolders}
-      activeFolder={activeFolder}
-      conversations={conversationsWithPreviews}
-      syncConnected={syncConnected}
-      activeConversationId={activeConversationId}
-      activeConversation={activeConversation}
-      messages={messages}
-      messageToForward={messageToForward}
-      showProfile={showProfile}
-      messageError={messageError}
-      mediaUploadProgress={mediaUploadProgress}
-      replyTo={replyTo}
-      editingMessage={editingMessage}
-      onSelectProfile={selectProfile}
-      onRemoveProfile={removeProfile}
-      onAddProfile={() => setShowAuth(true)}
-      searchUser={searchResult}
-      searchBusy={searchBusy}
-      searchError={searchError}
-      onSearchUser={searchForUser}
-      onOpenSearchUser={openSearchUser}
-      onSelectConversation={setActiveConversationId}
-      onSelectFolder={selectFolder}
-      onTogglePinned={togglePinned}
-      onToggleMuted={toggleMuted}
-      onMarkUnread={markUnread}
-      onArchive={archiveConversation}
-      onAddToFolder={addToFolder}
-      onDelete={deleteConversation}
-      onReorder={reorderConversations}
-      onBack={() => { setActiveConversationId(null); setShowProfile(false); }}
-      onToggleProfile={() => setShowProfile((value) => !value)}
-      onCloseProfile={() => setShowProfile(false)}
-      onSendMessage={sendMessage}
-      onReply={replyToMessage}
-      onStartEditMessage={editMessage}
-      onEditMessage={applyMessageEdit}
-      onToggleMessagePinned={toggleMessagePinned}
-      onSaveMessage={saveMessage}
-      onDeleteMessage={deleteMessage}
-      onReactToMessage={reactToMessage}
-      onForwardMessage={setMessageToForward}
-      onSendForwardedMessage={forwardMessage}
-      onCloseForward={() => setMessageToForward(null)}
-      onCancelMessageContext={() => { setReplyTo(null); setEditingMessage(null); }}
-    />
+    <>
+      <MessengerView
+        profiles={profiles}
+        activeProfile={activeProfile}
+        folders={availableFolders}
+        activeFolder={activeFolder}
+        conversations={conversationsWithPreviews}
+        syncConnected={syncConnected}
+        activeConversationId={activeConversationId}
+        activeConversation={activeConversation}
+        messages={messages}
+        messageToForward={messageToForward}
+        showProfile={showProfile}
+        showSettings={showSettings}
+        messageError={messageError}
+        mediaUploadProgress={mediaUploadProgress}
+        replyTo={replyTo}
+        editingMessage={editingMessage}
+        onSelectProfile={selectProfile}
+        onRemoveProfile={removeProfile}
+        onAddProfile={() => setShowAuth(true)}
+        searchUser={searchResult}
+        searchBusy={searchBusy}
+        searchError={searchError}
+        onSearchUser={searchForUser}
+        onOpenSearchUser={openSearchUser}
+        onSelectConversation={setActiveConversationId}
+        onSelectFolder={selectFolder}
+        onTogglePinned={togglePinned}
+        onToggleMuted={toggleMuted}
+        onMarkUnread={markUnread}
+        onArchive={archiveConversation}
+        onAddToFolder={addToFolder}
+        onDelete={deleteConversation}
+        onReorder={reorderConversations}
+        onBack={() => { setActiveConversationId(null); setShowProfile(false); setShowSettings(false); }}
+        onToggleProfile={() => { setShowSettings(false); setShowProfile((value) => !value); }}
+        onOpenSettings={() => { setShowProfile(false); setShowSettings(true); }}
+        onCloseProfile={() => setShowProfile(false)}
+        onSendMessage={sendMessage}
+        onReply={replyToMessage}
+        onStartEditMessage={editMessage}
+        onEditMessage={applyMessageEdit}
+        onToggleMessagePinned={toggleMessagePinned}
+        onSaveMessage={saveMessage}
+        onDeleteMessage={deleteMessage}
+        onReactToMessage={reactToMessage}
+        onForwardMessage={setMessageToForward}
+        onSendForwardedMessage={forwardMessage}
+        onCloseForward={() => setMessageToForward(null)}
+        onCancelMessageContext={() => { setReplyTo(null); setEditingMessage(null); }}
+      />
+      {showSettings && activeProfile && <SettingsPanel profile={activeProfile} localSettings={localSettings} messageCount={cachedMessageCount} outboxCount={activeOutboxCount} onLocalSettingsChange={updateLocalSettings} onClearMessageCache={clearActiveMessageCache} onClearOutbox={clearActiveOutbox} onRemoveProfile={removeProfile} onClose={() => setShowSettings(false)} />}
+    </>
   );
 }

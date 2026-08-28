@@ -14,6 +14,62 @@ use uuid::Uuid;
 pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_SYNC_EVENTS: i64 = 1_000;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSettings {
+    pub show_online: bool,
+    pub show_last_seen: bool,
+    pub read_receipts: bool,
+    pub typing_indicators: bool,
+}
+
+impl Default for AccountSettings {
+    fn default() -> Self {
+        Self {
+            show_online: true,
+            show_last_seen: true,
+            read_receipts: true,
+            typing_indicators: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredSession {
+    pub id: String,
+    pub device_id: Option<String>,
+    pub platform: String,
+    pub device_name: Option<String>,
+    pub app_version: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredDevice {
+    pub device_id: String,
+    pub platform: String,
+    pub name: Option<String>,
+    pub app_version: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+fn legacy_session_id(token: &str) -> String {
+    let mut first = 0xcbf29ce484222325u64;
+    let mut second = 0x84222325cbf29ce4u64;
+    for byte in token.as_bytes() {
+        first = (first ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        second = (second ^ u64::from((*byte).rotate_left(3))).wrapping_mul(0x100000001b3);
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&first.to_be_bytes());
+    bytes[8..].copy_from_slice(&second.to_be_bytes());
+    format!("legacy-{}", Uuid::new_v8(bytes))
+}
+
 fn new_server_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -472,7 +528,29 @@ impl SqliteStorage {
                  token TEXT PRIMARY KEY,
                  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                  created_at INTEGER NOT NULL,
-                 expires_at INTEGER NOT NULL DEFAULT 0
+                 expires_at INTEGER NOT NULL DEFAULT 0,
+                 session_id TEXT,
+                 device_id TEXT,
+                 platform TEXT NOT NULL DEFAULT 'unknown',
+                 device_name TEXT,
+                 app_version TEXT,
+                 last_seen_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS account_settings (
+                 account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                 value_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS devices (
+                 owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 device_id TEXT NOT NULL,
+                 platform TEXT NOT NULL DEFAULT 'unknown',
+                 name TEXT,
+                 app_version TEXT,
+                 created_at INTEGER NOT NULL,
+                 last_seen_at INTEGER,
+                 revoked_at INTEGER,
+                 PRIMARY KEY(owner_account_id, device_id)
              );
              CREATE TABLE IF NOT EXISTS conversations (
                  id TEXT PRIMARY KEY,
@@ -598,6 +676,29 @@ impl SqliteStorage {
                 [],
             )?;
         }
+        for (column, definition) in [
+            ("session_id", "TEXT"),
+            ("device_id", "TEXT"),
+            ("platform", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("device_name", "TEXT"),
+            ("app_version", "TEXT"),
+            ("last_seen_at", "INTEGER"),
+        ] {
+            let exists = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                params![column],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if exists == 0 {
+                connection.execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL", [])?;
+        connection.execute("CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at INTEGER NOT NULL)", [])?;
+        connection.execute("CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, PRIMARY KEY(owner_account_id, device_id))", [])?;
         connection.execute(
             "UPDATE sessions SET expires_at = created_at + ?1 WHERE expires_at <= 0",
             params![SESSION_TTL_MS],
@@ -876,18 +977,76 @@ impl SqliteStorage {
             .optional()
     }
 
+    pub fn account_settings(&self, account_id: &str) -> SqlResult<AccountSettings> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT value_json FROM account_settings WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn update_account_settings(
+        &mut self,
+        account_id: &str,
+        settings: &AccountSettings,
+        updated_at: i64,
+    ) -> SqlResult<()> {
+        let value_json = serde_json::to_string(settings)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.connection.execute(
+            "INSERT INTO account_settings (account_id, value_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            params![account_id, value_json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_account_name(&mut self, account_id: &str, name: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE accounts SET name = ?1 WHERE id = ?2",
+            params![name, account_id],
+        )? > 0)
+    }
+
+    pub fn change_password(&mut self, account_id: &str, password_hash: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE accounts SET password_hash = ?1 WHERE id = ?2",
+            params![password_hash, account_id],
+        )? > 0)
+    }
+
+    #[cfg(test)]
     pub fn store_session(
         &mut self,
         token: &str,
         account_id: &str,
         created_at: i64,
     ) -> SqlResult<()> {
-        let expires_at = created_at.saturating_add(SESSION_TTL_MS);
-        self.connection.execute(
-            "INSERT OR REPLACE INTO sessions (token, account_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            params![token, account_id, created_at, expires_at],
-        )?;
+        self.store_session_with_metadata(token, account_id, created_at, None, None, None, None)?;
         Ok(())
+    }
+
+    pub fn store_session_with_metadata(
+        &mut self,
+        token: &str,
+        account_id: &str,
+        created_at: i64,
+        device_id: Option<&str>,
+        platform: Option<&str>,
+        device_name: Option<&str>,
+        app_version: Option<&str>,
+    ) -> SqlResult<String> {
+        let session_id = legacy_session_id(token);
+        self.connection.execute(
+            "INSERT OR REPLACE INTO sessions (token, account_id, created_at, expires_at, session_id, device_id, platform, device_name, app_version, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?3)",
+            params![token, account_id, created_at, created_at.saturating_add(SESSION_TTL_MS), session_id, device_id, platform, device_name, app_version],
+        )?;
+        Ok(session_id)
     }
 
     pub fn account_id_for_session(&self, token: &str, now: i64) -> SqlResult<Option<String>> {
@@ -905,6 +1064,146 @@ impl SqliteStorage {
             .connection
             .execute("DELETE FROM sessions WHERE token = ?1", params![token])?
             > 0)
+    }
+
+    pub fn list_sessions(
+        &mut self,
+        account_id: &str,
+        current_token: &str,
+        now: i64,
+    ) -> SqlResult<Vec<StoredSession>> {
+        let rows = {
+            let mut statement = self.connection.prepare("SELECT token, session_id, device_id, platform, device_name, app_version, created_at, expires_at, last_seen_at FROM sessions WHERE account_id = ?1 AND expires_at > ?2 ORDER BY COALESCE(last_seen_at, created_at) DESC")?;
+            let mapped = statement.query_map(params![account_id, now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                ))
+            })?;
+            mapped.collect::<SqlResult<Vec<_>>>()?
+        };
+        let mut result = Vec::with_capacity(rows.len());
+        for (
+            token,
+            id,
+            device_id,
+            platform,
+            device_name,
+            app_version,
+            created_at,
+            expires_at,
+            last_seen_at,
+        ) in rows
+        {
+            let id = id
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| legacy_session_id(&token));
+            self.connection.execute("UPDATE sessions SET session_id = ?1 WHERE token = ?2 AND (session_id IS NULL OR session_id = '')", params![id, token])?;
+            result.push(StoredSession {
+                id,
+                device_id,
+                platform,
+                device_name,
+                app_version,
+                created_at,
+                expires_at,
+                last_seen_at,
+                current: token == current_token,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn revoke_session_by_id(&mut self, account_id: &str, session_id: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM sessions WHERE account_id = ?1 AND session_id = ?2",
+            params![account_id, session_id],
+        )? > 0)
+    }
+
+    pub fn revoke_other_sessions(
+        &mut self,
+        account_id: &str,
+        current_token: &str,
+    ) -> SqlResult<u64> {
+        Ok(self.connection.execute(
+            "DELETE FROM sessions WHERE account_id = ?1 AND token <> ?2",
+            params![account_id, current_token],
+        )? as u64)
+    }
+
+    pub fn bind_session_device(
+        &mut self,
+        account_id: &str,
+        token: &str,
+        device_id: &str,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET device_id = ?1 WHERE account_id = ?2 AND token = ?3 AND (device_id IS NULL OR device_id = ?1)",
+            params![device_id, account_id, token],
+        )? > 0)
+    }
+
+    pub fn upsert_device(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        platform: &str,
+        name: Option<&str>,
+        app_version: Option<&str>,
+        now: i64,
+    ) -> SqlResult<()> {
+        self.connection.execute("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = excluded.platform, name = COALESCE(excluded.name, devices.name), app_version = COALESCE(excluded.app_version, devices.app_version), last_seen_at = excluded.last_seen_at, revoked_at = NULL", params![account_id, device_id, platform, name, app_version, now])?;
+        Ok(())
+    }
+
+    pub fn list_devices(&self, account_id: &str) -> SqlResult<Vec<StoredDevice>> {
+        let mut statement = self.connection.prepare("SELECT device_id, platform, name, app_version, created_at, last_seen_at, revoked_at FROM devices WHERE owner_account_id = ?1 ORDER BY COALESCE(last_seen_at, created_at) DESC")?;
+        let devices = statement
+            .query_map(params![account_id], |row| {
+                Ok(StoredDevice {
+                    device_id: row.get(0)?,
+                    platform: row.get(1)?,
+                    name: row.get(2)?,
+                    app_version: row.get(3)?,
+                    created_at: row.get(4)?,
+                    last_seen_at: row.get(5)?,
+                    revoked_at: row.get(6)?,
+                })
+            })?
+            .collect();
+        devices
+    }
+
+    pub fn revoke_device(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        now: i64,
+    ) -> SqlResult<bool> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute("UPDATE devices SET revoked_at = ?1 WHERE owner_account_id = ?2 AND device_id = ?3 AND revoked_at IS NULL", params![now, account_id, device_id])?;
+        transaction.execute(
+            "DELETE FROM device_keys WHERE owner_account_id = ?1 AND device_id = ?2",
+            params![account_id, device_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM push_tokens WHERE owner_account_id = ?1 AND device_id = ?2",
+            params![account_id, device_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM sessions WHERE account_id = ?1 AND device_id = ?2",
+            params![account_id, device_id],
+        )?;
+        transaction.commit()?;
+        Ok(changed > 0)
     }
 
     pub fn register_push_token(
@@ -1682,6 +1981,117 @@ mod tests {
             handle: "alice".to_owned(),
             password_hash: "hash".to_owned(),
         }
+    }
+
+    #[test]
+    fn account_settings_round_trip_with_safe_defaults() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open settings database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        assert_eq!(
+            storage
+                .account_settings(&account.id)
+                .expect("read defaults"),
+            AccountSettings::default()
+        );
+        let settings = AccountSettings {
+            show_online: false,
+            show_last_seen: false,
+            read_receipts: true,
+            typing_indicators: false,
+        };
+        storage
+            .update_account_settings(&account.id, &settings, 2)
+            .expect("write settings");
+        assert_eq!(
+            storage
+                .account_settings(&account.id)
+                .expect("read settings"),
+            settings
+        );
+    }
+
+    #[test]
+    fn sessions_are_addressable_without_exposing_tokens() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open session database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        storage
+            .store_session_with_metadata(
+                "secret-token",
+                &account.id,
+                100,
+                Some("device-1"),
+                Some("desktop"),
+                Some("Workstation"),
+                Some("0.2.0"),
+            )
+            .expect("store session");
+        let sessions = storage
+            .list_sessions(&account.id, "secret-token", 100)
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_ne!(sessions[0].id, "secret-token");
+        assert_eq!(sessions[0].device_id.as_deref(), Some("device-1"));
+        assert!(sessions[0].current);
+        assert!(storage
+            .revoke_session_by_id(&account.id, &sessions[0].id)
+            .expect("revoke session"));
+    }
+
+    #[test]
+    fn revoking_a_device_revokes_its_sessions_and_keys() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open device database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        storage
+            .upsert_device(
+                &account.id,
+                "device-1",
+                "mobile",
+                Some("Phone"),
+                Some("0.2.0"),
+                2,
+            )
+            .expect("store device");
+        storage
+            .register_device_key(
+                &account.id,
+                &StoredDeviceKey {
+                    device_id: "device-1".to_owned(),
+                    key_id: "key-1".to_owned(),
+                    encryption_public_key: "encryption".to_owned(),
+                    signing_public_key: "signing".to_owned(),
+                    created_at: 2,
+                },
+                2,
+            )
+            .expect("store device key");
+        storage
+            .store_session_with_metadata(
+                "device-token",
+                &account.id,
+                2,
+                Some("device-1"),
+                Some("mobile"),
+                Some("Phone"),
+                Some("0.2.0"),
+            )
+            .expect("store device session");
+        assert!(storage
+            .revoke_device(&account.id, "device-1", 3)
+            .expect("revoke device"));
+        assert!(!storage
+            .has_device_key(&account.id, "device-1")
+            .expect("check revoked key"));
+        assert!(storage
+            .list_sessions(&account.id, "device-token", 3)
+            .expect("list revoked sessions")
+            .is_empty());
+        assert_eq!(
+            storage.list_devices(&account.id).expect("list device")[0].revoked_at,
+            Some(3)
+        );
     }
 
     #[test]
@@ -2693,30 +3103,357 @@ impl Storage {
         }
     }
 
-    pub async fn store_session(
+    pub async fn account_settings(
+        &self,
+        account_id: &str,
+    ) -> Result<AccountSettings, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .account_settings(account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let raw =
+                    sqlx::query("SELECT value_json FROM account_settings WHERE account_id = $1")
+                        .bind(account_id)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(raw
+                    .and_then(|row| row.try_get::<String, _>("value_json").ok())
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default())
+            }
+        }
+    }
+
+    pub async fn update_account_settings(
+        &self,
+        account_id: &str,
+        settings: &AccountSettings,
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        let value_json = serde_json::to_string(settings)
+            .map_err(|error| StorageError::InvalidEvent(error.to_string()))?;
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .update_account_settings(account_id, settings, updated_at)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                sqlx::query("INSERT INTO account_settings (account_id, value_json, updated_at) VALUES ($1, $2, $3) ON CONFLICT(account_id) DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = EXCLUDED.updated_at")
+                    .bind(account_id)
+                    .bind(value_json)
+                    .bind(updated_at)
+                    .execute(pool)
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn update_account_name(
+        &self,
+        account_id: &str,
+        name: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .update_account_name(account_id, name)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                Ok(sqlx::query("UPDATE accounts SET name = $1 WHERE id = $2")
+                    .bind(name)
+                    .bind(account_id)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+                    > 0)
+            }
+        }
+    }
+
+    pub async fn change_password(
+        &self,
+        account_id: &str,
+        password_hash: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .change_password(account_id, password_hash)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "UPDATE accounts SET password_hash = $1 WHERE id = $2",
+            )
+            .bind(password_hash)
+            .bind(account_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
+    pub async fn store_session_with_metadata(
         &self,
         token: &str,
         account_id: &str,
         created_at: i64,
+        device_id: Option<&str>,
+        platform: Option<&str>,
+        device_name: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Result<String, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .store_session_with_metadata(
+                    token,
+                    account_id,
+                    created_at,
+                    device_id,
+                    platform,
+                    device_name,
+                    app_version,
+                )
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let session_id = Uuid::new_v4().to_string();
+                sqlx::query("INSERT INTO sessions (token, account_id, created_at, expires_at, session_id, device_id, platform, device_name, app_version, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'unknown'), $8, $9, $3) ON CONFLICT (token) DO UPDATE SET account_id = EXCLUDED.account_id, created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at, session_id = EXCLUDED.session_id, device_id = EXCLUDED.device_id, platform = EXCLUDED.platform, device_name = EXCLUDED.device_name, app_version = EXCLUDED.app_version, last_seen_at = EXCLUDED.last_seen_at").bind(token).bind(account_id).bind(created_at).bind(created_at.saturating_add(SESSION_TTL_MS)).bind(&session_id).bind(device_id).bind(platform).bind(device_name).bind(app_version).execute(pool).await?;
+                Ok(session_id)
+            }
+        }
+    }
+
+    pub async fn list_sessions(
+        &self,
+        account_id: &str,
+        current_token: &str,
+        now: i64,
+    ) -> Result<Vec<StoredSession>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .list_sessions(account_id, current_token, now)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let rows = sqlx::query("SELECT token, session_id, device_id, platform, device_name, app_version, created_at, expires_at, last_seen_at FROM sessions WHERE account_id = $1 AND expires_at > $2 ORDER BY COALESCE(last_seen_at, created_at) DESC")
+                    .bind(account_id)
+                    .bind(now)
+                    .fetch_all(pool)
+                    .await?;
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let token: String = row.try_get("token")?;
+                    let stored_id = row.try_get::<Option<String>, _>("session_id")?;
+                    let id = stored_id
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| legacy_session_id(&token));
+                    if stored_id.as_deref().is_none_or(str::is_empty) {
+                        sqlx::query("UPDATE sessions SET session_id = $1 WHERE token = $2 AND (session_id IS NULL OR session_id = '')")
+                            .bind(&id)
+                            .bind(&token)
+                            .execute(pool)
+                            .await?;
+                    }
+                    result.push(StoredSession {
+                        id,
+                        device_id: row.try_get("device_id")?,
+                        platform: row.try_get("platform")?,
+                        device_name: row.try_get("device_name")?,
+                        app_version: row.try_get("app_version")?,
+                        created_at: row.try_get("created_at")?,
+                        expires_at: row.try_get("expires_at")?,
+                        last_seen_at: row.try_get("last_seen_at")?,
+                        current: token == current_token,
+                    });
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    pub async fn revoke_session_by_id(
+        &self,
+        account_id: &str,
+        session_id: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .revoke_session_by_id(account_id, session_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "DELETE FROM sessions WHERE account_id = $1 AND session_id = $2",
+            )
+            .bind(account_id)
+            .bind(session_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
+    pub async fn revoke_other_sessions(
+        &self,
+        account_id: &str,
+        current_token: &str,
+    ) -> Result<u64, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .revoke_other_sessions(account_id, current_token)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "DELETE FROM sessions WHERE account_id = $1 AND token <> $2",
+            )
+            .bind(account_id)
+            .bind(current_token)
+            .execute(pool)
+            .await?
+            .rows_affected()),
+        }
+    }
+
+    pub async fn bind_session_device(
+        &self,
+        account_id: &str,
+        token: &str,
+        device_id: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .bind_session_device(account_id, token, device_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "UPDATE sessions SET device_id = $1 WHERE account_id = $2 AND token = $3 AND (device_id IS NULL OR device_id = $1)",
+            )
+            .bind(device_id)
+            .bind(account_id)
+            .bind(token)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
+    pub async fn upsert_device(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        platform: &str,
+        name: Option<&str>,
+        app_version: Option<&str>,
+        now: i64,
     ) -> Result<(), StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
-                .store_session(token, account_id, created_at)
+                .upsert_device(account_id, device_id, platform, name, app_version, now)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
-                let expires_at = created_at.saturating_add(SESSION_TTL_MS);
-                sqlx::query(
-                    "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (token) DO UPDATE SET account_id = EXCLUDED.account_id, created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at",
-                )
-                .bind(token)
-                .bind(account_id)
-                .bind(created_at)
-                .bind(expires_at)
-                .execute(pool)
-                .await?;
+                sqlx::query("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = EXCLUDED.platform, name = COALESCE(EXCLUDED.name, devices.name), app_version = COALESCE(EXCLUDED.app_version, devices.app_version), last_seen_at = EXCLUDED.last_seen_at, revoked_at = NULL")
+                    .bind(account_id)
+                    .bind(device_id)
+                    .bind(platform)
+                    .bind(name)
+                    .bind(app_version)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
                 Ok(())
+            }
+        }
+    }
+
+    pub async fn list_devices(&self, account_id: &str) -> Result<Vec<StoredDevice>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .list_devices(account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let rows = sqlx::query("SELECT device_id, platform, name, app_version, created_at, last_seen_at, revoked_at FROM devices WHERE owner_account_id = $1 ORDER BY COALESCE(last_seen_at, created_at) DESC")
+                    .bind(account_id)
+                    .fetch_all(pool)
+                    .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(StoredDevice {
+                            device_id: row.try_get("device_id")?,
+                            platform: row.try_get("platform")?,
+                            name: row.try_get("name")?,
+                            app_version: row.try_get("app_version")?,
+                            created_at: row.try_get("created_at")?,
+                            last_seen_at: row.try_get("last_seen_at")?,
+                            revoked_at: row.try_get("revoked_at")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, sqlx::Error>>()
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    pub async fn revoke_device(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .revoke_device(account_id, device_id, now)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let changed = sqlx::query("UPDATE devices SET revoked_at = $1 WHERE owner_account_id = $2 AND device_id = $3 AND revoked_at IS NULL")
+                    .bind(now)
+                    .bind(account_id)
+                    .bind(device_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                sqlx::query(
+                    "DELETE FROM device_keys WHERE owner_account_id = $1 AND device_id = $2",
+                )
+                .bind(account_id)
+                .bind(device_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM push_tokens WHERE owner_account_id = $1 AND device_id = $2",
+                )
+                .bind(account_id)
+                .bind(device_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query("DELETE FROM sessions WHERE account_id = $1 AND device_id = $2")
+                    .bind(account_id)
+                    .bind(device_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                Ok(changed > 0)
             }
         }
     }
@@ -3909,7 +4646,10 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
         "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY);\
          CREATE TABLE IF NOT EXISTS server_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
          CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, handle TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL, last_seen_at BIGINT);\
-         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL DEFAULT 0);\
+         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL DEFAULT 0, session_id TEXT, device_id TEXT, platform TEXT NOT NULL DEFAULT 'unknown', device_name TEXT, app_version TEXT, last_seen_at BIGINT);\
+         CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL;\
+         CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at BIGINT NOT NULL);\
+         CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at BIGINT NOT NULL, last_seen_at BIGINT, revoked_at BIGINT, PRIMARY KEY(owner_account_id, device_id));\
          CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, handle TEXT, avatar TEXT NOT NULL, subtitle TEXT, can_write BOOLEAN NOT NULL DEFAULT TRUE, last_message TEXT NOT NULL DEFAULT '', last_message_at BIGINT, pinned BOOLEAN NOT NULL DEFAULT FALSE, online BOOLEAN NOT NULL DEFAULT FALSE, sort_order BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
          CREATE INDEX IF NOT EXISTS conversations_owner_order ON conversations(owner_account_id, pinned DESC, sort_order ASC, created_at ASC);\
          CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_handle ON conversations(owner_account_id, handle) WHERE handle IS NOT NULL;\
@@ -3947,6 +4687,19 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
     )
     .execute(pool)
     .await?;
+    for statement in [
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_id TEXT",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id TEXT",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_name TEXT",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS app_version TEXT",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL",
+        "CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at BIGINT NOT NULL, last_seen_at BIGINT, revoked_at BIGINT, PRIMARY KEY(owner_account_id, device_id))",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     sqlx::query("UPDATE sessions SET expires_at = created_at + $1 WHERE expires_at <= 0")
         .bind(SESSION_TTL_MS)
         .execute(pool)

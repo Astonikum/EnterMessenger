@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRealtimeQueue, createSyncQueue } from "../src/lib/sync-queue.ts";
 import { writeMessageCache } from "../src/lib/message-cache.ts";
+import { applyLocalSettings, DEFAULT_LOCAL_SETTINGS, readLocalSettings, writeLocalSettings } from "../src/lib/local-settings.ts";
 
 const values = new Map();
 globalThis.localStorage = {
@@ -9,6 +10,17 @@ globalThis.localStorage = {
   removeItem: (key) => values.delete(key),
 };
 globalThis.window = globalThis;
+
+assert.deepEqual(readLocalSettings(), DEFAULT_LOCAL_SETTINGS);
+const customSettings = { ...DEFAULT_LOCAL_SETTINGS, theme: "light", fontScale: 1.1, density: "compact", accent: "blue", locale: "en", notifications: { desktop: false, sound: true, preview: false }, cachePolicy: "minimal" };
+writeLocalSettings(customSettings);
+assert.deepEqual(readLocalSettings(), customSettings);
+globalThis.matchMedia = () => ({ matches: true });
+globalThis.document = { documentElement: { dataset: {}, style: { setProperty: () => undefined } } };
+applyLocalSettings(customSettings);
+assert.equal(document.documentElement.dataset.theme, "light");
+assert.equal(document.documentElement.dataset.density, "compact");
+assert.equal(document.documentElement.lang, "en");
 
 const cachedMessages = Array.from({ length: 201 }, (_, index) => ({
   id: String(index),

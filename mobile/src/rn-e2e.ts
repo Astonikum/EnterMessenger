@@ -290,6 +290,16 @@ export function deleteDeviceKeys(profileId: string) {
   })();
 }
 
+/** Explicit destructive cleanup; never call this from startup or migration paths. */
+export async function deletePrivateE2EKeys(profileId: string) {
+  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  await Promise.all([
+    SecureStore.deleteItemAsync(cacheKey(profileId)),
+    SecureStore.deleteItemAsync(accountCacheKey(profileId)),
+  ]);
+  await AsyncStorage.multiRemove([fallbackCacheKey(profileId), fallbackAccountCacheKey(profileId)]);
+}
+
 export function deviceKeyBundle(device: StoredDevice): DeviceKeyBundle {
   return { deviceId: device.deviceId, keyId: device.keyId, encryptionPublicKey: device.encryptionPublicKey, signingPublicKey: device.signingPublicKey, createdAt: device.createdAt };
 }

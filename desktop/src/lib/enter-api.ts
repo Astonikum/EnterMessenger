@@ -73,6 +73,40 @@ export type DeviceHistoryEntry = {
   envelope: EncryptedEnvelope;
 };
 
+export type AccountSettings = {
+  id: string;
+  name: string;
+  handle: string;
+  showOnline: boolean;
+  showLastSeen: boolean;
+  readReceipts: boolean;
+  typingIndicators: boolean;
+};
+
+export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators">>;
+
+export type ManagedDevice = {
+  deviceId: string;
+  platform: string;
+  name?: string | null;
+  appVersion?: string | null;
+  createdAt: number;
+  lastSeenAt?: number | null;
+  revokedAt?: number | null;
+};
+
+export type ManagedSession = {
+  id: string;
+  deviceId?: string | null;
+  platform: string;
+  deviceName?: string | null;
+  appVersion?: string | null;
+  createdAt: number;
+  expiresAt: number;
+  lastSeenAt?: number | null;
+  current: boolean;
+};
+
 type PublicKeyDirectoryResponse = {
   id: string;
   handle: string;
@@ -177,6 +211,65 @@ function isRealtimeEvent(value: unknown): value is RealtimeEvent {
 
 function isAcceptedResponse(value: unknown): value is { accepted: boolean } {
   return isRecord(value) && typeof value.accepted === "boolean";
+}
+
+function isAcceptedTrueResponse(value: unknown): value is { accepted: true } {
+  return isRecord(value) && value.accepted === true;
+}
+
+function isNonNegativeTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]) {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function isAccountSettings(value: unknown): value is AccountSettings {
+  return isRecord(value)
+    && hasOnlyKeys(value, ["id", "name", "handle", "showOnline", "showLastSeen", "readReceipts", "typingIndicators"])
+    && isString(value.id, 256)
+    && isString(value.name, 256)
+    && isString(value.handle, 256)
+    && typeof value.showOnline === "boolean"
+    && typeof value.showLastSeen === "boolean"
+    && typeof value.readReceipts === "boolean"
+    && typeof value.typingIndicators === "boolean";
+}
+
+function isManagedDevice(value: unknown): value is ManagedDevice {
+  return isRecord(value)
+    && hasOnlyKeys(value, ["deviceId", "platform", "name", "appVersion", "createdAt", "lastSeenAt", "revokedAt"])
+    && isString(value.deviceId, 256)
+    && isString(value.platform, 64)
+    && (value.name === undefined || value.name === null || isString(value.name, 256))
+    && (value.appVersion === undefined || value.appVersion === null || isString(value.appVersion, 128))
+    && isNonNegativeTimestamp(value.createdAt)
+    && (value.lastSeenAt === undefined || value.lastSeenAt === null || isNonNegativeTimestamp(value.lastSeenAt))
+    && (value.revokedAt === undefined || value.revokedAt === null || isNonNegativeTimestamp(value.revokedAt));
+}
+
+function isManagedSession(value: unknown): value is ManagedSession {
+  return isRecord(value)
+    && hasOnlyKeys(value, ["id", "deviceId", "platform", "deviceName", "appVersion", "createdAt", "expiresAt", "lastSeenAt", "current"])
+    && isString(value.id, 256)
+    && (value.deviceId === undefined || value.deviceId === null || isString(value.deviceId, 256))
+    && isString(value.platform, 64)
+    && (value.deviceName === undefined || value.deviceName === null || isString(value.deviceName, 256))
+    && (value.appVersion === undefined || value.appVersion === null || isString(value.appVersion, 128))
+    && isNonNegativeTimestamp(value.createdAt)
+    && isNonNegativeTimestamp(value.expiresAt)
+    && value.expiresAt >= value.createdAt
+    && (value.lastSeenAt === undefined || value.lastSeenAt === null || isNonNegativeTimestamp(value.lastSeenAt))
+    && typeof value.current === "boolean";
+}
+
+function isDevicesResponse(value: unknown): value is ManagedDevice[] {
+  return Array.isArray(value) && value.length <= 256 && value.every(isManagedDevice);
+}
+
+function isSessionsResponse(value: unknown): value is ManagedSession[] {
+  return Array.isArray(value) && value.length <= 256 && value.every(isManagedSession);
 }
 
 function isTimestampResponse(value: unknown, field: "readAt" | "deliveredAt"): value is Record<string, number> {
@@ -295,6 +388,63 @@ export function openRealtime(profile: Profile, since: number, onEvent: (event: R
   };
   websocket.onclose = onClose;
   return websocket;
+}
+
+export async function getAccountSettings(profile: Profile): Promise<AccountSettings> {
+  const response = await request(apiUrl(profile, "/api/v1/account/settings"), { headers: headers(profile) });
+  return readJson<AccountSettings>(response, isAccountSettings);
+}
+
+export async function updateAccountSettings(profile: Profile, patch: AccountSettingsPatch): Promise<AccountSettings> {
+  const response = await request(apiUrl(profile, "/api/v1/account/settings"), {
+    method: "PATCH",
+    headers: headers(profile),
+    body: JSON.stringify(patch),
+  });
+  return readJson<AccountSettings>(response, isAccountSettings);
+}
+
+export async function changePassword(profile: Profile, currentPassword: string, newPassword: string) {
+  const response = await request(apiUrl(profile, "/auth/change-password"), {
+    method: "POST",
+    headers: headers(profile),
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+  await readJson<{ accepted: true }>(response, isAcceptedTrueResponse);
+}
+
+export async function getDevices(profile: Profile): Promise<ManagedDevice[]> {
+  const response = await request(apiUrl(profile, "/api/v1/devices"), { headers: headers(profile) });
+  return readJson<ManagedDevice[]>(response, isDevicesResponse);
+}
+
+export async function revokeDevice(profile: Profile, deviceId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/devices/${encodeURIComponent(deviceId)}`), {
+    method: "DELETE",
+    headers: headers(profile),
+  });
+  await readJson<{ accepted: true }>(response, isAcceptedTrueResponse);
+}
+
+export async function getSessions(profile: Profile): Promise<ManagedSession[]> {
+  const response = await request(apiUrl(profile, "/api/v1/sessions"), { headers: headers(profile) });
+  return readJson<ManagedSession[]>(response, isSessionsResponse);
+}
+
+export async function revokeSession(profile: Profile, sessionId: string) {
+  const response = await request(apiUrl(profile, `/api/v1/sessions/${encodeURIComponent(sessionId)}`), {
+    method: "DELETE",
+    headers: headers(profile),
+  });
+  await readJson<{ accepted: true }>(response, isAcceptedTrueResponse);
+}
+
+export async function revokeOtherSessions(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/sessions/revoke-others"), {
+    method: "POST",
+    headers: headers(profile),
+  });
+  await readJson<{ accepted: true }>(response, isAcceptedTrueResponse);
 }
 
 export async function markConversationRead(profile: Profile, conversationId: string) {

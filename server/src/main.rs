@@ -10,7 +10,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use rand_core::OsRng;
@@ -147,10 +147,73 @@ struct ProtocolErrorResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthRequest {
     name: Option<String>,
     handle: String,
     password: String,
+    device_id: Option<String>,
+    platform: Option<String>,
+    device_name: Option<String>,
+    app_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct AccountSettingsPatch {
+    name: Option<String>,
+    show_online: Option<bool>,
+    show_last_seen: Option<bool>,
+    read_receipts: Option<bool>,
+    typing_indicators: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountSettingsResponse {
+    id: String,
+    name: String,
+    handle: String,
+    show_online: bool,
+    show_last_seen: bool,
+    read_receipts: bool,
+    typing_indicators: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceResponse {
+    device_id: String,
+    platform: String,
+    name: Option<String>,
+    app_version: Option<String>,
+    created_at: i64,
+    last_seen_at: Option<i64>,
+    current: bool,
+    revoked_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionResponse {
+    id: String,
+    device_id: Option<String>,
+    platform: String,
+    device_name: Option<String>,
+    app_version: Option<String>,
+    created_at: i64,
+    expires_at: i64,
+    last_seen_at: Option<i64>,
+    current: bool,
 }
 
 #[derive(Serialize)]
@@ -497,6 +560,20 @@ fn valid_display_text(value: &str, max_len: usize) -> bool {
 
 fn valid_password(value: &str) -> bool {
     value.len() >= 8 && value.len() <= MAX_PASSWORD_BYTES && !value.chars().any(char::is_control)
+}
+
+fn valid_optional_metadata(value: Option<&String>, max_len: usize) -> bool {
+    value.map_or(true, |value| valid_display_text(value.trim(), max_len))
+}
+
+fn valid_auth_metadata(request: &AuthRequest) -> bool {
+    request
+        .device_id
+        .as_ref()
+        .map_or(true, |value| protocol::valid_identifier(value.trim()))
+        && valid_optional_metadata(request.platform.as_ref(), 32)
+        && valid_optional_metadata(request.device_name.as_ref(), 128)
+        && valid_optional_metadata(request.app_version.as_ref(), 64)
 }
 
 fn valid_key_material(value: &str) -> bool {
@@ -889,11 +966,17 @@ async fn register(
     State(state): State<AppState>,
     Json(request): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let name = request.name.unwrap_or_default().trim().to_owned();
+    let name = request
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     let handle = request.handle.trim().trim_start_matches('@').to_lowercase();
     if !valid_display_text(&name, 160)
         || !protocol::valid_handle(&handle)
         || !valid_password(&request.password)
+        || !valid_auth_metadata(&request)
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_registration"));
     }
@@ -921,9 +1004,31 @@ async fn register(
     }
     state
         .db
-        .store_session(&response.token, &account.id, storage::now_ms())
+        .store_session_with_metadata(
+            &response.token,
+            &account.id,
+            storage::now_ms(),
+            request.device_id.as_deref(),
+            request.platform.as_deref(),
+            request.device_name.as_deref(),
+            request.app_version.as_deref(),
+        )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(device_id) = request.device_id.as_deref() {
+        state
+            .db
+            .upsert_device(
+                &account.id,
+                device_id.trim(),
+                request.platform.as_deref().unwrap_or("unknown"),
+                request.device_name.as_deref(),
+                request.app_version.as_deref(),
+                storage::now_ms(),
+            )
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    }
     Ok(Json(response))
 }
 
@@ -932,7 +1037,10 @@ async fn login(
     Json(request): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
     let handle = request.handle.trim().trim_start_matches('@').to_lowercase();
-    if !protocol::valid_handle(&handle) || !valid_password(&request.password) {
+    if !protocol::valid_handle(&handle)
+        || !valid_password(&request.password)
+        || !valid_auth_metadata(&request)
+    {
         return Err(error(StatusCode::UNAUTHORIZED, "invalid_credentials"));
     }
     let Some(account) = state
@@ -954,9 +1062,31 @@ async fn login(
     let response = auth_response(&account, &state.server_id);
     state
         .db
-        .store_session(&response.token, &response.profile.id, storage::now_ms())
+        .store_session_with_metadata(
+            &response.token,
+            &response.profile.id,
+            storage::now_ms(),
+            request.device_id.as_deref(),
+            request.platform.as_deref(),
+            request.device_name.as_deref(),
+            request.app_version.as_deref(),
+        )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(device_id) = request.device_id.as_deref() {
+        state
+            .db
+            .upsert_device(
+                &response.profile.id,
+                device_id.trim(),
+                request.platform.as_deref().unwrap_or("unknown"),
+                request.device_name.as_deref(),
+                request.app_version.as_deref(),
+                storage::now_ms(),
+            )
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    }
     Ok(Json(response))
 }
 
@@ -999,6 +1129,306 @@ async fn logout(
         .revoke_session(token)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
+fn account_settings_response(
+    account: storage::StoredAccount,
+    settings: storage::AccountSettings,
+) -> AccountSettingsResponse {
+    AccountSettingsResponse {
+        id: account.id,
+        name: account.name,
+        handle: account.handle,
+        show_online: settings.show_online,
+        show_last_seen: settings.show_last_seen,
+        read_receipts: settings.read_receipts,
+        typing_indicators: settings.typing_indicators,
+    }
+}
+
+async fn get_account_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AccountSettingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let account = state
+        .db
+        .account_by_id(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let settings = state
+        .db
+        .account_settings(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(account_settings_response(account, settings)))
+}
+
+async fn patch_account_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AccountSettingsPatch>,
+) -> Result<Json<AccountSettingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let mut settings = state
+        .db
+        .account_settings(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(value) = request.show_online {
+        settings.show_online = value;
+    }
+    if let Some(value) = request.show_last_seen {
+        settings.show_last_seen = value;
+    }
+    if let Some(value) = request.read_receipts {
+        settings.read_receipts = value;
+    }
+    if let Some(value) = request.typing_indicators {
+        settings.typing_indicators = value;
+    }
+    if let Some(name) = request.name {
+        let name = name.trim();
+        if !valid_display_text(name, 160) {
+            return Err(error(StatusCode::BAD_REQUEST, "invalid_name"));
+        }
+        if !state
+            .db
+            .update_account_name(&account_id, name)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        {
+            return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+        }
+    }
+    state
+        .db
+        .update_account_settings(&account_id, &settings, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    let account = state
+        .db
+        .account_by_id(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    Ok(Json(account_settings_response(account, settings)))
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    if !valid_password(&request.current_password) || !valid_password(&request.new_password) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_password"));
+    }
+    let account = state
+        .db
+        .account_by_id(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let parsed_hash = PasswordHash::new(&account.password_hash)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "password_hash_failed"))?;
+    if Argon2::default()
+        .verify_password(request.current_password.as_bytes(), &parsed_hash)
+        .is_err()
+    {
+        return Err(error(StatusCode::UNAUTHORIZED, "invalid_credentials"));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(request.new_password.as_bytes(), &salt)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "password_hash_failed"))?
+        .to_string();
+    if !state
+        .db
+        .change_password(&account_id, &password_hash)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SessionResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let sessions = state
+        .db
+        .list_sessions(&account_id, &token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(
+        sessions
+            .into_iter()
+            .map(|session| SessionResponse {
+                id: session.id,
+                device_id: session.device_id,
+                platform: session.platform,
+                device_name: session.device_name,
+                app_version: session.app_version,
+                created_at: session.created_at,
+                expires_at: session.expires_at,
+                last_seen_at: session.last_seen_at,
+                current: session.current,
+            })
+            .collect(),
+    ))
+}
+
+async fn revoke_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    if !protocol::valid_identifier(&session_id) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_session"));
+    }
+    let sessions = state
+        .db
+        .list_sessions(&account_id, &token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if sessions
+        .iter()
+        .any(|session| session.id == session_id && session.current)
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "cannot_revoke_current_session",
+        ));
+    }
+    if !state
+        .db
+        .revoke_session_by_id(&account_id, &session_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::NOT_FOUND, "session_not_found"));
+    }
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
+async fn revoke_other_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let revoked = state
+        .db
+        .revoke_other_sessions(&account_id, &token)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(
+        serde_json::json!({ "accepted": true, "revoked": revoked }),
+    ))
+}
+
+async fn list_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeviceResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let current_device_id = state
+        .db
+        .list_sessions(&account_id, &token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .into_iter()
+        .find(|session| session.current)
+        .and_then(|session| session.device_id);
+    let devices = state
+        .db
+        .list_devices(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|device| DeviceResponse {
+                current: current_device_id.as_deref() == Some(device.device_id.as_str()),
+                device_id: device.device_id,
+                platform: device.platform,
+                name: device.name,
+                app_version: device.app_version,
+                created_at: device.created_at,
+                last_seen_at: device.last_seen_at,
+                revoked_at: device.revoked_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn revoke_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    if !protocol::valid_identifier(&device_id) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_device"));
+    }
+    let sessions = state
+        .db
+        .list_sessions(&account_id, &token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if sessions
+        .iter()
+        .any(|session| session.current && session.device_id.as_deref() == Some(device_id.as_str()))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "cannot_revoke_current_device",
+        ));
+    }
+    if !state
+        .db
+        .revoke_device(&account_id, &device_id, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::NOT_FOUND, "device_not_found"));
+    }
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
@@ -1499,6 +1929,11 @@ async fn register_push_token(
     state
         .db
         .register_push_token(&account_id, device_id, token, &platform, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    state
+        .db
+        .bind_session_device(&account_id, bearer_token(&headers)?, device_id)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     Ok(Json(PushTokenResponse { accepted: true }))
@@ -2223,6 +2658,23 @@ async fn register_device_key(
         )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    state
+        .db
+        .upsert_device(
+            &account_id,
+            device_id,
+            "unknown",
+            None,
+            None,
+            storage::now_ms(),
+        )
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    state
+        .db
+        .bind_session_device(&account_id, bearer_token(&headers)?, device_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     if let Some((key_id, public_key)) = account_key {
         state
             .db
@@ -2324,6 +2776,19 @@ async fn main() {
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
+        .route("/auth/change-password", post(change_password))
+        .route(
+            "/api/v1/account/settings",
+            get(get_account_settings).patch(patch_account_settings),
+        )
+        .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/sessions/:session_id", delete(revoke_session))
+        .route(
+            "/api/v1/sessions/revoke-others",
+            post(revoke_other_sessions),
+        )
+        .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/:device_id", delete(revoke_device))
         .route("/api/v1/sync", get(sync))
         .route("/api/v1/realtime", get(realtime))
         .route("/api/v1/messages", post(send_message))

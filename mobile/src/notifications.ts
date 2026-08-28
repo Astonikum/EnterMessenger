@@ -1,14 +1,11 @@
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
+import { readSettings } from "./settings";
 
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
     const isLocal = notification.request.content.data?.local === true;
-    return {
-      shouldShowAlert: isLocal,
-      shouldPlaySound: false,
-      shouldSetBadge: isLocal,
-    };
+    return { shouldShowAlert: isLocal, shouldPlaySound: isLocal && notification.request.content.data?.sound === true, shouldSetBadge: isLocal };
   },
 });
 
@@ -49,12 +46,14 @@ export async function notifyIncomingMessage(input: {
   text: string;
 }) {
   try {
+    const settings = await readSettings();
+    if (!settings.notifications.enabled) return;
     await Notifications.scheduleNotificationAsync({
       content: {
         title: input.title,
-        body: input.text,
-        sound: undefined,
-        data: { local: true, profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
+        body: settings.notifications.preview ? input.text : "Новое сообщение",
+        sound: settings.notifications.sound ? "default" : undefined,
+        data: { local: true, sound: settings.notifications.sound, profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
       },
       trigger: Platform.OS === "android" ? { channelId: "messages", seconds: 1 } : null,
     });

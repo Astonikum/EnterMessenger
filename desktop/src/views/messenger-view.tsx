@@ -57,6 +57,7 @@ type MessengerViewProps = {
   editingMessage?: Message | null;
   messagesLoading?: boolean;
   showProfile?: boolean;
+  showSettings?: boolean;
   messageError?: string;
   searchUser?: SearchUser | null;
   searchBusy?: boolean;
@@ -75,6 +76,7 @@ type MessengerViewProps = {
   onReorder?: (sourceId: string, targetId: string) => void;
   onBack?: () => void;
   onToggleProfile?: () => void;
+  onOpenSettings?: () => void;
   onCloseProfile?: () => void;
   onSearchUser?: (query: string) => void | Promise<void>;
   onOpenSearchUser?: (user: SearchUser) => void | Promise<void>;
@@ -110,6 +112,7 @@ export function MessengerView({
   editingMessage = null,
   messagesLoading = false,
   showProfile = false,
+  showSettings = false,
   messageError = "",
   mediaUploadProgress = null,
   searchUser = null,
@@ -129,6 +132,7 @@ export function MessengerView({
   onReorder = () => undefined,
   onBack = () => undefined,
   onToggleProfile = () => undefined,
+  onOpenSettings = () => undefined,
   onCloseProfile = () => undefined,
   onSearchUser = () => undefined,
   onOpenSearchUser = () => undefined,
@@ -215,7 +219,7 @@ export function MessengerView({
 
   return (
     <main className="app-shell bg-background text-foreground" data-resizing={isResizing} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
-      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showProfile={showProfile} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleProfile={onToggleProfile} />
+      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showProfile={showProfile} showSettings={showSettings} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleProfile={onToggleProfile} onOpenSettings={onOpenSettings} />
       <div className="app-conversations-shell">
         <ConversationList className="app-conversations" conversations={conversations} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onAddToFolder={onAddToFolder} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
         <div className="app-conversations-resizer" role="separator" aria-label="Изменить ширину списка чатов" aria-orientation="vertical" aria-valuemin={MIN_CONVERSATIONS_WIDTH} aria-valuemax={maxConversationsWidth()} aria-valuenow={conversationsWidth} tabIndex={0} onPointerDown={beginConversationsResize} onKeyDown={handleConversationsResizeKeyDown} title="Изменить ширину списка чатов" />

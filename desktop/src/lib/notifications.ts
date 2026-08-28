@@ -1,3 +1,15 @@
+import { readLocalSettings, writeLocalSettings, type NotificationSettings } from "./local-settings";
+
+export type { NotificationSettings } from "./local-settings";
+
+export function readNotificationSettings(): NotificationSettings {
+  return readLocalSettings().notifications;
+}
+
+export function writeNotificationSettings(settings: NotificationSettings) {
+  writeLocalSettings({ ...readLocalSettings(), notifications: settings });
+}
+
 export async function requestDesktopNotificationPermission() {
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
@@ -16,14 +28,17 @@ export async function notifyIncomingMessage(input: {
   title: string;
   text: string;
 }) {
+  const settings = readNotificationSettings();
+  if (!settings.desktop) return;
   if (!(await requestDesktopNotificationPermission())) return;
-  const body = input.text;
+  const body = settings.preview ? input.text : "Новое сообщение";
 
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
     plugin.sendNotification({
       title: input.title,
       body,
+      sound: settings.sound ? "Ping" : undefined,
       extra: { profileId: input.profileId, conversationId: input.conversationId },
     });
     return;

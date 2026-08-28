@@ -10,7 +10,7 @@ import { Montserrat_600SemiBold } from "@expo-google-fonts/montserrat/600SemiBol
 import { Montserrat_700Bold } from "@expo-google-fonts/montserrat/700Bold";
 import * as NavigationBar from "expo-navigation-bar";
 import * as Notifications from "expo-notifications";
-import { Alert, Animated, AppState, Easing, Image, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { Alert, Animated, AppState, Easing, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { initialWindowMetrics, SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { AuthScreen } from "./src/components/AuthScreen";
@@ -18,6 +18,7 @@ import { ConversationList, type Action } from "./src/components/ConversationList
 import { ChatScreen, ForwardSheet } from "./src/components/ChatScreen";
 import { Icon } from "./src/components/Icon";
 import { ProfileSheet } from "./src/components/ProfileSheet";
+import { SettingsScreen } from "./src/components/SettingsScreen";
 import { ProfileScreen } from "./src/components/ProfileScreen";
 import { EMPTY_MESSAGES, makeId, messageTime } from "./src/data";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./src/rn-e2e";
@@ -41,7 +42,7 @@ const NAVIGATION_KEY = "enter-mobile-navigation";
 const OUTBOX_KEY = "enter-mobile-outbox";
 const ALL_FOLDER = "all";
 
-type Screen = "inbox" | "chat" | "profile";
+type Screen = "inbox" | "chat" | "profile" | "settings";
 type MessagesByProfile = Record<string, Record<string, Message[]>>;
 type ConversationsByProfile = Record<string, Conversation[]>;
 type NavigationState = {
@@ -204,6 +205,16 @@ export default function App() {
   const previousScreen = useRef<Screen>(screen);
   const activeConversationIdRef = useRef(activeConversationId);
   const screenRef = useRef(screen);
+  const swipeResponder = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_event, gesture) => {
+      if (screenRef.current !== "inbox" && screenRef.current !== "settings") return false;
+      return Math.abs(gesture.dx) > 12 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25;
+    },
+    onPanResponderRelease: (_event, gesture) => {
+      if (screenRef.current === "inbox" && gesture.dx <= -80) setScreen("settings");
+      if (screenRef.current === "settings" && gesture.dx >= 80) setScreen("inbox");
+    },
+  })).current;
   const pendingNotificationRef = useRef<{ profileId?: string; conversationId: string; messageId?: string } | null>(null);
   const handledNotificationRef = useRef<string | null>(null);
   const hasRenderedScreen = useRef(false);
@@ -216,7 +227,7 @@ export default function App() {
       screenMotion.setValue(1);
       return;
     }
-    const movingBack = (previousScreen.current === "chat" && screen !== "chat") || (previousScreen.current === "profile" && screen === "inbox");
+    const movingBack = (previousScreen.current === "chat" && screen !== "chat") || ((previousScreen.current === "settings" || previousScreen.current === "profile") && screen === "inbox");
     previousScreen.current = screen;
     setScreenDirection(movingBack ? -1 : 1);
     screenMotion.setValue(0);
@@ -346,7 +357,7 @@ export default function App() {
       setActiveConversationByProfile(navigation.activeConversationByProfile ?? {});
       setActiveFolderByProfile(navigation.activeFolderByProfile ?? {});
       const hasSelectedConversation = Boolean(selectedProfileId && selectedConversationId && (cachedConversations[selectedProfileId] ?? []).some((item) => item.id === selectedConversationId));
-      setScreen(hasSelectedConversation ? "chat" : "inbox");
+      setScreen(navigation.screen === "settings" ? "settings" : hasSelectedConversation ? "chat" : "inbox");
       setHydrated(true);
     })().catch(() => { if (mounted) { setHydrated(true); setShowAuth(true); } });
     return () => { mounted = false; };
@@ -769,6 +780,30 @@ export default function App() {
     if (activeProfileId === profile.id) { setActiveProfileId(next[0]?.id ?? null); setActiveConversationId(null); setScreen("inbox"); setShowAuth(next.length === 0); }
   }
 
+  async function clearMessageCache() {
+    if (!activeProfileId) return;
+    setMessagesByProfile((current) => {
+      const next = { ...current };
+      delete next[activeProfileId];
+      return next;
+    });
+    setSyncCursors((current) => ({ ...current, [activeProfileId]: 0 }));
+    syncCursorsRef.current[activeProfileId] = 0;
+  }
+
+  async function clearOutbox() {
+    if (!activeProfileId) return;
+    setOutboxByProfile((current) => {
+      const next = { ...current };
+      delete next[activeProfileId];
+      return next;
+    });
+  }
+
+  async function forgetLocalPrivateKeys() {
+    if (activeProfile) await deleteDeviceKeys(activeProfile.id);
+  }
+
   function expireProfileSession(profileId: string) {
     void deleteSessionToken(profileId);
     const next = profiles.filter((profile) => profile.id !== profileId);
@@ -963,16 +998,16 @@ export default function App() {
   if (!hydrated || !fontsLoaded) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider>;
   if (profiles.length === 0 || showAuth) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider>;
 
-  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.app} edges={["top", "bottom", "left", "right"]}><StatusBar style="light" />
-    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : current.reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} syncConnected={syncConnected} conversations={conversationsWithPreviews} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} />}</Animated.View>
-    {screen !== "chat" && <BottomNav screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => undefined} />}
+  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.app} edges={["top", "bottom", "left", "right"]}><StatusBar style="light" /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
+    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} onClose={() => setScreen("inbox")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : current.reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} syncConnected={syncConnected} conversations={conversationsWithPreviews} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} />}</Animated.View>
+    {screen !== "chat" && <BottomNav screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
     <ProfileSheet visible={showProfiles} profiles={profiles} activeProfile={activeProfile} onClose={() => setShowProfiles(false)} onSelect={selectProfile} onAdd={() => setShowAuth(true)} onRemove={removeProfile} />
     <ForwardSheet visible={Boolean(forwardMessage)} message={forwardMessage} conversations={conversations} currentId={activeConversationId} onClose={() => setForwardMessage(null)} onForward={(id) => forwardMessage && sendForwardedMessage(forwardMessage, id)} />
-  </SafeAreaView></SafeAreaProvider>;
+  </View></SafeAreaView></SafeAreaProvider>;
 }
 
 function BottomNav({ screen, onInbox, onProfile, onSettings }: { screen: Screen; onInbox: () => void; onProfile: () => void; onSettings: () => void }) {
-  return <View style={styles.bottomNav}><NavButton active={screen === "inbox"} icon="chat" label="Чаты" onPress={onInbox} /><NavButton active={screen === "profile"} icon="person" label="Профиль" onPress={onProfile} /><NavButton active={false} icon="settings" label="Настройки" onPress={onSettings} /></View>;
+  return <View style={styles.bottomNav}><NavButton active={screen === "inbox"} icon="chat" label="Чаты" onPress={onInbox} /><NavButton active={screen === "profile"} icon="person" label="Профиль" onPress={onProfile} /><NavButton active={screen === "settings"} icon="settings" label="Настройки" onPress={onSettings} /></View>;
 }
 
 function NavButton({ active, icon, label, onPress }: { active: boolean; icon: "chat" | "person" | "settings"; label: string; onPress: () => void }) {
