@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Message, MessageAttachment } from "../types";
 import type { Profile } from "../types";
 import { copyText, cn } from "../lib/utils";
+import { isAudioAttachment } from "../lib/media";
 import { ContextMenu } from "./ui/context-menu";
 import { Icon } from "./ui/icon";
 import { MediaBubble, MediaGroup, type MediaContextActions } from "./media-bubble";
@@ -64,7 +65,9 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
         const sameAsPrevious = sameStack(previous, message);
         const sameAsNext = sameStack(message, next);
         const visualAttachments = message.attachments?.filter((attachment) => attachment.kind === "image" || attachment.kind === "video") ?? [];
-        const otherAttachments = message.attachments?.filter((attachment) => attachment.kind !== "image" && attachment.kind !== "video") ?? [];
+        const audioAttachments = message.attachments?.filter(isAudioAttachment) ?? [];
+        const fileAttachments = message.attachments?.filter((attachment) => !isAudioAttachment(attachment) && attachment.kind === "file") ?? [];
+        const otherAttachments = [...audioAttachments, ...fileAttachments];
         const mediaOnly = Boolean(visualAttachments.length && !otherAttachments.length && !message.text && !message.replyTo && !message.reaction);
         const mediaCaption = Boolean(visualAttachments.length && (message.text || message.reaction));
         const bubblePosition = sameAsPrevious ? (sameAsNext ? "chat-bubble-middle" : "chat-bubble-bottom") : (sameAsNext ? "chat-bubble-top" : "chat-bubble-single");

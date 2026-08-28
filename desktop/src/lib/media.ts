@@ -7,6 +7,27 @@ export type EncryptedMedia = {
   ciphertext: Uint8Array;
 };
 
+const audioMimeTypes: Record<string, string> = {
+  aac: "audio/aac",
+  amr: "audio/amr",
+  flac: "audio/flac",
+  m4a: "audio/mp4",
+  mp3: "audio/mpeg",
+  oga: "audio/ogg",
+  ogg: "audio/ogg",
+  opus: "audio/opus",
+  wav: "audio/wav",
+  weba: "audio/webm",
+};
+
+function audioMimeTypeForName(name: string) {
+  return audioMimeTypes[name.toLowerCase().split(".").pop() ?? ""];
+}
+
+export function isAudioAttachment(attachment: MessageAttachment) {
+  return attachment.kind === "audio" || (attachment.kind === "file" && (attachment.mimeType.toLowerCase().startsWith("audio/") || Boolean(audioMimeTypeForName(attachment.name))));
+}
+
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -20,6 +41,12 @@ function kindForMime(mimeType: string): MessageAttachment["kind"] {
   return "file";
 }
 
+function mimeTypeForFile(file: File) {
+  const mimeType = file.type.toLowerCase();
+  if (mimeType.startsWith("audio/")) return mimeType;
+  return audioMimeTypeForName(file.name) || mimeType || "application/octet-stream";
+}
+
 function equalBytes(left: Uint8Array, right: Uint8Array) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -27,6 +54,7 @@ function equalBytes(left: Uint8Array, right: Uint8Array) {
 export async function encryptMedia(file: File): Promise<EncryptedMedia> {
   if (file.size > MAX_MEDIA_BYTES) throw new Error("Файл слишком большой. Максимум — 200 МБ.");
   const plaintext = new Uint8Array(await file.arrayBuffer());
+  const mimeType = mimeTypeForFile(file);
   const keyBytes = crypto.getRandomValues(new Uint8Array(32));
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -35,9 +63,9 @@ export async function encryptMedia(file: File): Promise<EncryptedMedia> {
   return {
     attachment: {
       id: crypto.randomUUID(),
-      kind: kindForMime(file.type || "application/octet-stream"),
+      kind: kindForMime(mimeType),
       name: file.name || "Вложение",
-      mimeType: file.type || "application/octet-stream",
+      mimeType,
       size: plaintext.byteLength,
       sha256: bytesToBase64(digest),
       key: bytesToBase64(keyBytes),

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode, WheelEvent } from "react";
 import { downloadMedia } from "../lib/enter-api";
-import { decryptMedia } from "../lib/media";
+import { decryptMedia, isAudioAttachment } from "../lib/media";
 import type { MessageAttachment, Profile } from "../types";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
@@ -28,6 +28,8 @@ const speedOptions = [
   { value: 1.5, label: "Быстро" },
   { value: 2, label: "Очень быстро" },
 ];
+
+const audioWaveform = [8, 13, 6, 17, 10, 20, 12, 7, 15, 22, 11, 18, 9, 14, 6, 19, 12, 8, 16, 10, 21, 13, 7, 15];
 
 function downloadObjectUrl(url: string, name: string) {
   const link = document.createElement("a");
@@ -172,6 +174,55 @@ export type MediaContextActions = {
   saveAs: () => void;
 };
 
+type MediaContextProps = {
+  "data-attachment-context": string;
+  onContextMenu: () => void;
+};
+
+function AudioBubble({ attachment, url, grouped, className, contextProps }: { attachment: MessageAttachment; url: string; grouped: boolean; className?: string; contextProps: MediaContextProps }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const initialDuration = Math.max(0, (attachment.durationMs ?? 0) / 1000);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(initialDuration);
+
+  useEffect(() => {
+    setPlaying(false);
+    setCurrentTime(0);
+    setDuration(initialDuration);
+  }, [initialDuration, url]);
+
+  function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) void audio.play().catch(() => setPlaying(false));
+    else audio.pause();
+  }
+
+  function seek(value: number) {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = value;
+    setCurrentTime(value);
+  }
+
+  const progress = duration > 0 ? Math.min(1, currentTime / duration) : 0;
+  return <div {...contextProps} className={cn("flex min-w-60 items-center gap-2.5 rounded-xl bg-background/15 px-3 py-2.5 text-left transition-colors hover:bg-background/25", grouped && "h-full min-w-0 px-2", className)}>
+    <audio ref={audioRef} src={url} preload="metadata" className="sr-only" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : initialDuration)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} aria-label={attachment.name} />
+    <Button type="button" variant="ghost" size="icon" className="size-9 shrink-0 rounded-full bg-foreground/10 text-current hover:bg-foreground/20" title={playing ? "Пауза" : "Воспроизвести"} aria-label={playing ? `Поставить на паузу: ${attachment.name}` : `Воспроизвести: ${attachment.name}`} onClick={togglePlayback}><Icon name={playing ? "pause" : "play"} className="size-4" /></Button>
+    <div className="min-w-0 flex-1">
+      <div className="flex items-center gap-2 text-xs"><span className="min-w-0 flex-1 truncate font-medium">{attachment.name}</span><span className="shrink-0 tabular-nums opacity-70">{formatTime(currentTime)} / {formatTime(duration)}</span></div>
+      <div className="relative mt-1.5 h-5">
+        <div className="pointer-events-none absolute inset-0 flex items-center gap-0.5 overflow-hidden opacity-45">{audioWaveform.map((height, index) => <span key={index} className="w-0.5 shrink-0 rounded-full bg-current" style={{ height }} />)}</div>
+        <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center gap-0.5 overflow-hidden" style={{ width: `${progress * 100}%` }}>{audioWaveform.map((height, index) => <span key={index} className="w-0.5 shrink-0 rounded-full bg-current" style={{ height }} />)}</div>
+        <input aria-label={`Позиция аудио: ${attachment.name}`} title="Позиция аудио" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => seek(Number(event.target.value))} className="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
+      </div>
+      <span className="block text-[0.6875rem] opacity-60">Аудио · {formatFileSize(attachment.size)}</span>
+    </div>
+    <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-current/65 hover:bg-foreground/10 hover:text-current" title="Сохранить аудио" aria-label={`Сохранить ${attachment.name}`} onClick={() => downloadObjectUrl(url, attachment.name)}><Icon name="download" className="size-4" /></Button>
+  </div>;
+}
+
 export function MediaBubble({ profile, attachment, grouped = false, className, onAttachmentContextMenu }: { profile?: Profile; attachment: MessageAttachment; grouped?: boolean; className?: string; onAttachmentContextMenu?: (attachment: MessageAttachment, actions: MediaContextActions) => void }) {
   const [url, setUrl] = useState<string>();
   const [error, setError] = useState(false);
@@ -199,7 +250,7 @@ export function MediaBubble({ profile, attachment, grouped = false, className, o
   const contextProps = { "data-attachment-context": "true", onContextMenu: () => onAttachmentContextMenu?.(attachment, { save: () => downloadObjectUrl(url, attachment.name), saveAs: () => void saveAs(url, attachment) }) };
   if (attachment.kind === "image") return <><button type="button" {...contextProps} className={cn("block overflow-hidden rounded-xl p-0", grouped && "h-full", className)} onClick={() => setViewerOpen(true)} aria-label={`Открыть ${attachment.name}`}><img src={url} alt={attachment.name} className={grouped ? "size-full object-cover" : "max-h-80 max-w-full object-cover"} /></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   if (attachment.kind === "video") return <><button type="button" {...contextProps} className={cn("relative block overflow-hidden rounded-xl bg-black p-0", grouped && "h-full", className)} onClick={() => setViewerOpen(true)} aria-label={`Открыть ${attachment.name}`}><video src={url} muted playsInline preload="metadata" className={cn("pointer-events-none", grouped ? "size-full object-cover" : "max-h-80 max-w-full object-contain")} /><span className="pointer-events-none absolute inset-0 grid place-items-center text-3xl text-white/90 drop-shadow">▶</span></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  if (attachment.kind === "audio") return <><button type="button" {...contextProps} className={cn("flex min-w-52 items-center gap-3 rounded-xl bg-background/15 px-3 py-2.5 text-left transition-colors hover:bg-background/25", grouped && "h-full min-w-0 px-2", className)} onClick={() => setViewerOpen(true)}><Icon name="mic" className="size-5 shrink-0" /><span className="min-w-0"><span className="block truncate text-sm font-medium">{attachment.name}</span><span className="block text-xs opacity-65">Аудио · {formatFileSize(attachment.size)}</span></span></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (isAudioAttachment(attachment)) return <AudioBubble attachment={attachment} url={url} grouped={grouped} className={className} contextProps={contextProps} />;
   return <a href={url} download={attachment.name} {...contextProps} className={cn("flex min-w-52 items-center gap-3 rounded-xl bg-background/15 px-3 py-2.5 transition-colors hover:bg-background/25", grouped && "h-full min-w-0 px-2", className)}><span className="grid size-9 shrink-0 place-items-center rounded-lg bg-background/20"><Icon name="attach_file" className="size-4" /></span><span className="min-w-0"><span className="block truncate text-sm font-medium">{attachment.name}</span><span className="block text-xs opacity-65">{formatFileSize(attachment.size)}</span></span></a>;
 }
 

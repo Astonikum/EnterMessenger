@@ -6,7 +6,7 @@ import { EMPTY_MESSAGES } from "./lib/empty-messages";
 import { clearMessageCache, MESSAGE_CACHE_KEY_PREFIX, readMessageCache, readMessageCacheAsync, writeMessageCache } from "./lib/message-cache";
 import { acknowledgeMessage, createConversation, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, type DeviceHistoryEntry, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./lib/e2e";
-import { encryptMedia } from "./lib/media";
+import { encryptMedia, isAudioAttachment } from "./lib/media";
 import type { PendingMedia } from "./components/message-composer";
 import { formatMessageTime, makeId } from "./lib/utils";
 import { migrateLocalServerAddress } from "./lib/server-address";
@@ -28,7 +28,7 @@ function messagePreview(message: Message) {
   const attachments = message.attachments ?? [];
   if (attachments.some(({ kind }) => kind === "image")) return "[Фото]";
   if (attachments.some(({ kind }) => kind === "video")) return "[Видео]";
-  if (attachments.some(({ kind }) => kind === "audio")) return "[Аудио]";
+  if (attachments.some(isAudioAttachment)) return "[Аудио]";
   return attachments.length > 0 ? "[Файлы]" : "";
 }
 
