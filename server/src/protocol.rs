@@ -21,6 +21,8 @@ pub struct DiscoveryDocument {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryEndpoints {
     pub keys: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation_delivery: Option<&'static str>,
     pub realtime: &'static str,
     pub media_upload: &'static str,
     pub media_download: &'static str,
@@ -50,6 +52,36 @@ pub struct EncryptedEnvelope {
     pub ciphertext: String,
     pub associated_data: String,
     pub signature: String,
+}
+
+/// A user-visible message carried between home servers. The encrypted envelope
+/// is deliberately nested so transport metadata is not confused with a message.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub created_at: i64,
+    pub envelope: EncryptedEnvelope,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationDelivery {
+    pub protocol: String,
+    pub delivery_id: String,
+    pub sender_server: String,
+    pub sender_name: String,
+    pub sender_avatar: String,
+    pub message: FederationMessage,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationDeliveryResponse {
+    pub protocol: &'static str,
+    pub delivery_id: String,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -87,7 +119,18 @@ pub fn discovery(
     server_id: String,
     name: String,
     logo: Option<String>,
+    federation_enabled: bool,
 ) -> DiscoveryDocument {
+    let mut capabilities = vec![
+        "directory",
+        "message-relay",
+        "encrypted-messages",
+        "encrypted-media",
+        "realtime",
+    ];
+    if federation_enabled {
+        capabilities.insert(2, "federation");
+    }
     DiscoveryDocument {
         protocol: PROTOCOL_NAME,
         version: PROTOCOL_VERSION,
@@ -95,15 +138,10 @@ pub fn discovery(
         server_id,
         name,
         logo,
-        capabilities: vec![
-            "directory",
-            "message-relay",
-            "encrypted-messages",
-            "encrypted-media",
-            "realtime",
-        ],
+        capabilities,
         endpoints: DiscoveryEndpoints {
             keys: "/enter/v1/keys/{handle}",
+            federation_delivery: federation_enabled.then_some("/enter/v1/federation/deliveries"),
             realtime: "/api/v1/realtime",
             media_upload: "/api/v1/media",
             media_download: "/api/v1/media/{media_id}",
@@ -133,6 +171,28 @@ pub fn is_supported_envelope(envelope: &EncryptedEnvelope) -> bool {
         && valid_encoded(&envelope.signature, 512)
 }
 
+pub fn is_supported_delivery(delivery: &FederationDelivery) -> bool {
+    delivery.protocol == PROTOCOL_VERSION
+        && valid_delivery_identifier(&delivery.delivery_id)
+        && valid_server_reference(&delivery.sender_server)
+        && valid_display_text(&delivery.sender_name, 160)
+        && valid_display_text(&delivery.sender_avatar, 320)
+        && valid_identifier(&delivery.message.id)
+        && valid_identifier(&delivery.message.conversation_id)
+        && delivery.message.created_at > 0
+        && delivery.message.id == delivery.message.envelope.message_id
+        && delivery.message.conversation_id == delivery.message.envelope.conversation_id
+        && is_supported_envelope(&delivery.message.envelope)
+}
+
+fn valid_delivery_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 pub fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -149,7 +209,7 @@ pub fn valid_handle(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn valid_server(value: &str) -> bool {
+pub fn valid_server(value: &str) -> bool {
     if value.is_empty() || value.len() > 255 {
         return false;
     }
@@ -183,6 +243,26 @@ fn valid_server(value: &str) -> bool {
             && port.parse::<u16>().is_ok_and(|value| value > 0)
     });
     valid_host && valid_port
+}
+
+fn valid_server_reference(value: &str) -> bool {
+    let value = value.trim();
+    let (scheme, server) = if let Some(server) = value.strip_prefix("http://") {
+        ("http", server)
+    } else if let Some(server) = value.strip_prefix("https://") {
+        ("https", server)
+    } else {
+        ("", value)
+    };
+    !server.contains('/')
+        && !server.contains('?')
+        && !server.contains('#')
+        && valid_server(server)
+        && (scheme.is_empty() || matches!(scheme, "http" | "https"))
+}
+
+fn valid_display_text(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && !value.chars().any(char::is_control)
 }
 
 pub fn valid_address(value: &str) -> bool {
@@ -258,15 +338,61 @@ mod tests {
     }
 
     #[test]
-    fn discovery_does_not_advertise_unsupported_federation() {
+    fn discovery_advertises_federation_delivery() {
         let document = discovery(
             "https://example.test".to_owned(),
             "server-1".to_owned(),
             "Enter".to_owned(),
             None,
+            true,
         );
-        assert!(!document.capabilities.contains(&"federation"));
+        assert!(document.capabilities.contains(&"federation"));
         let value = serde_json::to_value(document).expect("serialize discovery");
-        assert!(value["endpoints"].get("federationDelivery").is_none());
+        assert_eq!(
+            value["endpoints"]["federationDelivery"],
+            "/enter/v1/federation/deliveries"
+        );
+
+        let disabled = discovery(
+            "https://example.test".to_owned(),
+            "server-1".to_owned(),
+            "Enter".to_owned(),
+            None,
+            false,
+        );
+        assert!(!disabled.capabilities.contains(&"federation"));
+        let disabled = serde_json::to_value(disabled).expect("serialize disabled discovery");
+        assert!(disabled["endpoints"].get("federationDelivery").is_none());
+    }
+
+    #[test]
+    fn federation_delivery_contains_a_message_with_an_envelope() {
+        let envelope = envelope();
+        let delivery = FederationDelivery {
+            protocol: PROTOCOL_VERSION.to_owned(),
+            delivery_id: "message-1:key-1".to_owned(),
+            sender_server: "https://example.test".to_owned(),
+            sender_name: "Alice".to_owned(),
+            sender_avatar: "alice".to_owned(),
+            message: FederationMessage {
+                id: envelope.message_id.clone(),
+                conversation_id: envelope.conversation_id.clone(),
+                created_at: 1,
+                envelope,
+            },
+        };
+        assert!(is_supported_delivery(&delivery));
+        let value = serde_json::to_value(&delivery).expect("serialize delivery");
+        assert!(value["message"]["envelope"].is_object());
+        assert!(value.get("envelope").is_none());
+
+        let mut long_delivery = delivery;
+        long_delivery.delivery_id = format!(
+            "{}:{}:{}",
+            "a".repeat(255),
+            "m".repeat(128),
+            "k".repeat(128)
+        );
+        assert!(is_supported_delivery(&long_delivery));
     }
 }

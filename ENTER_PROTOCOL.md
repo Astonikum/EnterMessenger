@@ -1,13 +1,13 @@
 # Enter Protocol
 
-Enter — это messaging protocol для мессенджера: у пользователя есть адрес `handle@server`, а домашний сервер отвечает за хранение и доставку зашифрованных сообщений. Текущая реализация поддерживает доставку между аккаунтами одного сервера; federation пока не включена.
+Enter — это messaging protocol для мессенджера: у пользователя есть адрес `handle@server`, а домашний сервер отвечает за хранение и доставку зашифрованных сообщений. Серверы умеют пересылать сообщения между собой через federation.
 
 ## Границы доверия
 
 - Клиент владеет identity key, device keys и состоянием сессии.
 - Домашний сервер хранит аккаунт, публичные device key bundles и зашифрованные сообщения для доставки в диалоги.
 - Сервер хранит и маршрутизирует зашифрованные сообщения, но не получает plaintext и не имеет ключей расшифровки.
-- Межсерверная доставка в текущем профиле отключена: сервер отклоняет remote conversation и delivery, чтобы сообщение не принималось без фактической доставки.
+- Межсерверная доставка выполняется через `POST /enter/v1/federation/deliveries`. Серверы из одной федерации должны иметь одинаковый `ENTER_FEDERATION_SECRET`; запрос использует `Authorization: Bearer <secret>`. Для production нужен HTTPS. HTTP разрешается только явной настройкой `ENTER_FEDERATION_ALLOW_HTTP=true` для local/LAN development.
 
 ## Адреса и discovery
 
@@ -17,7 +17,7 @@ Enter — это messaging protocol для мессенджера: у польз
 
 ## Сообщение и шифрование
 
-На уровне транспорта каждое сообщение представлено структурой `EncryptedEnvelope`: message id, conversation id, sender/recipient addresses, device/key ids, nonce, эфемерный public key, associated data, ciphertext и signature. Поля `ciphertext`, `nonce` и `signature` — opaque для relay.
+На уровне API сообщение — это объект `message` с id, conversation id, временем, автором и вложенным `envelope`. `EncryptedEnvelope` — только зашифрованная копия для одного устройства: в ней message id, conversation id, sender/recipient addresses, device/key ids, nonce, эфемерный public key, associated data, ciphertext и signature. Поля `ciphertext`, `nonce` и `signature` — opaque для relay.
 
 `/api/v1/messages` принимает набор зашифрованных представлений одного сообщения (поле `envelope` остаётся совместимым со старым форматом). Клиент создаёт отдельную копию сообщения для каждого зарегистрированного устройства отправителя и получателя. Сервер сохраняет ciphertext и метаданные без plaintext; `/api/v1/sync` отдаёт копии клиенту, где выполняются проверка подписи, выбор копии для текущего устройства и расшифровка. Повторная отправка с тем же client message id идемпотентна.
 
@@ -38,10 +38,11 @@ Enter — это messaging protocol для мессенджера: у польз
 - `/.well-known/enter` — server discovery и cryptographic profile.
 - `POST /enter/v1/keys` — публикация публичного device key bundle после авторизации.
 - `GET /enter/v1/keys/{handle}` — публичный каталог ключей получателя.
+- `POST /enter/v1/federation/deliveries` — доставка `message` с вложенным `envelope` между домашними серверами.
 - `POST /api/v1/messages/{messageId}/delivered` — authenticated client ACK после обработки сообщения.
 - `WebSocket /api/v1/realtime` — authenticated realtime stream с cursor/resume.
 - `GET /enter/v1/keys/search?q=...` — поиск в публичном каталоге ключей локальных аккаунтов.
 
 Приватные device keys создаются через Web Crypto и сохраняются в IndexedDB приложения; они не отправляются на сервер. Для каждого сообщения создаётся новый эфемерный ECDH-ключ, а подпись покрывает зашифрованную копию сообщения.
 
-Прямой E2E v1 завершён для текущих локальных диалогов. Маршрутизация между разными серверами, server-to-server authentication и группы требуют отдельных протокольных профилей и пока не входят в discovery.
+Прямой E2E v1 работает для локальных и federated диалогов: домашний сервер отправителя пересылает зашифрованную копию домашнему серверу получателя, не расшифровывая её.

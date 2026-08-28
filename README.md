@@ -32,6 +32,10 @@ npm run tauri dev
 нужно реализовать следующий backend в `server/src/storage.rs`, не меняя API
 синхронизации и сообщений.
 
+Для межсерверной отправки задайте на обоих серверах один длинный случайный
+`ENTER_FEDERATION_SECRET`. В production оставьте `ENTER_FEDERATION_ALLOW_HTTP=false`
+и используйте HTTPS; для локальной сети можно явно включить HTTP.
+
 Сервер запускается из корня командой:
 
 ```bash

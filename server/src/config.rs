@@ -15,6 +15,10 @@ pub struct ServerConfig {
     pub logo_path: Option<PathBuf>,
     pub database_url: String,
     pub expo_push_url: String,
+    /// Shared secret used to authenticate server-to-server delivery.
+    pub federation_secret: Option<String>,
+    /// HTTP is useful for local/LAN development only; production should use HTTPS.
+    pub federation_allow_http: bool,
     /// Maximum plaintext media size. The upload body may be 16 bytes larger for AES-GCM auth data.
     pub media_max_bytes: usize,
     pub address: SocketAddr,
@@ -50,6 +54,12 @@ impl ServerConfig {
             .unwrap_or_else(|_| "https://exp.host/--/api/v2/push/send".to_owned())
             .trim_end_matches('/')
             .to_owned();
+        let federation_secret = env::var("ENTER_FEDERATION_SECRET")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let federation_allow_http =
+            parse_bool(env::var("ENTER_FEDERATION_ALLOW_HTTP").ok().as_deref());
         let media_max_bytes = media_limit_bytes(env::var("ENTER_MEDIA_MAX_MB").ok().as_deref());
         let port = env::var("ENTER_PORT")
             .ok()
@@ -64,6 +74,8 @@ impl ServerConfig {
             logo_path,
             database_url,
             expo_push_url,
+            federation_secret,
+            federation_allow_http,
             media_max_bytes,
             address: bind_address,
         }
@@ -92,6 +104,15 @@ fn configured_address(value: Option<&str>, port: u16) -> SocketAddr {
         .and_then(|value| value.parse::<IpAddr>().ok())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     SocketAddr::new(address, port)
+}
+
+fn parse_bool(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -128,5 +149,13 @@ mod tests {
         assert_eq!(media_limit_bytes(Some("32")), 32 * 1024 * 1024);
         assert_eq!(media_limit_bytes(Some("invalid")), 200 * 1024 * 1024);
         assert_eq!(media_limit_bytes(Some("0")), 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn federation_http_is_opt_in() {
+        assert!(!parse_bool(None));
+        assert!(!parse_bool(Some("false")));
+        assert!(parse_bool(Some("true")));
+        assert!(parse_bool(Some(" ON ")));
     }
 }

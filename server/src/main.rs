@@ -307,6 +307,11 @@ struct SendMessageResponse {
     message: MessageResponse,
 }
 
+#[derive(Deserialize)]
+struct FederationDeliveryAck {
+    accepted: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaUploadResponse {
@@ -385,6 +390,7 @@ const MAX_ENVELOPES_PER_MESSAGE: usize = 64;
 const MAX_ENVELOPE_BATCH_BYTES: usize = 3 * 1024 * 1024;
 const MAX_LOGO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
+const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct RealtimeMetrics {
@@ -423,6 +429,7 @@ async fn protocol_discovery(State(state): State<AppState>) -> Json<protocol::Dis
         state.server_id.clone(),
         state.config.name.clone(),
         state.config.logo(),
+        state.config.federation_secret.is_some(),
     ))
 }
 
@@ -557,6 +564,126 @@ fn canonical_address(server_url: &str, handle: &str) -> String {
     format!("{handle}@{server}")
 }
 
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for (left, right) in left.bytes().zip(right.bytes()) {
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
+fn federation_authorized(headers: &HeaderMap, expected_secret: Option<&str>) -> bool {
+    let Some(expected_secret) = expected_secret.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_equal(token.trim(), expected_secret)
+}
+
+fn federation_urls(remote_server: &str, allow_http: bool) -> Vec<String> {
+    let server = normalize_server(remote_server);
+    let mut schemes = vec!["https"];
+    if allow_http {
+        schemes.push("http");
+    }
+    schemes
+        .into_iter()
+        .map(|scheme| format!("{scheme}://{server}/enter/v1/federation/deliveries"))
+        .collect()
+}
+
+fn federation_delivery_error(
+    delivery: &protocol::FederationDelivery,
+    local_server: &str,
+) -> Option<&'static str> {
+    if !protocol::is_supported_delivery(delivery) {
+        return Some("invalid_federation_delivery");
+    }
+    let envelope = &delivery.message.envelope;
+    let Some((_, envelope_sender_server)) = enter_address_parts(&envelope.sender) else {
+        return Some("invalid_federation_delivery");
+    };
+    if !same_server(&delivery.sender_server, envelope_sender_server) {
+        return Some("sender_server_mismatch");
+    }
+    if same_server(local_server, envelope_sender_server) {
+        return Some("federation_loop");
+    }
+    let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+        return Some("invalid_federation_delivery");
+    };
+    if !same_server(local_server, recipient_server) {
+        return Some("wrong_recipient_server");
+    }
+    None
+}
+
+async fn forward_federation_message(
+    state: &AppState,
+    sender: &storage::StoredAccount,
+    envelope: &protocol::EncryptedEnvelope,
+    created_at: i64,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(secret) = state.config.federation_secret.as_deref() else {
+        return Err(error(StatusCode::BAD_REQUEST, "federation_not_configured"));
+    };
+    let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+    };
+    let delivery = protocol::FederationDelivery {
+        protocol: protocol::PROTOCOL_VERSION.to_owned(),
+        delivery_id: format!(
+            "{}:{}:{}",
+            normalize_server(&state.config.public_url),
+            envelope.message_id,
+            envelope.key_id
+        ),
+        sender_server: state.config.public_url.clone(),
+        sender_name: sender.name.clone(),
+        sender_avatar: sender.handle.clone(),
+        message: protocol::FederationMessage {
+            id: envelope.message_id.clone(),
+            conversation_id: envelope.conversation_id.clone(),
+            created_at,
+            envelope: envelope.clone(),
+        },
+    };
+    let client = reqwest::Client::builder()
+        .timeout(FEDERATION_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| error(StatusCode::BAD_GATEWAY, "federation_delivery_failed"))?;
+    for url in federation_urls(recipient_server, state.config.federation_allow_http) {
+        let response = match client
+            .post(&url)
+            .bearer_auth(secret)
+            .json(&delivery)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let accepted = response
+            .json::<FederationDeliveryAck>()
+            .await
+            .ok()
+            .is_some_and(|response| response.accepted);
+        if accepted {
+            return Ok(());
+        }
+    }
+    Err(error(StatusCode::BAD_GATEWAY, "federation_delivery_failed"))
+}
+
 async fn deliver_local_message(
     state: &AppState,
     sender: &storage::StoredAccount,
@@ -621,6 +748,78 @@ async fn deliver_local_message(
         }
     }
     Ok(())
+}
+
+async fn federation_delivery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(delivery): Json<protocol::FederationDelivery>,
+) -> Result<Json<protocol::FederationDeliveryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(secret) = state.config.federation_secret.as_deref() else {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "federation_not_configured",
+        ));
+    };
+    if !federation_authorized(&headers, Some(secret)) {
+        return Err(error(StatusCode::UNAUTHORIZED, "federation_unauthorized"));
+    }
+    if let Some(reason) = federation_delivery_error(&delivery, &state.config.public_url) {
+        return Err(error(StatusCode::BAD_REQUEST, reason));
+    }
+    let envelope = &delivery.message.envelope;
+    let Some((recipient_handle, _)) = enter_address_parts(&envelope.recipient) else {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid_federation_delivery",
+        ));
+    };
+    let Some(recipient) = state
+        .db
+        .account_by_handle(recipient_handle)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    else {
+        return Err(error(StatusCode::NOT_FOUND, "recipient_not_found"));
+    };
+    let envelope_json = serde_json::to_string(envelope)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_federation_delivery"))?;
+    let delivered = state
+        .db
+        .deliver_message(
+            &recipient.id,
+            &envelope.conversation_id,
+            &envelope.sender,
+            &delivery.sender_name,
+            &delivery.sender_avatar,
+            &delivery.delivery_id,
+            &envelope_json,
+            storage::now_ms(),
+        )
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if let Some(message) = delivered {
+        if let Some(event) = state
+            .db
+            .event_for_message(&recipient.id, &message.id)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        {
+            publish_stored_event(&state, event).await;
+        }
+        tokio::spawn(send_push_notification(
+            state.clone(),
+            recipient.id.clone(),
+            delivery.sender_name.clone(),
+            envelope.conversation_id.clone(),
+            message.id,
+        ));
+    }
+    Ok(Json(protocol::FederationDeliveryResponse {
+        protocol: protocol::PROTOCOL_VERSION,
+        delivery_id: delivery.delivery_id,
+        accepted: true,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1345,11 +1544,10 @@ async fn send_message(
         let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
         };
-        if !same_server(&state.config.public_url, recipient_server) {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "remote_delivery_not_supported",
-            ));
+        if !same_server(&state.config.public_url, recipient_server)
+            && state.config.federation_secret.is_none()
+        {
+            return Err(error(StatusCode::BAD_REQUEST, "federation_not_configured"));
         }
         if !envelope_belongs_to_account(envelope, &sender, &state.config.public_url) {
             return Err(error(StatusCode::FORBIDDEN, "sender_identity_mismatch"));
@@ -1420,15 +1618,22 @@ async fn send_message(
     for (index, envelope) in envelopes.iter().enumerate() {
         let envelope_json = serde_json::to_string(envelope)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
-        deliver_local_message(
-            &state,
-            &sender,
-            envelope,
-            &envelope_json,
-            created_at,
-            index == 0,
-        )
-        .await?;
+        let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+            return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+        };
+        if same_server(&state.config.public_url, recipient_server) {
+            deliver_local_message(
+                &state,
+                &sender,
+                envelope,
+                &envelope_json,
+                created_at,
+                index == 0,
+            )
+            .await?;
+        } else {
+            forward_federation_message(&state, &sender, envelope, created_at).await?;
+        }
     }
     let cursor = state
         .db
@@ -1640,8 +1845,9 @@ async fn device_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        conversation_response, enter_address_parts, envelope_belongs_to_account,
-        is_embedded_app_origin, normalize_server, origin, realtime_error_payload,
+        constant_time_equal, conversation_response, enter_address_parts,
+        envelope_belongs_to_account, federation_authorized, federation_delivery_error,
+        federation_urls, is_embedded_app_origin, normalize_server, origin, realtime_error_payload,
         realtime_hello_error, realtime_origin_allowed, same_server, valid_envelope_batch,
         RealtimeEvent, RealtimeHello, RealtimeHub, MAX_ENVELOPES_PER_MESSAGE,
         REALTIME_PROTOCOL_VERSION,
@@ -1735,6 +1941,76 @@ mod tests {
             envelope;
             MAX_ENVELOPES_PER_MESSAGE + 1
         ]));
+    }
+
+    #[test]
+    fn federation_auth_uses_the_bearer_secret_and_transport_policy() {
+        assert!(constant_time_equal("secret", "secret"));
+        assert!(!constant_time_equal("secret", "other"));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(federation_authorized(&headers, Some("secret")));
+        assert!(!federation_authorized(&headers, Some("wrong")));
+        assert!(!federation_authorized(&headers, None));
+        assert_eq!(
+            federation_urls("remote.example:50121", false),
+            vec!["https://remote.example:50121/enter/v1/federation/deliveries"]
+        );
+        assert_eq!(
+            federation_urls("remote.example:50121", true),
+            vec![
+                "https://remote.example:50121/enter/v1/federation/deliveries",
+                "http://remote.example:50121/enter/v1/federation/deliveries"
+            ]
+        );
+    }
+
+    #[test]
+    fn federation_delivery_is_bound_to_both_servers() {
+        let envelope = super::protocol::EncryptedEnvelope {
+            protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
+            message_id: "message-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            sender: "alice@source.example".to_owned(),
+            recipient: "bob@target.example".to_owned(),
+            sender_device: "device-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            created_at: "2026-08-28T00:00:00Z".to_owned(),
+            nonce: "nonce".to_owned(),
+            ephemeral_public_key: "ephemeral".to_owned(),
+            ciphertext: "ciphertext".to_owned(),
+            associated_data: "aad".to_owned(),
+            signature: "signature".to_owned(),
+        };
+        let delivery = super::protocol::FederationDelivery {
+            protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
+            delivery_id: "source.example:message-1:key-1".to_owned(),
+            sender_server: "https://source.example".to_owned(),
+            sender_name: "Alice".to_owned(),
+            sender_avatar: "alice".to_owned(),
+            message: super::protocol::FederationMessage {
+                id: envelope.message_id.clone(),
+                conversation_id: envelope.conversation_id.clone(),
+                created_at: 1,
+                envelope,
+            },
+        };
+        assert_eq!(
+            federation_delivery_error(&delivery, "https://target.example"),
+            None
+        );
+        let mut forged = delivery.clone();
+        forged.sender_server = "https://mallory.example".to_owned();
+        assert_eq!(
+            federation_delivery_error(&forged, "https://target.example"),
+            Some("sender_server_mismatch")
+        );
+        let mut misrouted = delivery;
+        misrouted.message.envelope.recipient = "bob@other.example".to_owned();
+        assert_eq!(
+            federation_delivery_error(&misrouted, "https://target.example"),
+            Some("wrong_recipient_server")
+        );
     }
 
     #[test]
@@ -1871,7 +2147,7 @@ async fn create_conversation(
     let peer_address = request.peer_address.trim();
     let name = request.name.trim();
     let avatar = request.avatar.trim();
-    let Some((_, peer_server)) = enter_address_parts(peer_address) else {
+    let Some((_, _)) = enter_address_parts(peer_address) else {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_conversation"));
     };
     if peer_address.len() > 320
@@ -1883,12 +2159,6 @@ async fn create_conversation(
             .is_some_and(|value| !valid_display_text(value, 320))
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_conversation"));
-    }
-    if !same_server(&state.config.public_url, peer_server) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "remote_conversations_not_supported",
-        ));
     }
     let conversation = state
         .db
@@ -2061,6 +2331,7 @@ async fn main() {
             "/api/v1/media",
             post(upload_media).layer(DefaultBodyLimit::max(max_media_body)),
         )
+        .route("/enter/v1/federation/deliveries", post(federation_delivery))
         .route("/api/v1/media/:media_id", get(download_media))
         .route(
             "/api/v1/conversations/:conversation_id/read",

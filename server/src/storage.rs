@@ -982,6 +982,7 @@ impl SqliteStorage {
         )
     }
 
+    #[cfg(test)]
     pub fn events_since(&self, account_id: &str, since: i64) -> SqlResult<Vec<StoredEvent>> {
         self.events_since_limited(account_id, since, i64::MAX)
     }
@@ -1432,25 +1433,17 @@ impl SqliteStorage {
         created_at: i64,
     ) -> SqlResult<Option<StoredMessage>> {
         let transaction = self.connection.transaction()?;
-        if let Some(existing) = transaction
+        if transaction
             .query_row(
-                "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = ?1 AND client_message_id = ?2",
+                "SELECT id FROM messages WHERE owner_account_id = ?1 AND client_message_id = ?2",
                 params![account_id, delivery_id],
-                |row| {
-                    Ok(StoredMessage {
-                        id: row.get(0)?,
-                        conversation_id: row.get(1)?,
-                        author: row.get(2)?,
-                        created_at: row.get(3)?,
-                        stack_id: row.get(4)?,
-                        envelope_json: row.get(5)?,
-                    })
-                },
+                |row| row.get::<_, String>(0),
             )
             .optional()?
+            .is_some()
         {
             transaction.commit()?;
-            return Ok(Some(existing));
+            return Ok(None);
         }
 
         let target_conversation_id = transaction
@@ -2033,9 +2026,8 @@ mod tests {
                     3,
                 )
                 .expect("repeat delivery")
-                .expect("existing delivery")
-                .envelope_json,
-            "{\"envelope\":true}"
+                .is_none(),
+            true
         );
         storage
             .deliver_message(
@@ -3531,23 +3523,17 @@ impl Storage {
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                if let Some(row) = sqlx::query(
-                    "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
+                if sqlx::query(
+                    "SELECT 1 FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
                 )
                 .bind(account_id)
                 .bind(delivery_id)
                 .fetch_optional(&mut *transaction)
                 .await?
+                .is_some()
                 {
                     transaction.commit().await?;
-                    return Ok(Some(StoredMessage {
-                        id: row.try_get("id")?,
-                        conversation_id: row.try_get("conversation_id")?,
-                        author: row.try_get("author")?,
-                        created_at: row.try_get("created_at")?,
-                        stack_id: row.try_get("stack_id")?,
-                        envelope_json: row.try_get("envelope_json")?,
-                    }));
+                    return Ok(None);
                 }
                 let target_conversation_id = sqlx::query(
                     "SELECT id FROM conversations WHERE owner_account_id = $1 AND handle = $2",
@@ -3590,27 +3576,8 @@ impl Storage {
                 .execute(&mut *transaction)
                 .await?;
                 if inserted.rows_affected() == 0 {
-                    let existing = sqlx::query(
-                        "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
-                    )
-                    .bind(account_id)
-                    .bind(delivery_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?;
-                    let existing = existing
-                        .map(|row| {
-                            Ok::<StoredMessage, sqlx::Error>(StoredMessage {
-                                id: row.try_get("id")?,
-                                conversation_id: row.try_get("conversation_id")?,
-                                author: row.try_get("author")?,
-                                created_at: row.try_get("created_at")?,
-                                stack_id: row.try_get("stack_id")?,
-                                envelope_json: row.try_get("envelope_json")?,
-                            })
-                        })
-                        .transpose()?;
                     transaction.commit().await?;
-                    return Ok(existing);
+                    return Ok(None);
                 }
                 sqlx::query(
                     "UPDATE conversations SET last_message = '', last_message_at = $1, updated_at = $1 WHERE owner_account_id = $2 AND id = $3",
