@@ -2348,7 +2348,7 @@ async fn main() {
         .route("/enter/v1/keys/:handle", get(public_keys))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive().allow_private_network(true));
     let listener = tokio::net::TcpListener::bind(config.address)
         .await
         .expect("bind server");
