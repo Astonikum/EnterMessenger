@@ -5,7 +5,6 @@ export type TabState = {
   activeConversationByProfile?: Record<string, string | null>;
   activeFolderByProfile?: Record<string, string>;
   showProfile?: boolean;
-  showSettings?: boolean;
 };
 
 function storage() {

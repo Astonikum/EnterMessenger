@@ -1,23 +1,12 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
-
-export type NotificationSettings = {
-  desktop: boolean;
-  sound: boolean;
-  preview: boolean;
-};
-
-const SETTINGS_KEY = "enter-notification-settings";
-const DEFAULT_SETTINGS: NotificationSettings = { desktop: true, sound: false, preview: true };
 
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
     const isLocal = notification.request.content.data?.local === true;
-    const settings = isLocal ? await readNotificationSettings() : DEFAULT_SETTINGS;
     return {
       shouldShowAlert: isLocal,
-      shouldPlaySound: isLocal && settings.sound,
+      shouldPlaySound: false,
       shouldSetBadge: isLocal,
     };
   },
@@ -41,23 +30,6 @@ export async function configureNotifications() {
   }
 }
 
-export async function readNotificationSettings(): Promise<NotificationSettings> {
-  try {
-    const value = JSON.parse((await AsyncStorage.getItem(SETTINGS_KEY)) ?? "null") as Partial<NotificationSettings> | null;
-    return {
-      desktop: value?.desktop ?? DEFAULT_SETTINGS.desktop,
-      sound: value?.sound ?? DEFAULT_SETTINGS.sound,
-      preview: value?.preview ?? DEFAULT_SETTINGS.preview,
-    };
-  } catch {
-    return DEFAULT_SETTINGS;
-  }
-}
-
-export function writeNotificationSettings(settings: NotificationSettings) {
-  return AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
-
 export async function registerForPushNotifications() {
   if (Platform.OS === "web") return null;
   const permissions = await Notifications.getPermissionsAsync();
@@ -76,14 +48,12 @@ export async function notifyIncomingMessage(input: {
   title: string;
   text: string;
 }) {
-  const settings = await readNotificationSettings();
-  if (!settings.desktop) return;
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
         title: input.title,
-        body: settings.preview ? input.text : "Новое сообщение",
-        sound: settings.sound ? "default" : undefined,
+        body: input.text,
+        sound: undefined,
         data: { local: true, profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
       },
       trigger: Platform.OS === "android" ? { channelId: "messages", seconds: 1 } : null,

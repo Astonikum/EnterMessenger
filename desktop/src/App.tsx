@@ -242,7 +242,6 @@ export default function App() {
   const [syncConnected, setSyncConnected] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
   const [showProfile, setShowProfile] = useState(() => readTabState().showProfile ?? false);
-  const [showSettings, setShowSettings] = useState(() => readTabState().showSettings ?? false);
   const [searchResult, setSearchResult] = useState<SearchUser | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -305,7 +304,6 @@ export default function App() {
       if (!profiles.some((profile) => profile.id === profileId)) return;
       setActiveProfileId(profileId);
       setActiveConversationId(conversationId);
-      setShowSettings(false);
     }).then((cleanup) => {
       if (active) dispose = cleanup;
       else cleanup();
@@ -315,7 +313,6 @@ export default function App() {
       if (!detail?.profileId || !detail.conversationId || !profiles.some((profile) => profile.id === detail.profileId)) return;
       setActiveProfileId(detail.profileId);
       setActiveConversationId(detail.conversationId);
-      setShowSettings(false);
     };
     window.addEventListener("enter:open-conversation", openConversation);
     return () => {
@@ -375,9 +372,8 @@ export default function App() {
         ? { ...state.activeFolderByProfile, [activeProfileId]: activeFolder }
         : state.activeFolderByProfile,
       showProfile,
-      showSettings,
     });
-  }, [activeConversationId, activeFolder, activeProfileId, showProfile, showSettings]);
+  }, [activeConversationId, activeFolder, activeProfileId, showProfile]);
 
   useEffect(() => {
     const cached = activeProfileId ? readMessageCache(activeProfileId) : null;
@@ -1256,7 +1252,6 @@ export default function App() {
       messages={messages}
       messageToForward={messageToForward}
       showProfile={showProfile}
-      showSettings={showSettings}
       messageError={messageError}
       mediaUploadProgress={mediaUploadProgress}
       replyTo={replyTo}
@@ -1278,11 +1273,9 @@ export default function App() {
       onAddToFolder={addToFolder}
       onDelete={deleteConversation}
       onReorder={reorderConversations}
-      onBack={() => { setActiveConversationId(null); setShowProfile(false); setShowSettings(false); }}
-      onToggleProfile={() => { setShowProfile((value) => !value); setShowSettings(false); }}
+      onBack={() => { setActiveConversationId(null); setShowProfile(false); }}
+      onToggleProfile={() => setShowProfile((value) => !value)}
       onCloseProfile={() => setShowProfile(false)}
-      onToggleSettings={() => { setShowSettings((value) => !value); setShowProfile(false); }}
-      onCloseSettings={() => setShowSettings(false)}
       onSendMessage={sendMessage}
       onReply={replyToMessage}
       onStartEditMessage={editMessage}

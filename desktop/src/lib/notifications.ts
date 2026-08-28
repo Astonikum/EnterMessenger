@@ -1,29 +1,3 @@
-export type NotificationSettings = {
-  desktop: boolean;
-  sound: boolean;
-  preview: boolean;
-};
-
-const SETTINGS_KEY = "enter-notification-settings";
-const DEFAULT_SETTINGS: NotificationSettings = { desktop: true, sound: false, preview: true };
-
-export function readNotificationSettings(): NotificationSettings {
-  try {
-    const value = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "null") as Partial<NotificationSettings> | null;
-    return {
-      desktop: value?.desktop ?? DEFAULT_SETTINGS.desktop,
-      sound: value?.sound ?? DEFAULT_SETTINGS.sound,
-      preview: value?.preview ?? DEFAULT_SETTINGS.preview,
-    };
-  } catch {
-    return DEFAULT_SETTINGS;
-  }
-}
-
-export function writeNotificationSettings(settings: NotificationSettings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
-
 export async function requestDesktopNotificationPermission() {
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
@@ -42,10 +16,8 @@ export async function notifyIncomingMessage(input: {
   title: string;
   text: string;
 }) {
-  const settings = readNotificationSettings();
-  if (!settings.desktop) return;
   if (!(await requestDesktopNotificationPermission())) return;
-  const body = settings.preview ? input.text : "Новое сообщение";
+  const body = input.text;
 
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
