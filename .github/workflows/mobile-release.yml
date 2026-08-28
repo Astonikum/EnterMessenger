@@ -133,15 +133,16 @@ jobs:
           fi
 
           query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){releases(first:100,orderBy:{field:CREATED_AT,direction:DESC}){nodes{databaseId,tagName,name,isDraft,isPrerelease}}}}'
+          repo_name="${GITHUB_REPOSITORY#*/}"
           release_rows="$(gh api graphql \
-            -F owner=Astonikum \
-            -F name=EnterMessenger \
+            -F owner="$GITHUB_REPOSITORY_OWNER" \
+            -F name="$repo_name" \
             -f query="$query" \
             --jq '.data.repository.releases.nodes[] | [.databaseId, .tagName, .name] | @tsv')"
           echo "Release lookup: $release_rows"
-          release_id="$(printf '%s\n' "$release_rows" | grep -F "$tag" | cut -f1 | head -n 1 || true)"
+          release_id="$(printf '%s\n' "$release_rows" | awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
           if [[ -z "$release_id" ]]; then
-            release_id="$(printf '%s\n' "$release_rows" | grep -F "$title" | cut -f1 | head -n 1 || true)"
+            release_id="$(printf '%s\n' "$release_rows" | awk -F '\t' -v title="$title" '$3 == title {print $1; exit}')"
           fi
 
           if [[ -n "$release_id" ]]; then
@@ -149,7 +150,7 @@ jobs:
               -f "tag_name=$tag" \
               -f "name=$title" \
               -f "body=$notes" \
-              -F draft=false \
+              -F draft=true \
               -F prerelease=false >/dev/null
           else
             release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
@@ -157,7 +158,7 @@ jobs:
               -f "target_commitish=$GITHUB_SHA" \
               -f "name=$title" \
               -f "body=$notes" \
-              -F draft=false \
+              -F draft=true \
               -F prerelease=false --jq .id)"
           fi
 

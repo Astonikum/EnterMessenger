@@ -4,7 +4,7 @@
 
 - `Desktop release` — Windows x64, Linux x64, macOS Intel и macOS Apple Silicon.
 - `Mobile release` — Android через EAS; по умолчанию профиль `preview` создает устанавливаемый `.apk` и прикрепляет его к draft-релизу. Профиль `production` создает `.aab` для Google Play; параметр `submit` отдельно включает отправку в Google Play.
-- `CI` запускается на pull request и push в `main` и проверяет desktop/mobile production-сборки.
+- `CI` запускается на pull request и push в `main` и проверяет desktop/mobile, VS Code extension и server.
 
 ## Версии
 
@@ -13,7 +13,7 @@
 - desktop: `desktop/package.json`, `desktop/src-tauri/Cargo.toml`, `desktop/src-tauri/tauri.conf.json`;
 - mobile: `mobile/package.json`, `mobile/app.json`.
 
-Desktop action создает draft-релиз с тегом `desktop`, а Mobile action — draft-релиз с тегом `mobile`. Версия указывается в названии релиза и берется отдельно из manifest соответствующей платформы. Эти теги указывают на последний релиз своей платформы; старые versioned-теги сохраняются как история. Сначала проверь draft-артефакты, затем опубликуй релиз вручную.
+Desktop action создает draft-релиз с тегом `desktop-v<version>`, а Mobile action — draft-релиз с тегом `mobile-v<version>`. Версия указывается в названии и теге релиза и берется отдельно из manifest соответствующей платформы. Артефакты прикрепляются к draft-релизу; после проверки его можно опубликовать вручную.
 
 Для мобильного тестового релиза выбери `platform: android`, `profile: preview` и `submit: false`. APK появится во вкладке Assets draft-релиза. Для Google Play выбери `profile: production` и включи `submit` — этот вариант выпускает AAB.
 
@@ -27,7 +27,7 @@ Desktop использует стабильный Tauri identifier `com.enter.me
 
 Обновления не должны менять identifier и не должны очищать WebView data directory — иначе пользователь потеряет локальную сессию, кэш и ключи.
 
-Mobile хранит обычное состояние и кэш через AsyncStorage, а приватные device/account keys — через SecureStore. Удаление приложения может удалить эти данные согласно политике ОС.
+Mobile хранит обычное состояние и кэш через AsyncStorage, а приватные device/account keys — через SecureStore (с fallback в AsyncStorage на платформах, где SecureStore недоступен). Удаление приложения может удалить эти данные согласно политике ОС.
 
 ## Одноразовая настройка EAS
 

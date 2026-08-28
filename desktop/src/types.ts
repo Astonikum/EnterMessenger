@@ -69,4 +69,5 @@ export type OutboxEntry = {
   message: Message;
   attempts: number;
   nextAttemptAt: number;
+  blocked?: boolean;
 };

@@ -19,7 +19,8 @@
 Чтобы собрать VSIX локально:
 
 ```bash
-npx --yes @vscode/vsce package --allow-missing-repository
+npm ci
+npm run package
 ```
 
 Затем установите созданный `.vsix` через команду VS Code `Extensions: Install from VSIX...`.
@@ -128,4 +129,3 @@ return <div className="grid gap-4">{demos}</div>;
 - preview-файл должен находиться в workspace с доступными зависимостями;
 - для React 17 и старше потребуется заменить рендерер на `react-dom.render`;
 - сложные alias-настройки и нестандартные asset loaders зависят от того, насколько их может разрешить `esbuild` без конфигурации основного bundler-а.
-

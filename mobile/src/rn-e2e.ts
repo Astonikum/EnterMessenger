@@ -101,6 +101,29 @@ async function secureStoreAvailable() {
   try { return await SecureStore.isAvailableAsync(); } catch { return false; }
 }
 
+function isStoredDevice(value: unknown): value is StoredDevice {
+  if (!value || typeof value !== "object") return false;
+  const device = value as Partial<StoredDevice>;
+  return typeof device.profileId === "string"
+    && typeof device.deviceId === "string"
+    && typeof device.keyId === "string"
+    && typeof device.encryptionPrivateKey === "string"
+    && typeof device.encryptionPublicKey === "string"
+    && typeof device.signingPrivateKey === "string"
+    && typeof device.signingPublicKey === "string"
+    && typeof device.createdAt === "number"
+    && Number.isFinite(device.createdAt);
+}
+
+function isStoredAccount(value: unknown): value is StoredAccount {
+  if (!value || typeof value !== "object") return false;
+  const account = value as Partial<StoredAccount>;
+  return typeof account.profileId === "string"
+    && typeof account.keyId === "string"
+    && typeof account.encryptionPrivateKey === "string"
+    && typeof account.encryptionPublicKey === "string";
+}
+
 function encodeJwk(jwk: JsonWebKey) {
   return fromByteArray(utf8ToBytes(JSON.stringify(jwk)));
 }
@@ -147,39 +170,53 @@ function idFromBytes(bytes: Uint8Array) {
 }
 
 async function readDevice(profileId: string) {
-  let raw: string | null = null;
-  if (await secureStoreAvailable()) {
-    try { raw = await SecureStore.getItemAsync(cacheKey(profileId)); } catch { raw = null; }
+  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  let raw: string | null;
+  try { raw = await SecureStore.getItemAsync(cacheKey(profileId)); } catch { throw new Error("Не удалось прочитать ключи устройства"); }
+  if (!raw) {
+    const legacy = await AsyncStorage.getItem(fallbackCacheKey(profileId));
+    if (legacy) {
+      await SecureStore.setItemAsync(cacheKey(profileId), legacy);
+      await AsyncStorage.removeItem(fallbackCacheKey(profileId));
+      raw = legacy;
+    }
   }
-  if (!raw) raw = await AsyncStorage.getItem(fallbackCacheKey(profileId));
   if (!raw) return undefined;
-  try { return JSON.parse(raw) as StoredDevice; } catch { return undefined; }
+  try {
+    const value: unknown = JSON.parse(raw);
+    return isStoredDevice(value) ? value : undefined;
+  } catch { return undefined; }
 }
 
 async function writeDevice(device: StoredDevice) {
   const value = JSON.stringify(device);
-  if (await secureStoreAvailable()) {
-    try { await SecureStore.setItemAsync(cacheKey(device.profileId), value); return; } catch { /* Fall back for an outdated native runtime. */ }
-  }
-  await AsyncStorage.setItem(fallbackCacheKey(device.profileId), value);
+  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  try { await SecureStore.setItemAsync(cacheKey(device.profileId), value); } catch { throw new Error("Не удалось сохранить ключи устройства"); }
 }
 
 async function readAccount(profileId: string) {
-  let raw: string | null = null;
-  if (await secureStoreAvailable()) {
-    try { raw = await SecureStore.getItemAsync(accountCacheKey(profileId)); } catch { raw = null; }
+  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  let raw: string | null;
+  try { raw = await SecureStore.getItemAsync(accountCacheKey(profileId)); } catch { throw new Error("Не удалось прочитать ключи аккаунта"); }
+  if (!raw) {
+    const legacy = await AsyncStorage.getItem(fallbackAccountCacheKey(profileId));
+    if (legacy) {
+      await SecureStore.setItemAsync(accountCacheKey(profileId), legacy);
+      await AsyncStorage.removeItem(fallbackAccountCacheKey(profileId));
+      raw = legacy;
+    }
   }
-  if (!raw) raw = await AsyncStorage.getItem(fallbackAccountCacheKey(profileId));
   if (!raw) return undefined;
-  try { return JSON.parse(raw) as StoredAccount; } catch { return undefined; }
+  try {
+    const value: unknown = JSON.parse(raw);
+    return isStoredAccount(value) ? value : undefined;
+  } catch { return undefined; }
 }
 
 async function writeAccount(account: StoredAccount) {
   const value = JSON.stringify(account);
-  if (await secureStoreAvailable()) {
-    try { await SecureStore.setItemAsync(accountCacheKey(account.profileId), value); return; } catch { /* Fall back for an outdated native runtime. */ }
-  }
-  await AsyncStorage.setItem(fallbackAccountCacheKey(account.profileId), value);
+  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  try { await SecureStore.setItemAsync(accountCacheKey(account.profileId), value); } catch { throw new Error("Не удалось сохранить ключ аккаунта"); }
 }
 
 async function generateDevice(profileId: string): Promise<StoredDevice> {

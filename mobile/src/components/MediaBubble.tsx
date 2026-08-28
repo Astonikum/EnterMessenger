@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Image, Modal, PanResponder, Platform, Pressable, Share, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { Alert, Image, Modal, PanResponder, Platform, Pressable, Share, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { ResizeMode, Video, type AVPlaybackStatus } from "expo-av";
 import * as FileSystem from "expo-file-system";
 import { fromByteArray } from "base64-js";
@@ -50,7 +50,7 @@ async function saveNativeFile(uri: string, attachment: MessageAttachment) {
     if (!directoryUri) {
       const suggestedDirectory = FileSystem.StorageAccessFramework.getUriForDirectoryInRoot("Download");
       const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(suggestedDirectory);
-      if (!permissions.granted) return;
+      if (!permissions.granted) throw new Error("Доступ к папке загрузок не предоставлен");
       directoryUri = permissions.directoryUri;
       await AsyncStorage.setItem(DOWNLOAD_DIRECTORY_KEY, directoryUri);
     }
@@ -66,6 +66,12 @@ async function saveNativeFile(uri: string, attachment: MessageAttachment) {
   await Share.share({ message: attachment.name, url: uri });
 }
 
+function saveWithFeedback(uri: string, attachment: MessageAttachment) {
+  void saveNativeFile(uri, attachment).catch((reason) => {
+    Alert.alert("Не удалось сохранить файл", reason instanceof Error ? reason.message : "Попробуйте ещё раз");
+  });
+}
+
 function touchDistance(touches: readonly { pageX: number; pageY: number }[]) {
   if (touches.length < 2) return 0;
   const [first, second] = touches;
@@ -79,6 +85,7 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [mediaSize, setMediaSize] = useState<{ width: number; height: number }>();
   const [playing, setPlaying] = useState(false);
+  const [playbackError, setPlaybackError] = useState(false);
   const [positionMillis, setPositionMillis] = useState(0);
   const [durationMillis, setDurationMillis] = useState(0);
   const [progressWidth, setProgressWidth] = useState(0);
@@ -89,6 +96,11 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   const offsetRef = useRef({ x: 0, y: 0 });
   const gestureRef = useRef({ distance: 0, zoom: 1, offset: { x: 0, y: 0 } });
   const { width: viewportWidth, height: viewportHeight } = useWindowDimensions();
+
+  useEffect(() => () => {
+    const player = mediaRef.current;
+    if (player) void player.unloadAsync().catch(() => undefined);
+  }, []);
 
   const panResponder = useMemo(() => PanResponder.create({
     onStartShouldSetPanResponder: () => false,
@@ -130,7 +142,10 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   }, [attachment.kind, speed, volume]);
 
   const handlePlaybackStatus = (status: AVPlaybackStatus) => {
-    if (!status.isLoaded) return;
+    if (!status.isLoaded) {
+      if (status.error) setPlaybackError(true);
+      return;
+    }
     setPlaying(status.isPlaying);
     setPositionMillis(status.positionMillis);
     setDurationMillis(status.durationMillis ?? 0);
@@ -161,20 +176,20 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
     ? <Image source={{ uri }} onLoad={(event) => setMediaSize({ width: event.nativeEvent.source.width, height: event.nativeEvent.source.height })} style={styles.mediaFill} resizeMode="contain" />
     : attachment.kind === "audio"
       ? <View style={styles.audioViewerCard}><View style={styles.audioViewerIcon}><Icon name="mic" size={28} color={colors.primary} /></View><Text style={styles.audioViewerName} numberOfLines={1}>{attachment.name}</Text><Video ref={mediaRef} source={{ uri }} onPlaybackStatusUpdate={handlePlaybackStatus} shouldPlay resizeMode={ResizeMode.CONTAIN} style={styles.audioEngine} /></View>
-      : <Video ref={mediaRef} source={{ uri }} onReadyForDisplay={(event) => { const { width, height } = event.naturalSize; if (width && height) setMediaSize({ width, height }); }} onPlaybackStatusUpdate={handlePlaybackStatus} shouldPlay resizeMode={ResizeMode.CONTAIN} style={styles.mediaFill} />;
+      : <Video ref={mediaRef} source={{ uri }} onError={() => setPlaybackError(true)} onReadyForDisplay={(event) => { const { width, height } = event.naturalSize; if (width && height) setMediaSize({ width, height }); }} onPlaybackStatusUpdate={handlePlaybackStatus} shouldPlay resizeMode={ResizeMode.CONTAIN} style={styles.mediaFill} />;
   const mediaKind = attachment.kind === "image" ? "Фото" : attachment.kind === "video" ? "Видео" : "Аудио";
 
   return <Modal visible transparent animationType="fade" onRequestClose={onClose}><View style={styles.viewer}>
     <Pressable style={styles.viewerContent} onPress={onClose}>
       <View style={styles.viewerMedia}>
-        <Pressable {...panResponder.panHandlers} style={[mediaFrame, { transform: mediaTransform }]} onPress={(event) => event.stopPropagation()}>{content}</Pressable>
+      <Pressable {...panResponder.panHandlers} style={[mediaFrame, { transform: mediaTransform }]} onPress={(event) => event.stopPropagation()}>{content}{playbackError && <Text style={styles.playbackError}>Не удалось воспроизвести файл</Text>}</Pressable>
       </View>
     </Pressable>
     <View style={styles.viewerTopBar}>
       <View style={styles.viewerInfo}><Text style={styles.viewerName} numberOfLines={1}>{attachment.name}</Text><Text style={styles.viewerSize}>{mediaKind} · {formatFileSize(attachment.size)}</Text></View>
       <View style={styles.viewerTools}>
         {(attachment.kind === "image" || attachment.kind === "video") && <Pressable accessibilityLabel="Повернуть налево" style={styles.viewerIconButton} onPress={() => setRotation((value) => value - 90)}><Icon name="rotateLeft" size={18} color="#fff" /></Pressable>}
-        <Pressable accessibilityLabel="Сохранить в загрузки" style={styles.viewerIconButton} onPress={() => void saveNativeFile(uri, attachment)}><Icon name="download" size={18} color="#fff" /></Pressable>
+        <Pressable accessibilityLabel="Сохранить в загрузки" style={styles.viewerIconButton} onPress={() => saveWithFeedback(uri, attachment)}><Icon name="download" size={18} color="#fff" /></Pressable>
         <Pressable accessibilityLabel="Закрыть просмотр" style={styles.viewerIconButton} onPress={onClose}><Icon name="close" size={20} color="#fff" /></Pressable>
       </View>
     </View>
@@ -201,7 +216,7 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
 
   function openActions(event: { stopPropagation?: () => void }) {
     event.stopPropagation?.();
-    if (uri) onAttachmentLongPress?.(attachment, () => { void saveNativeFile(uri, attachment); });
+    if (uri) onAttachmentLongPress?.(attachment, () => saveWithFeedback(uri, attachment));
   }
 
   useEffect(() => {
@@ -213,8 +228,9 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
       .then((ciphertext) => decryptMedia(ciphertext, attachment))
       .then(async (plaintext) => {
         if (Platform.OS === "web") {
-          objectUrl = URL.createObjectURL(new Blob([plaintext.buffer as ArrayBuffer], { type: attachment.mimeType }));
-          if (!disposed) setUri(objectUrl);
+          const nextObjectUrl = URL.createObjectURL(new Blob([plaintext.buffer as ArrayBuffer], { type: attachment.mimeType }));
+          if (disposed) URL.revokeObjectURL(nextObjectUrl);
+          else { objectUrl = nextObjectUrl; setUri(nextObjectUrl); }
           return;
         }
         const directory = FileSystem.cacheDirectory;
@@ -225,15 +241,15 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
       })
       .catch(() => { if (!disposed) setError(true); });
     return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [attachment, profile]);
+  }, [attachment.id, attachment.kind, attachment.key, attachment.mimeType, attachment.name, attachment.nonce, attachment.sha256, attachment.size, profile.id, profile.server, profile.token]);
 
   if (error) return <View style={grouped ? styles.groupError : styles.error}><Icon name="error" size={16} color={colors.danger} />{!grouped && <Text style={styles.errorText}>Не удалось загрузить вложение</Text>}</View>;
   if (!uri) return <View style={grouped ? styles.groupLoading : styles.loading}><Icon name="attach" size={17} color={colors.primary} />{!grouped && <Text style={styles.loadingText}>Загрузка вложения…</Text>}</View>;
   const longPress = onAttachmentLongPress ? openActions : undefined;
-  if (attachment.kind === "image") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupImageButton : styles.imageButton, captioned && styles.captionedMedia]}><Image source={{ uri }} style={grouped ? styles.groupImage : styles.image} resizeMode="cover" /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} resizeMode={ResizeMode.CONTAIN} style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (attachment.kind === "image") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupImageButton : styles.imageButton, captioned && styles.captionedMedia]}><Image source={{ uri }} onError={() => setError(true)} style={grouped ? styles.groupImage : styles.image} resizeMode="cover" /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} onError={() => setError(true)} resizeMode={ResizeMode.CONTAIN} style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   if (attachment.kind === "audio") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[styles.audioButton, grouped && styles.groupAudioButton, outgoing && styles.outgoingMedia]}><Icon name="mic" size={20} color={outgoing ? colors.primaryText : colors.primary} /><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>Аудио · {formatFileSize(attachment.size)}</Text></View></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  return <Pressable style={({ pressed }) => [styles.file, grouped && styles.groupFile, outgoing && styles.outgoingMedia, pressed && styles.pressed]} onPress={() => void saveNativeFile(uri, attachment)} onLongPress={longPress}><View style={[styles.fileIcon, outgoing && styles.outgoingFileIcon]}><Icon name="attach" size={19} color={outgoing ? colors.primaryText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>{formatFileSize(attachment.size)} · сохранить</Text></View><Icon name="share" size={18} color={outgoing ? colors.primaryText : colors.muted} /></Pressable>;
+  return <Pressable style={({ pressed }) => [styles.file, grouped && styles.groupFile, outgoing && styles.outgoingMedia, pressed && styles.pressed]} onPress={() => saveWithFeedback(uri, attachment)} onLongPress={longPress}><View style={[styles.fileIcon, outgoing && styles.outgoingFileIcon]}><Icon name="attach" size={19} color={outgoing ? colors.primaryText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>{formatFileSize(attachment.size)} · сохранить</Text></View><Icon name="share" size={18} color={outgoing ? colors.primaryText : colors.muted} /></Pressable>;
 }
 
 export function MediaGroup({ profile, attachments, overlay, captioned = false, outgoing = false, onAttachmentLongPress }: { profile: Profile; attachments: MessageAttachment[]; overlay?: ReactNode; captioned?: boolean; outgoing?: boolean; onAttachmentLongPress?: (attachment: MessageAttachment, save: () => void) => void }) {
@@ -310,6 +326,7 @@ const styles = StyleSheet.create({
   viewerImage: { width: "100%", height: "100%" },
   viewerVideo: { width: "100%", height: "100%" },
   viewerAudio: { width: "100%", height: 58 },
+  playbackError: { position: "absolute", alignSelf: "center", color: "#fff", backgroundColor: "rgba(120,35,42,0.9)", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7 },
   audioViewerCard: { width: "100%", height: "100%", alignItems: "center", justifyContent: "center", gap: 8, borderRadius: 14, backgroundColor: "rgba(255,255,255,0.08)" },
   audioViewerIcon: { width: 52, height: 52, borderRadius: 16, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(179,164,255,0.16)" },
   audioViewerName: { maxWidth: "82%", color: "#fff", fontFamily: fonts.bodySemibold, fontSize: 13 },

@@ -10,6 +10,7 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "test:crypto": "node scripts/e2e-self-check.mjs",
+    "test:state": "node --experimental-strip-types scripts/state-self-check.mjs",
     "test:realtime": "node --experimental-strip-types --test ../test/realtime-lifecycle.test.mjs"
   },
   "dependencies": {

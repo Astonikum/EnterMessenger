@@ -77,13 +77,48 @@ jobs:
 
       - name: Export web bundle
         working-directory: mobile
-        run: npx expo export --platform web
+        run: npm exec -- expo export --platform web
+
+  extension:
+    name: VS Code extension checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Test extension
+        working-directory: vscode-extension
+        run: npm test
+
+      - name: Package extension
+        working-directory: vscode-extension
+        run: npm run package -- --out "$RUNNER_TEMP/react-component-preview.vsix"
+
+      - name: Verify portable VSIX
+        run: |
+          unzip -l "$RUNNER_TEMP/react-component-preview.vsix" > "$RUNNER_TEMP/vsix-contents.txt"
+          ! grep -E '(@esbuild/|esbuild\.(exe|dll|dylib))' "$RUNNER_TEMP/vsix-contents.txt"
+          grep -F 'extension/node_modules/esbuild-wasm/esbuild.wasm' "$RUNNER_TEMP/vsix-contents.txt"
 
   server:
     name: Server Docker image
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test server
+        run: cargo test --manifest-path server/Cargo.toml
 
       - name: Build server image
         run: docker build --build-arg APP_VERSION=0.2.0 --tag enter-server:ci --file server/Dockerfile .

@@ -1,19 +1,19 @@
 # Enter Protocol
 
-Enter — это federated messaging protocol для мессенджера: у пользователя есть переносимый адрес `handle@server`, а сервер пользователя отвечает за маршрутизацию и доставку сообщений между серверами.
+Enter — это messaging protocol для мессенджера: у пользователя есть адрес `handle@server`, а домашний сервер отвечает за хранение и доставку зашифрованных сообщений. Текущая реализация поддерживает доставку между аккаунтами одного сервера; federation пока не включена.
 
 ## Границы доверия
 
 - Клиент владеет identity key, device keys и состоянием сессии.
 - Домашний сервер хранит аккаунт, публичные device key bundles и зашифрованные сообщения для доставки в диалоги.
-- Серверы маршрутизируют зашифрованные сообщения, но не получают plaintext и не имеют ключей расшифровки.
-- Межсерверная доставка идёт на сервер получателя через `/.well-known/enter` и `POST /enter/v1/federation/deliveries`.
+- Сервер хранит и маршрутизирует зашифрованные сообщения, но не получает plaintext и не имеет ключей расшифровки.
+- Межсерверная доставка в текущем профиле отключена: сервер отклоняет remote conversation и delivery, чтобы сообщение не принималось без фактической доставки.
 
 ## Адреса и discovery
 
 Канонический адрес: `handle@server`. Server может быть доменом, IP или `localhost:50121` в development.
 
-`GET /.well-known/enter` возвращает версию протокола, capabilities, federation endpoints и cryptographic profile. Клиент не должен угадывать возможности сервера после discovery.
+`GET /.well-known/enter` возвращает версию протокола, capabilities, endpoints и cryptographic profile. Клиент не должен угадывать возможности сервера после discovery.
 
 ## Сообщение и шифрование
 
@@ -40,8 +40,8 @@ Enter — это federated messaging protocol для мессенджера: у 
 - `GET /enter/v1/keys/{handle}` — публичный каталог ключей получателя.
 - `POST /api/v1/messages/{messageId}/delivered` — authenticated client ACK после обработки сообщения.
 - `WebSocket /api/v1/realtime` — authenticated realtime stream с cursor/resume.
-- `/enter/v1/federation/deliveries` — opaque federation message delivery foundation.
+- `GET /enter/v1/keys/search?q=...` — поиск в публичном каталоге ключей локальных аккаунтов.
 
 Приватные device keys создаются через Web Crypto и сохраняются в IndexedDB приложения; они не отправляются на сервер. Для каждого сообщения создаётся новый эфемерный ECDH-ключ, а подпись покрывает зашифрованную копию сообщения.
 
-Прямой E2E v1 завершён для текущих диалогов. Federation delivery остаётся транспортным слоем: маршрутизация между разными серверами, server-to-server authentication и группы требуют отдельных протокольных профилей.
+Прямой E2E v1 завершён для текущих локальных диалогов. Маршрутизация между разными серверами, server-to-server authentication и группы требуют отдельных протокольных профилей и пока не входят в discovery.

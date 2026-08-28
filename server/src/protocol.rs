@@ -21,7 +21,6 @@ pub struct DiscoveryDocument {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryEndpoints {
     pub keys: &'static str,
-    pub federation_delivery: &'static str,
     pub realtime: &'static str,
     pub media_upload: &'static str,
     pub media_download: &'static str,
@@ -83,14 +82,6 @@ pub struct PublicKeyDirectory {
     pub account_key: Option<AccountKeyBundle>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct FederationDelivery {
-    pub delivery_id: String,
-    pub sender_server: String,
-    pub envelope: EncryptedEnvelope,
-    pub server_signature: String,
-}
-
 pub fn discovery(
     server_url: String,
     server_id: String,
@@ -107,14 +98,12 @@ pub fn discovery(
         capabilities: vec![
             "directory",
             "message-relay",
-            "federation",
             "encrypted-messages",
             "encrypted-media",
             "realtime",
         ],
         endpoints: DiscoveryEndpoints {
             keys: "/enter/v1/keys/{handle}",
-            federation_delivery: "/enter/v1/federation/deliveries",
             realtime: "/api/v1/realtime",
             media_upload: "/api/v1/media",
             media_download: "/api/v1/media/{media_id}",
@@ -130,25 +119,93 @@ pub fn discovery(
 
 pub fn is_supported_envelope(envelope: &EncryptedEnvelope) -> bool {
     envelope.protocol == PROTOCOL_VERSION
-        && !envelope.message_id.is_empty()
-        && !envelope.conversation_id.is_empty()
-        && !envelope.sender.is_empty()
-        && !envelope.recipient.is_empty()
-        && !envelope.sender_device.is_empty()
-        && !envelope.key_id.is_empty()
-        && !envelope.created_at.is_empty()
-        && !envelope.nonce.is_empty()
-        && !envelope.ephemeral_public_key.is_empty()
-        && !envelope.associated_data.is_empty()
-        && !envelope.ciphertext.is_empty()
-        && !envelope.signature.is_empty()
+        && valid_identifier(&envelope.message_id)
+        && valid_identifier(&envelope.conversation_id)
+        && valid_address(&envelope.sender)
+        && valid_address(&envelope.recipient)
+        && valid_identifier(&envelope.sender_device)
+        && valid_identifier(&envelope.key_id)
+        && valid_timestamp(&envelope.created_at)
+        && valid_encoded(&envelope.nonce, 128)
+        && valid_encoded(&envelope.ephemeral_public_key, 16_384)
+        && valid_encoded(&envelope.associated_data, 16_384)
+        && valid_encoded(&envelope.ciphertext, 1_500_000)
+        && valid_encoded(&envelope.signature, 512)
 }
 
-pub fn is_supported_delivery(delivery: &FederationDelivery) -> bool {
-    !delivery.delivery_id.is_empty()
-        && !delivery.sender_server.is_empty()
-        && !delivery.server_signature.is_empty()
-        && is_supported_envelope(&delivery.envelope)
+pub fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+pub fn valid_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_server(value: &str) -> bool {
+    if value.is_empty() || value.len() > 255 {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return false;
+        };
+        (host, Some(port))
+    } else if let Some((host, port)) = value.rsplit_once(':') {
+        if host.contains(':') {
+            return false;
+        }
+        (host, Some(port))
+    } else {
+        (value, None)
+    };
+    if host.is_empty() || host.contains("..") {
+        return false;
+    }
+    let valid_host = if value.starts_with('[') {
+        host.bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b':')
+    } else {
+        host.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    };
+    let valid_port = port.is_none_or(|port| {
+        !port.is_empty()
+            && port.len() <= 5
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|value| value > 0)
+    });
+    valid_host && valid_port
+}
+
+pub fn valid_address(value: &str) -> bool {
+    let Some((handle, server)) = value.rsplit_once('@') else {
+        return false;
+    };
+    valid_handle(handle) && valid_server(server) && !server.contains('@')
+}
+
+fn valid_timestamp(value: &str) -> bool {
+    value.len() <= 64
+        && value.contains('T')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'T' | b'Z' | b'+' | b'-' | b':' | b'.')
+        })
+}
+
+fn valid_encoded(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
 }
 
 #[cfg(test)]
@@ -186,13 +243,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsigned_or_unidentified_delivery() {
-        let delivery = FederationDelivery {
-            delivery_id: String::new(),
-            sender_server: "https://remote.example".to_owned(),
-            envelope: envelope(),
-            server_signature: String::new(),
-        };
-        assert!(!is_supported_delivery(&delivery));
+    fn rejects_malformed_or_oversized_envelope_fields() {
+        let mut value = envelope();
+        value.sender = "alice@example.test/path".to_owned();
+        assert!(!is_supported_envelope(&value));
+
+        let mut value = envelope();
+        value.message_id = "x".repeat(129);
+        assert!(!is_supported_envelope(&value));
+
+        let mut value = envelope();
+        value.ciphertext = "!".to_owned();
+        assert!(!is_supported_envelope(&value));
+    }
+
+    #[test]
+    fn discovery_does_not_advertise_unsupported_federation() {
+        let document = discovery(
+            "https://example.test".to_owned(),
+            "server-1".to_owned(),
+            "Enter".to_owned(),
+            None,
+        );
+        assert!(!document.capabilities.contains(&"federation"));
+        let value = serde_json::to_value(document).expect("serialize discovery");
+        assert!(value["endpoints"].get("federationDelivery").is_none());
     }
 }

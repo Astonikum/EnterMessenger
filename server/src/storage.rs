@@ -11,6 +11,9 @@ use std::{
 };
 use uuid::Uuid;
 
+pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const MAX_SYNC_EVENTS: i64 = 1_000;
+
 fn new_server_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -44,7 +47,10 @@ fn is_loopback_server(value: &str) -> bool {
 
 fn same_local_server(local: &str, candidate: &str) -> bool {
     server_without_scheme(local) == server_without_scheme(candidate)
-        || (is_loopback_server(candidate) && server_port(local) == server_port(candidate))
+        || (is_loopback_server(candidate)
+            && server_port(local)
+                .zip(server_port(candidate))
+                .is_some_and(|(local_port, candidate_port)| local_port == candidate_port))
 }
 
 fn canonical_server(value: &str) -> String {
@@ -118,6 +124,14 @@ impl StoredEvent {
             Self::Message { account_id, .. }
             | Self::ReadReceipt { account_id, .. }
             | Self::DeliveryReceipt { account_id, .. } => account_id,
+        }
+    }
+
+    pub fn cursor(&self) -> i64 {
+        match self {
+            Self::Message { cursor, .. }
+            | Self::ReadReceipt { cursor, .. }
+            | Self::DeliveryReceipt { cursor, .. } => *cursor,
         }
     }
 }
@@ -457,7 +471,8 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS sessions (
                  token TEXT PRIMARY KEY,
                  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-                 created_at INTEGER NOT NULL
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS conversations (
                  id TEXT PRIMARY KEY,
@@ -562,15 +577,7 @@ impl SqliteStorage {
                  created_at INTEGER NOT NULL,
                  updated_at INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS federation_envelopes (
-                 delivery_id TEXT PRIMARY KEY,
-                 message_id TEXT NOT NULL UNIQUE,
-                 conversation_id TEXT NOT NULL,
-                 sender_server TEXT NOT NULL,
-                 envelope_json TEXT NOT NULL,
-                 received_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS federation_envelopes_conversation ON federation_envelopes(conversation_id, received_at ASC);",
+             ",
         )?;
         let has_last_seen_column = connection.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'last_seen_at'",
@@ -580,6 +587,21 @@ impl SqliteStorage {
         if has_last_seen_column == 0 {
             connection.execute("ALTER TABLE accounts ADD COLUMN last_seen_at INTEGER", [])?;
         }
+        let has_session_expiry_column = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'expires_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if has_session_expiry_column == 0 {
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        connection.execute(
+            "UPDATE sessions SET expires_at = created_at + ?1 WHERE expires_at <= 0",
+            params![SESSION_TTL_MS],
+        )?;
         let has_envelope_column = connection.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'envelope_json'",
             [],
@@ -820,6 +842,23 @@ impl SqliteStorage {
             .optional()
     }
 
+    pub fn account_by_id(&self, account_id: &str) -> SqlResult<Option<StoredAccount>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, handle, password_hash FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| {
+                    Ok(StoredAccount {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        handle: row.get(2)?,
+                        password_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     pub fn account_by_handle_prefix(&self, prefix: &str) -> SqlResult<Option<StoredAccount>> {
         self.connection
             .query_row(
@@ -843,21 +882,29 @@ impl SqliteStorage {
         account_id: &str,
         created_at: i64,
     ) -> SqlResult<()> {
+        let expires_at = created_at.saturating_add(SESSION_TTL_MS);
         self.connection.execute(
-            "INSERT OR REPLACE INTO sessions (token, account_id, created_at) VALUES (?1, ?2, ?3)",
-            params![token, account_id, created_at],
+            "INSERT OR REPLACE INTO sessions (token, account_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![token, account_id, created_at, expires_at],
         )?;
         Ok(())
     }
 
-    pub fn account_id_for_session(&self, token: &str) -> SqlResult<Option<String>> {
+    pub fn account_id_for_session(&self, token: &str, now: i64) -> SqlResult<Option<String>> {
         self.connection
             .query_row(
-                "SELECT account_id FROM sessions WHERE token = ?1",
-                params![token],
+                "SELECT account_id FROM sessions WHERE token = ?1 AND expires_at > ?2",
+                params![token, now],
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    pub fn revoke_session(&mut self, token: &str) -> SqlResult<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM sessions WHERE token = ?1", params![token])?
+            > 0)
     }
 
     pub fn register_push_token(
@@ -899,7 +946,12 @@ impl SqliteStorage {
         Ok(())
     }
 
-    pub fn presence_watchers(&self, account_id: &str) -> SqlResult<Vec<PresenceWatcher>> {
+    pub fn presence_watchers(
+        &self,
+        account_id: &str,
+        local_server: &str,
+    ) -> SqlResult<Vec<PresenceWatcher>> {
+        let local_server = canonical_server(local_server);
         let mut statement = self.connection.prepare(
             "SELECT c.owner_account_id, c.id
              FROM conversations c
@@ -908,10 +960,11 @@ impl SqliteStorage {
                     WHEN instr(c.handle, '@') > 0 THEN substr(c.handle, 1, instr(c.handle, '@') - 1)
                     ELSE c.handle
                 END
+                AND substr(c.handle, instr(c.handle, '@') + 1) = ?2
              WHERE c.owner_account_id <> ?1",
         )?;
         let watchers = statement
-            .query_map(params![account_id], |row| {
+            .query_map(params![account_id, local_server], |row| {
                 Ok(PresenceWatcher {
                     owner_account_id: row.get(0)?,
                     conversation_id: row.get(1)?,
@@ -930,12 +983,21 @@ impl SqliteStorage {
     }
 
     pub fn events_since(&self, account_id: &str, since: i64) -> SqlResult<Vec<StoredEvent>> {
+        self.events_since_limited(account_id, since, i64::MAX)
+    }
+
+    fn events_since_limited(
+        &self,
+        account_id: &str,
+        since: i64,
+        limit: i64,
+    ) -> SqlResult<Vec<StoredEvent>> {
         let mut statement = self.connection.prepare(
             "SELECT cursor, kind, payload_json FROM realtime_events
-             WHERE account_id = ?1 AND cursor > ?2 ORDER BY cursor ASC",
+             WHERE account_id = ?1 AND cursor > ?2 ORDER BY cursor ASC LIMIT ?3",
         )?;
         let rows = statement
-            .query_map(params![account_id, since.max(0)], |row| {
+            .query_map(params![account_id, since.max(0), limit], |row| {
                 decode_sqlite_event(
                     account_id,
                     row.get(0)?,
@@ -984,7 +1046,13 @@ impl SqliteStorage {
             .optional()
     }
 
-    pub fn sync(&self, account_id: &str, since: i64) -> SqlResult<SyncSnapshot> {
+    pub fn sync(
+        &self,
+        account_id: &str,
+        since: i64,
+        local_server: &str,
+    ) -> SqlResult<SyncSnapshot> {
+        let local_server = canonical_server(local_server);
         let mut conversations_statement = self.connection.prepare(
             "SELECT c.id, c.name, c.handle, c.avatar, c.subtitle, c.can_write, c.last_message, c.last_message_at, c.pinned, c.online,
                     peer.last_seen_at,
@@ -1007,11 +1075,12 @@ impl SqliteStorage {
                  WHEN instr(c.handle, '@') > 0 THEN substr(c.handle, 1, instr(c.handle, '@') - 1)
                  ELSE c.handle
              END
+             AND substr(c.handle, instr(c.handle, '@') + 1) = ?2
              WHERE c.owner_account_id = ?1
              ORDER BY c.pinned DESC, c.sort_order ASC, c.created_at ASC",
         )?;
         let conversations = conversations_statement
-            .query_map(params![account_id], |row| {
+            .query_map(params![account_id, local_server], |row| {
                 Ok(StoredConversation {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -1029,10 +1098,15 @@ impl SqliteStorage {
             })?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let events = self.events_since_limited(account_id, since, MAX_SYNC_EVENTS)?;
+        let cursor = events
+            .last()
+            .map(StoredEvent::cursor)
+            .unwrap_or(self.cursor(account_id)?);
         let mut messages = Vec::new();
         let mut read_receipts = Vec::new();
         let mut delivery_receipts = Vec::new();
-        for event in self.events_since(account_id, since)? {
+        for event in events {
             match event {
                 StoredEvent::Message { message, .. } => messages.push(message),
                 StoredEvent::ReadReceipt {
@@ -1053,7 +1127,6 @@ impl SqliteStorage {
                 }),
             }
         }
-        let cursor = self.cursor(account_id)?;
         Ok(SyncSnapshot {
             cursor,
             conversations,
@@ -1308,20 +1381,13 @@ impl SqliteStorage {
         let source_delivery_id = source_key_id
             .filter(|value| !value.is_empty())
             .map(|value| format!("{message_id}:{value}"));
-        let message_pattern = format!(r#"%"message_id":"{message_id}"%"#);
         let source = transaction
             .query_row(
                 "SELECT author, created_at FROM messages
                  WHERE owner_account_id = ?1 AND conversation_id = ?2
-                   AND (id = ?3 OR client_message_id = ?4 OR envelope_json LIKE ?5)
+                   AND (id = ?3 OR client_message_id = ?4)
                  ORDER BY seq ASC LIMIT 1",
-                params![
-                    account_id,
-                    conversation_id,
-                    message_id,
-                    source_delivery_id,
-                    message_pattern,
-                ],
+                params![account_id, conversation_id, message_id, source_delivery_id,],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
@@ -1592,22 +1658,6 @@ impl SqliteStorage {
             |row| row.get(0),
         )
     }
-
-    pub fn store_federation_delivery(
-        &mut self,
-        delivery_id: &str,
-        message_id: &str,
-        conversation_id: &str,
-        sender_server: &str,
-        envelope_json: &str,
-        received_at: i64,
-    ) -> SqlResult<bool> {
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO federation_envelopes (delivery_id, message_id, conversation_id, sender_server, envelope_json, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![delivery_id, message_id, conversation_id, sender_server, envelope_json, received_at],
-        )?;
-        Ok(inserted > 0)
-    }
 }
 
 fn ensure_system_conversations(
@@ -1642,6 +1692,15 @@ mod tests {
     }
 
     #[test]
+    fn loopback_alias_requires_a_matching_explicit_port() {
+        assert!(same_local_server(
+            "https://example.test:50121",
+            "localhost:50121"
+        ));
+        assert!(!same_local_server("https://example.test", "localhost"));
+    }
+
+    #[test]
     fn persists_system_chats_and_cursor_messages() {
         let mut storage = SqliteStorage::open(":memory:").expect("open memory database");
         let account = account();
@@ -1663,7 +1722,7 @@ mod tests {
             .has_device_key(&account.id, "device-1")
             .expect("find device key"));
 
-        let initial = storage.sync(&account.id, 0).expect("initial sync");
+        let initial = storage.sync(&account.id, 0, "").expect("initial sync");
         assert_eq!(initial.conversations.len(), 2);
         assert_eq!(initial.cursor, 0);
 
@@ -1688,7 +1747,7 @@ mod tests {
             "alice"
         );
 
-        let synced = storage.sync(&account.id, 0).expect("message sync");
+        let synced = storage.sync(&account.id, 0, "").expect("message sync");
         assert_eq!(synced.messages.len(), 1);
         assert_eq!(synced.cursor, 1);
         assert!(matches!(
@@ -1700,7 +1759,7 @@ mod tests {
         ));
         assert_eq!(
             storage
-                .sync(&account.id, synced.cursor)
+                .sync(&account.id, synced.cursor, "")
                 .expect("empty sync")
                 .messages
                 .len(),
@@ -1735,6 +1794,33 @@ mod tests {
             storage.push_tokens(&account.id).expect("list tokens"),
             vec!["ExponentPushToken[second]".to_owned()]
         );
+    }
+
+    #[test]
+    fn sessions_expire_and_can_be_revoked() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open session database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        storage
+            .store_session("session-1", &account.id, 100)
+            .expect("store session");
+        assert_eq!(
+            storage
+                .account_id_for_session("session-1", 100 + SESSION_TTL_MS - 1)
+                .expect("find live session"),
+            Some(account.id.clone())
+        );
+        assert!(storage
+            .account_id_for_session("session-1", 100 + SESSION_TTL_MS)
+            .expect("find expired session")
+            .is_none());
+        storage
+            .store_session("session-2", &account.id, 100)
+            .expect("store second session");
+        assert!(storage.revoke_session("session-2").expect("revoke session"));
+        assert!(!storage
+            .revoke_session("session-2")
+            .expect("revoke missing session"));
     }
 
     #[test]
@@ -1831,7 +1917,37 @@ mod tests {
     }
 
     #[test]
-    fn message_and_federation_delivery_are_idempotent() {
+    fn sync_pages_large_event_backlogs_without_skipping_cursor() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open sync database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        for index in 0..=MAX_SYNC_EVENTS {
+            let message_id = format!("sync-message-{index}");
+            storage
+                .insert_message(
+                    &account.id,
+                    "favorites:account-1",
+                    &message_id,
+                    &format!(r#"{{"message_id":"{message_id}"}}"#),
+                    index + 2,
+                )
+                .expect("insert message")
+                .expect("writable conversation");
+        }
+
+        let first = storage.sync(&account.id, 0, "").expect("first sync page");
+        assert_eq!(first.messages.len(), MAX_SYNC_EVENTS as usize);
+        assert_eq!(first.cursor, MAX_SYNC_EVENTS);
+
+        let second = storage
+            .sync(&account.id, first.cursor, "")
+            .expect("second sync page");
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.cursor, MAX_SYNC_EVENTS + 1);
+    }
+
+    #[test]
+    fn message_delivery_is_idempotent() {
         let mut storage = SqliteStorage::open(":memory:").expect("open memory database");
         let account = account();
         let recipient = StoredAccount {
@@ -1898,7 +2014,7 @@ mod tests {
         assert!(reverse.conversation_id.starts_with("direct:"));
         assert_eq!(
             storage
-                .sync(&recipient.id, 0)
+                .sync(&recipient.id, 0, "")
                 .expect("recipient sync")
                 .messages
                 .len(),
@@ -1936,33 +2052,12 @@ mod tests {
             .expect("stored second device copy");
         assert_eq!(
             storage
-                .sync(&recipient.id, 0)
+                .sync(&recipient.id, 0, "")
                 .expect("recipient sync with device copies")
                 .messages
                 .len(),
             2
         );
-
-        assert!(storage
-            .store_federation_delivery(
-                "delivery-1",
-                "message-1",
-                "conversation-1",
-                "remote",
-                "{}",
-                4
-            )
-            .expect("store envelope"));
-        assert!(!storage
-            .store_federation_delivery(
-                "delivery-1",
-                "message-1",
-                "conversation-1",
-                "remote",
-                "{}",
-                5
-            )
-            .expect("repeat envelope"));
     }
 
     #[test]
@@ -2022,8 +2117,18 @@ mod tests {
             )
             .expect("create sender conversation")
             .expect("stored sender copy");
+        storage
+            .create_direct_conversation(
+                &account.id,
+                "bob@evil.example",
+                "Bob",
+                "bob",
+                Some("bob@evil.example"),
+                2,
+            )
+            .expect("create wrong-server sender conversation");
         let watchers = storage
-            .presence_watchers(&recipient.id)
+            .presence_watchers(&recipient.id, "example.test")
             .expect("find presence watchers");
         assert_eq!(watchers.len(), 1);
         assert_eq!(watchers[0].owner_account_id, account.id);
@@ -2042,7 +2147,7 @@ mod tests {
             .expect("insert outgoing message")
             .expect("writable sender conversation");
         assert!(storage
-            .sync(&account.id, 0)
+            .sync(&account.id, 0, "example.test")
             .expect("sync before delivery ACK")
             .delivery_receipts
             .is_empty());
@@ -2055,7 +2160,9 @@ mod tests {
             .expect("repeat delivery ACK")
             .is_none());
 
-        let before_read = storage.sync(&recipient.id, 0).expect("sync unread");
+        let before_read = storage
+            .sync(&recipient.id, 0, "example.test")
+            .expect("sync unread");
         let recipient_conversation = before_read
             .conversations
             .iter()
@@ -2066,7 +2173,9 @@ mod tests {
         storage
             .mark_conversation_read(&recipient.id, &recipient_conversation.id, 3)
             .expect("mark conversation read");
-        let after_read = storage.sync(&recipient.id, 0).expect("sync read state");
+        let after_read = storage
+            .sync(&recipient.id, 0, "example.test")
+            .expect("sync read state");
         assert_eq!(
             after_read
                 .conversations
@@ -2077,7 +2186,9 @@ mod tests {
             0
         );
 
-        let sender_sync = storage.sync(&account.id, 0).expect("sync read receipt");
+        let sender_sync = storage
+            .sync(&account.id, 0, "example.test")
+            .expect("sync read receipt");
         assert_eq!(
             sender_sync
                 .conversations
@@ -2085,6 +2196,14 @@ mod tests {
                 .find(|conversation| conversation.id == sender_conversation.conversation_id)
                 .and_then(|conversation| conversation.last_seen_at),
             Some(5)
+        );
+        assert_eq!(
+            sender_sync
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == sender_conversation.conversation_id)
+                .and_then(|conversation| conversation.subtitle.as_deref()),
+            Some("bob@example.test")
         );
         assert_eq!(
             sender_sync
@@ -2103,7 +2222,9 @@ mod tests {
             Some(4)
         );
         assert_eq!(sender_sync.cursor, 4);
-        let replay = storage.sync(&account.id, 2).expect("replay receipts");
+        let replay = storage
+            .sync(&account.id, 2, "example.test")
+            .expect("replay receipts");
         assert_eq!(replay.messages.len(), 0);
         assert_eq!(replay.read_receipts.len(), 1);
         assert_eq!(replay.delivery_receipts.len(), 1);
@@ -2524,6 +2645,34 @@ impl Storage {
         }
     }
 
+    pub async fn account_by_id(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<StoredAccount>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .account_by_id(account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                sqlx::query("SELECT id, name, handle, password_hash FROM accounts WHERE id = $1")
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .map(|row| {
+                        Ok(StoredAccount {
+                            id: row.try_get("id")?,
+                            name: row.try_get("name")?,
+                            handle: row.try_get("handle")?,
+                            password_hash: row.try_get("password_hash")?,
+                        })
+                    })
+                    .transpose()
+            }
+        }
+    }
+
     pub async fn account_by_handle_prefix(
         &self,
         prefix: &str,
@@ -2565,12 +2714,14 @@ impl Storage {
                 .store_session(token, account_id, created_at)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
+                let expires_at = created_at.saturating_add(SESSION_TTL_MS);
                 sqlx::query(
-                    "INSERT INTO sessions (token, account_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (token) DO UPDATE SET account_id = EXCLUDED.account_id, created_at = EXCLUDED.created_at",
+                    "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (token) DO UPDATE SET account_id = EXCLUDED.account_id, created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at",
                 )
                 .bind(token)
                 .bind(account_id)
                 .bind(created_at)
+                .bind(expires_at)
                 .execute(pool)
                 .await?;
                 Ok(())
@@ -2581,21 +2732,41 @@ impl Storage {
     pub async fn account_id_for_session(
         &self,
         token: &str,
+        now: i64,
     ) -> Result<Option<String>, StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
-                .account_id_for_session(token)
+                .account_id_for_session(token, now)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => Ok(sqlx::query(
-                "SELECT account_id FROM sessions WHERE token = $1",
+                "SELECT account_id FROM sessions WHERE token = $1 AND expires_at > $2",
             )
             .bind(token)
+            .bind(now)
             .fetch_optional(pool)
             .await?
             .map(|row| row.try_get("account_id"))
             .transpose()?),
+        }
+    }
+
+    pub async fn revoke_session(&self, token: &str) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .revoke_session(token)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                Ok(sqlx::query("DELETE FROM sessions WHERE token = $1")
+                    .bind(token)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+                    > 0)
+            }
         }
     }
 
@@ -2678,12 +2849,14 @@ impl Storage {
     pub async fn presence_watchers(
         &self,
         account_id: &str,
+        local_server: &str,
     ) -> Result<Vec<PresenceWatcher>, StorageError> {
+        let local_server = canonical_server(local_server);
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
-                .presence_watchers(account_id)
+                .presence_watchers(account_id, &local_server)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
                 let rows = sqlx::query(
@@ -2694,9 +2867,11 @@ impl Storage {
                             WHEN POSITION('@' IN c.handle) > 0 THEN split_part(c.handle, '@', 1)
                             ELSE c.handle
                         END
+                        AND split_part(c.handle, '@', 2) = $2
                      WHERE c.owner_account_id <> $1",
                 )
                 .bind(account_id)
+                .bind(local_server)
                 .fetch_all(pool)
                 .await?;
                 rows.into_iter()
@@ -2712,24 +2887,26 @@ impl Storage {
         }
     }
 
-    pub async fn events_since(
+    async fn events_since_limited(
         &self,
         account_id: &str,
         since: i64,
+        limit: i64,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
-                .events_since(account_id, since)
+                .events_since_limited(account_id, since, limit)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
                 let rows = sqlx::query(
                     "SELECT cursor, kind, payload_json FROM realtime_events
-                     WHERE account_id = $1 AND cursor > $2 ORDER BY cursor ASC",
+                     WHERE account_id = $1 AND cursor > $2 ORDER BY cursor ASC LIMIT $3",
                 )
                 .bind(account_id)
                 .bind(since.max(0))
+                .bind(limit)
                 .fetch_all(pool)
                 .await?;
                 rows.into_iter()
@@ -2803,12 +2980,18 @@ impl Storage {
         }
     }
 
-    pub async fn sync(&self, account_id: &str, since: i64) -> Result<SyncSnapshot, StorageError> {
+    pub async fn sync(
+        &self,
+        account_id: &str,
+        since: i64,
+        local_server: &str,
+    ) -> Result<SyncSnapshot, StorageError> {
+        let local_server = canonical_server(local_server);
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
-                .sync(account_id, since)
+                .sync(account_id, since, &local_server)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
                 let conversations = sqlx::query(
@@ -2829,10 +3012,12 @@ impl Storage {
                          WHEN POSITION('@' IN c.handle) > 0 THEN split_part(c.handle, '@', 1)
                          ELSE c.handle
                      END
+                     AND split_part(c.handle, '@', 2) = $2
                      WHERE c.owner_account_id = $1
                      ORDER BY c.pinned DESC, c.sort_order ASC, c.created_at ASC",
                 )
                 .bind(account_id)
+                .bind(local_server)
                 .fetch_all(pool)
                 .await?
                 .into_iter()
@@ -2856,7 +3041,14 @@ impl Storage {
                 let mut messages = Vec::new();
                 let mut read_receipts = Vec::new();
                 let mut delivery_receipts = Vec::new();
-                for event in self.events_since(account_id, since).await? {
+                let events = self
+                    .events_since_limited(account_id, since, MAX_SYNC_EVENTS)
+                    .await?;
+                let cursor = events
+                    .last()
+                    .map(StoredEvent::cursor)
+                    .unwrap_or(self.cursor(account_id).await?);
+                for event in events {
                     match event {
                         StoredEvent::Message { message, .. } => messages.push(message),
                         StoredEvent::ReadReceipt {
@@ -2877,7 +3069,6 @@ impl Storage {
                         }),
                     }
                 }
-                let cursor = self.cursor(account_id).await?;
                 Ok(SyncSnapshot {
                     cursor,
                     conversations,
@@ -3258,18 +3449,16 @@ impl Storage {
                 let source_delivery_id = source_key_id
                     .filter(|value| !value.is_empty())
                     .map(|value| format!("{message_id}:{value}"));
-                let message_pattern = format!(r#"%"message_id":"{message_id}"%"#);
                 let source = sqlx::query(
                     "SELECT author, created_at FROM messages
                      WHERE owner_account_id = $1 AND conversation_id = $2
-                       AND (id = $3 OR client_message_id = $4 OR envelope_json LIKE $5)
+                       AND (id = $3 OR client_message_id = $4)
                      ORDER BY seq ASC LIMIT 1",
                 )
                 .bind(account_id)
                 .bind(conversation_id)
                 .bind(message_id)
                 .bind(source_delivery_id)
-                .bind(message_pattern)
                 .fetch_optional(&mut *transaction)
                 .await?;
                 let Some(source) = source else {
@@ -3388,7 +3577,7 @@ impl Storage {
                 };
                 let stored_id = format!("inbound:{account_id}:{delivery_id}");
                 let stack_id = message_stack_id(&target_conversation_id, "them", created_at);
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id) VALUES ($1, $2, $3, 'them', '', $4, $5, $6, $7) ON CONFLICT DO NOTHING",
                 )
                 .bind(&stored_id)
@@ -3400,6 +3589,29 @@ impl Storage {
                 .bind(delivery_id)
                 .execute(&mut *transaction)
                 .await?;
+                if inserted.rows_affected() == 0 {
+                    let existing = sqlx::query(
+                        "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
+                    )
+                    .bind(account_id)
+                    .bind(delivery_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    let existing = existing
+                        .map(|row| {
+                            Ok::<StoredMessage, sqlx::Error>(StoredMessage {
+                                id: row.try_get("id")?,
+                                conversation_id: row.try_get("conversation_id")?,
+                                author: row.try_get("author")?,
+                                created_at: row.try_get("created_at")?,
+                                stack_id: row.try_get("stack_id")?,
+                                envelope_json: row.try_get("envelope_json")?,
+                            })
+                        })
+                        .transpose()?;
+                    transaction.commit().await?;
+                    return Ok(existing);
+                }
                 sqlx::query(
                     "UPDATE conversations SET last_message = '', last_message_at = $1, updated_at = $1 WHERE owner_account_id = $2 AND id = $3",
                 )
@@ -3692,44 +3904,6 @@ impl Storage {
             .try_get("present")?),
         }
     }
-
-    pub async fn store_federation_delivery(
-        &self,
-        delivery_id: &str,
-        message_id: &str,
-        conversation_id: &str,
-        sender_server: &str,
-        envelope_json: &str,
-        received_at: i64,
-    ) -> Result<bool, StorageError> {
-        match &self.backend {
-            StorageBackend::Sqlite(storage) => storage
-                .lock()
-                .map_err(|_| StorageError::LockPoisoned)?
-                .store_federation_delivery(
-                    delivery_id,
-                    message_id,
-                    conversation_id,
-                    sender_server,
-                    envelope_json,
-                    received_at,
-                )
-                .map_err(Into::into),
-            StorageBackend::Postgres(pool) => Ok(sqlx::query(
-                "INSERT INTO federation_envelopes (delivery_id, message_id, conversation_id, sender_server, envelope_json, received_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
-            )
-            .bind(delivery_id)
-            .bind(message_id)
-            .bind(conversation_id)
-            .bind(sender_server)
-            .bind(envelope_json)
-            .bind(received_at)
-            .execute(pool)
-            .await?
-            .rows_affected()
-                > 0),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3753,7 +3927,7 @@ mod backend_tests {
             .expect("create account"));
         assert_eq!(
             storage
-                .sync(&account.id, 0)
+                .sync(&account.id, 0, "")
                 .await
                 .expect("sync")
                 .conversations
@@ -3768,7 +3942,7 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
         "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY);\
          CREATE TABLE IF NOT EXISTS server_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
          CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, handle TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL, last_seen_at BIGINT);\
-         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL);\
+         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL DEFAULT 0);\
          CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, handle TEXT, avatar TEXT NOT NULL, subtitle TEXT, can_write BOOLEAN NOT NULL DEFAULT TRUE, last_message TEXT NOT NULL DEFAULT '', last_message_at BIGINT, pinned BOOLEAN NOT NULL DEFAULT FALSE, online BOOLEAN NOT NULL DEFAULT FALSE, sort_order BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
          CREATE INDEX IF NOT EXISTS conversations_owner_order ON conversations(owner_account_id, pinned DESC, sort_order ASC, created_at ASC);\
          CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_handle ON conversations(owner_account_id, handle) WHERE handle IS NOT NULL;\
@@ -3792,8 +3966,6 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          UPDATE messages SET stack_id = conversation_id || ':' || author || ':' || (created_at / 60000)::TEXT WHERE stack_id = '';\
          UPDATE messages SET text = '' WHERE envelope_json = '';\
          UPDATE conversations SET last_message = '';\
-         CREATE TABLE IF NOT EXISTS federation_envelopes (delivery_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, conversation_id TEXT NOT NULL, sender_server TEXT NOT NULL, envelope_json TEXT NOT NULL, received_at BIGINT NOT NULL);\
-         CREATE INDEX IF NOT EXISTS federation_envelopes_conversation ON federation_envelopes(conversation_id, received_at ASC);\
          INSERT INTO realtime_event_cursors (account_id, cursor) SELECT id, 0 FROM accounts ON CONFLICT (account_id) DO NOTHING;\
          INSERT INTO realtime_events (account_id, cursor, kind, source_id, payload_json, created_at) SELECT owner_account_id, seq, 'message', id, json_build_object('id', id, 'conversation_id', conversation_id, 'author', author, 'created_at', created_at, 'stack_id', stack_id, 'envelope_json', envelope_json)::TEXT, created_at FROM messages WHERE envelope_json <> '' ON CONFLICT DO NOTHING;\
          UPDATE realtime_event_cursors SET cursor = GREATEST(cursor, COALESCE((SELECT MAX(realtime_events.cursor) FROM realtime_events WHERE realtime_events.account_id = realtime_event_cursors.account_id), 0));\
@@ -3803,6 +3975,15 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE sessions SET expires_at = created_at + $1 WHERE expires_at <= 0")
+        .bind(SESSION_TTL_MS)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

@@ -31,6 +31,8 @@ import { createRealtimeQueue, createSyncQueue } from "./src/sync-queue";
 import { createRealtimeLifecycle } from "./src/realtime-lifecycle";
 import { configureNotifications, notifyIncomingMessage, registerForPushNotifications } from "./src/notifications";
 import type { Conversation, Message, OutboxEntry, Profile, SearchUser } from "./src/types";
+import { deleteSessionToken, readSessionToken, writeSessionToken } from "./src/secure-session";
+import { limitMessageList, limitMessagesByProfile, limitOutboxEntries, MAX_OUTBOX_ATTEMPTS, retryDelay, sanitizeMessagesByProfile, sanitizeOutboxByProfile, sanitizeSyncCursors } from "./src/storage-limits";
 
 const PROFILES_KEY = "enter-profiles";
 const MESSAGES_KEY = "enter-mobile-messages";
@@ -60,6 +62,32 @@ function isCachedConversation(value: unknown): value is Conversation {
     && typeof conversation.time === "string";
 }
 
+type StoredProfile = Omit<Profile, "token"> & { token?: string };
+
+function isStoredProfile(value: unknown): value is StoredProfile {
+  if (!value || typeof value !== "object") return false;
+  const profile = value as Partial<StoredProfile>;
+  return typeof profile.id === "string"
+    && typeof profile.name === "string"
+    && typeof profile.handle === "string"
+    && typeof profile.server === "string"
+    && typeof profile.color === "string"
+    && (profile.token === undefined || typeof profile.token === "string")
+    && (profile.serverId === undefined || typeof profile.serverId === "string")
+    && (profile.serverName === undefined || typeof profile.serverName === "string")
+    && (profile.serverLogo === undefined || typeof profile.serverLogo === "string")
+    && (profile.deviceId === undefined || typeof profile.deviceId === "string");
+}
+
+function persistJson(key: string, value: unknown) {
+  void AsyncStorage.setItem(key, JSON.stringify(value)).catch(() => undefined);
+}
+
+function profileForStorage(profile: Profile): StoredProfile {
+  const { token: _token, ...metadata } = profile;
+  return metadata;
+}
+
 function profileAddress(profile: Profile) {
   return `${profile.handle.replace(/^@+/, "")}@${profile.server.replace(/^https?:\/\//, "")}`;
 }
@@ -71,10 +99,6 @@ function messagePreview(message: Message) {
   if (attachments.some(({ kind }) => kind === "video")) return "[Видео]";
   if (attachments.some(({ kind }) => kind === "audio")) return "[Аудио]";
   return attachments.length > 0 ? "[Файлы]" : "";
-}
-
-function retryDelay(attempts: number) {
-  return Math.min(60_000, 1000 * 2 ** Math.min(attempts, 6));
 }
 
 function isUnauthorized(reason: unknown) {
@@ -122,7 +146,7 @@ function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array
     const index = existing.findIndex((item) => item.id === message.id);
     if (index < 0) next[conversationId] = [...existing, message];
     else { const replaced = [...existing]; replaced[index] = { ...replaced[index], ...message, readAt: message.readAt ?? replaced[index].readAt, deliveredAt: message.deliveredAt ?? replaced[index].deliveredAt }; next[conversationId] = replaced; }
-    next[conversationId] = resolveMessageEdits(next[conversationId]);
+    next[conversationId] = limitMessageList(resolveMessageEdits(next[conversationId]));
   });
   return next;
 }
@@ -262,39 +286,60 @@ export default function App() {
   useEffect(() => { syncCursorsRef.current = syncCursors; }, [syncCursors]);
 
   useEffect(() => {
-    Promise.all([AsyncStorage.getItem(PROFILES_KEY), AsyncStorage.getItem(MESSAGES_KEY), AsyncStorage.getItem(CURSORS_KEY), AsyncStorage.getItem(CONVERSATIONS_KEY), AsyncStorage.getItem(NAVIGATION_KEY), AsyncStorage.getItem(OUTBOX_KEY)]).then(([storedProfiles, storedMessages, storedCursors, storedConversations, storedNavigation, storedOutbox]) => {
-      let validProfiles: Profile[] = [];
+    let mounted = true;
+    void (async () => {
+      const [storedProfiles, storedMessages, storedCursors, storedConversations, storedNavigation, storedOutbox] = await Promise.all([
+        AsyncStorage.getItem(PROFILES_KEY),
+        AsyncStorage.getItem(MESSAGES_KEY),
+        AsyncStorage.getItem(CURSORS_KEY),
+        AsyncStorage.getItem(CONVERSATIONS_KEY),
+        AsyncStorage.getItem(NAVIGATION_KEY),
+        AsyncStorage.getItem(OUTBOX_KEY),
+      ]);
+      let candidates: StoredProfile[] = [];
       let navigation: NavigationState = {};
       let cachedConversations: ConversationsByProfile = {};
       try {
-        const parsed = storedProfiles ? JSON.parse(storedProfiles) as Profile[] : [];
-        validProfiles = Array.isArray(parsed) ? parsed.filter((profile) => typeof profile?.token === "string" && profile.token.length > 0).map((profile) => ({ ...profile, server: migrateLocalServerAddress(profile.server) })) : [];
-        setProfiles(validProfiles); setShowAuth(validProfiles.length === 0);
-        if (storedProfiles && JSON.stringify(validProfiles) !== storedProfiles) void AsyncStorage.setItem(PROFILES_KEY, JSON.stringify(validProfiles));
-      } catch { setShowAuth(true); }
+        const parsed: unknown = storedProfiles ? JSON.parse(storedProfiles) : [];
+        candidates = Array.isArray(parsed) ? parsed.filter(isStoredProfile).map((profile) => ({ ...profile, server: migrateLocalServerAddress(profile.server) })) : [];
+      } catch { candidates = []; }
+      const validProfiles = (await Promise.all(candidates.map(async (profile): Promise<Profile | null> => {
+        const secureToken = await readSessionToken(profile.id);
+        if (secureToken) return { ...profile, token: secureToken };
+        if (!profile.token) return null;
+        try {
+          await writeSessionToken(profile.id, profile.token);
+          return { ...profile, token: profile.token };
+        } catch {
+          return null;
+        }
+      }))).filter((profile): profile is Profile => profile !== null);
       try {
-        const parsed = storedMessages ? JSON.parse(storedMessages) as MessagesByProfile : {};
-        setMessagesByProfile(parsed && typeof parsed === "object" ? parsed : {});
+        const parsed: unknown = storedMessages ? JSON.parse(storedMessages) : {};
+        setMessagesByProfile(sanitizeMessagesByProfile(parsed));
       } catch { setMessagesByProfile({}); }
       try {
-        const parsed = storedCursors ? JSON.parse(storedCursors) as Record<string, number> : {};
-        setSyncCursors(parsed && typeof parsed === "object" ? parsed : {});
+        const parsed: unknown = storedCursors ? JSON.parse(storedCursors) : {};
+        setSyncCursors(sanitizeSyncCursors(parsed));
       } catch { setSyncCursors({}); }
       try {
-        const parsed = storedConversations ? JSON.parse(storedConversations) as ConversationsByProfile : {};
-        cachedConversations = parsed && typeof parsed === "object"
+        const parsed: unknown = storedConversations ? JSON.parse(storedConversations) : {};
+        cachedConversations = parsed && typeof parsed === "object" && !Array.isArray(parsed)
           ? Object.fromEntries(Object.entries(parsed).map(([profileId, items]) => [profileId, Array.isArray(items) ? items.filter(isCachedConversation) : []]))
           : {};
         setConversationsByProfile(cachedConversations);
       } catch { setConversationsByProfile({}); }
       try {
-        const parsed = storedNavigation ? JSON.parse(storedNavigation) as NavigationState : {};
-        navigation = parsed && typeof parsed === "object" ? parsed : {};
+        const parsed: unknown = storedNavigation ? JSON.parse(storedNavigation) : {};
+        navigation = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as NavigationState : {};
       } catch { navigation = {}; }
       try {
-        const parsed = storedOutbox ? JSON.parse(storedOutbox) as Record<string, OutboxEntry[]> : {};
-        setOutboxByProfile(parsed && typeof parsed === "object" ? parsed : {});
+        const parsed: unknown = storedOutbox ? JSON.parse(storedOutbox) : {};
+        setOutboxByProfile(sanitizeOutboxByProfile(parsed));
       } catch { setOutboxByProfile({}); }
+      if (!mounted) return;
+      setProfiles(validProfiles);
+      setShowAuth(validProfiles.length === 0);
       const selectedProfileId = validProfiles.some((profile) => profile.id === navigation.activeProfileId) ? navigation.activeProfileId ?? null : validProfiles[0]?.id ?? null;
       const selectedConversationId = selectedProfileId ? navigation.activeConversationByProfile?.[selectedProfileId] ?? null : null;
       setActiveProfileId(selectedProfileId);
@@ -304,21 +349,22 @@ export default function App() {
       const hasSelectedConversation = Boolean(selectedProfileId && selectedConversationId && (cachedConversations[selectedProfileId] ?? []).some((item) => item.id === selectedConversationId));
       setScreen(navigation.screen === "settings" ? "settings" : hasSelectedConversation ? "chat" : "inbox");
       setHydrated(true);
-    }).catch(() => { setHydrated(true); setShowAuth(true); });
+    })().catch(() => { if (mounted) { setHydrated(true); setShowAuth(true); } });
+    return () => { mounted = false; };
   }, []);
 
-  useEffect(() => { if (hydrated) void AsyncStorage.setItem(PROFILES_KEY, JSON.stringify(profiles)); }, [hydrated, profiles]);
-  useEffect(() => { if (hydrated) void AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(messagesByProfile)); }, [hydrated, messagesByProfile]);
-  useEffect(() => { if (hydrated) void AsyncStorage.setItem(CURSORS_KEY, JSON.stringify(syncCursors)); }, [hydrated, syncCursors]);
-  useEffect(() => { outboxRef.current = outboxByProfile; if (hydrated) void AsyncStorage.setItem(OUTBOX_KEY, JSON.stringify(outboxByProfile)); }, [hydrated, outboxByProfile]);
-  useEffect(() => { if (hydrated) void AsyncStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(conversationsByProfile)); }, [hydrated, conversationsByProfile]);
+  useEffect(() => { if (hydrated) persistJson(PROFILES_KEY, profiles.map(profileForStorage)); }, [hydrated, profiles]);
+  useEffect(() => { if (hydrated) persistJson(MESSAGES_KEY, limitMessagesByProfile(messagesByProfile)); }, [hydrated, messagesByProfile]);
+  useEffect(() => { if (hydrated) persistJson(CURSORS_KEY, syncCursors); }, [hydrated, syncCursors]);
+  useEffect(() => { outboxRef.current = outboxByProfile; if (hydrated) persistJson(OUTBOX_KEY, Object.fromEntries(Object.entries(outboxByProfile).map(([profileId, entries]) => [profileId, limitOutboxEntries(entries)]))); }, [hydrated, outboxByProfile]);
+  useEffect(() => { if (hydrated) persistJson(CONVERSATIONS_KEY, conversationsByProfile); }, [hydrated, conversationsByProfile]);
   useEffect(() => {
     if (!hydrated || !activeProfileId) return;
     setActiveConversationByProfile((current) => ({ ...current, [activeProfileId]: activeConversationId }));
   }, [hydrated, activeProfileId, activeConversationId]);
   useEffect(() => {
     if (!hydrated) return;
-    void AsyncStorage.setItem(NAVIGATION_KEY, JSON.stringify({ activeProfileId, activeConversationByProfile, activeFolderByProfile, screen } satisfies NavigationState));
+    persistJson(NAVIGATION_KEY, { activeProfileId, activeConversationByProfile, activeFolderByProfile, screen } satisfies NavigationState);
   }, [hydrated, activeProfileId, activeConversationByProfile, activeFolderByProfile, screen]);
 
   useEffect(() => {
@@ -343,12 +389,15 @@ export default function App() {
     const senderDeviceCache = new Map<string, Promise<PublicDeviceKey[]>>();
     let pushRegistrationStarted = false;
 
-     const senderDevicesFor = (address: string) => {
-       const cached = senderDeviceCache.get(address);
-       if (cached) return cached;
-       const request = fetchPublicDeviceKeys(profile, address);
-       senderDeviceCache.set(address, request);
-       return request;
+    const senderDevicesFor = (address: string) => {
+      const cached = senderDeviceCache.get(address);
+      if (cached) return cached;
+      const request = fetchPublicDeviceKeys(profile, address).catch((reason) => {
+        senderDeviceCache.delete(address);
+        throw reason;
+      });
+      senderDeviceCache.set(address, request);
+      return request;
      };
 
     const historyMessageKey = (message: Message) => `${message.id}:${message.text}`;
@@ -378,7 +427,7 @@ export default function App() {
         return ownBundle;
       } catch (reason) {
         nextPrepareAt = Date.now() + 5000;
-        if (isUnauthorized(reason)) { setMessageError("РЎРµСЃСЃРёСЏ СЃРµСЂРІРµСЂР° РёСЃС‚РµРєР»Р°. Р’РѕР№РґРёС‚Рµ СЃРЅРѕРІР°"); setShowAuth(true); }
+        if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); }
         return null;
       } finally {
         preparing = false;
@@ -405,7 +454,7 @@ export default function App() {
          historySyncSent.set(target.keyId, sent);
          historySyncComplete.add(targetKey);
        } catch (reason) {
-         if (isUnauthorized(reason)) setShowAuth(true);
+         if (isUnauthorized(reason)) expireProfileSession(profile.id);
        }
      }
 
@@ -438,7 +487,7 @@ export default function App() {
            historySyncSent.set(target.keyId, sent);
            historySyncComplete.add(targetKey);
         } catch (reason) {
-          if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); }
+          if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); }
         }
       }
     }
@@ -496,12 +545,12 @@ export default function App() {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
       });
-      if (decryptFailures === 0) advanceCursor(Math.max(cursor, result.nextCursor));
-      setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
+      advanceCursor(Math.max(cursor, result.nextCursor));
+      setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Они пропущены, синхронизация продолжена.` : "");
       void backfillHistoryToAccount();
       void backfillHistoryToDevices();
       void retryOutboxForProfile(profile.id);
-      return decryptFailures === 0;
+      return true;
     }
 
     const syncOnce = createSyncQueue(async () => {
@@ -512,7 +561,7 @@ export default function App() {
       } catch (reason) {
         if (cancelled || !appActive) return;
         setSyncConnected(false);
-        if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); }
+        if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); }
         else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу");
       }
       if (appActive) retryRealtime();
@@ -637,7 +686,7 @@ export default function App() {
 
     const syncInForeground = () => void (async () => {
       try { await syncOnce(); }
-      catch (reason) { if (!cancelled && appActive) { setSyncConnected(false); if (isUnauthorized(reason)) { setMessageError("Сессия сервера истекла. Войдите снова"); setShowAuth(true); } else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу"); } }
+      catch (reason) { if (!cancelled && appActive) { setSyncConnected(false); if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); } else setMessageError(reason instanceof Error ? `Нет подключения к серверу: ${reason.message}` : "Нет подключения к серверу"); } }
     })();
 
     const suspendRealtime = () => {
@@ -698,6 +747,7 @@ export default function App() {
 
   async function addProfile(profile: Profile, password: string) {
     await prepareProfile(profile, password);
+    await writeSessionToken(profile.id, profile.token);
     const nextProfiles = [...profiles.filter((item) => item.id !== profile.id), profile];
     setProfiles(nextProfiles); setActiveProfileId(profile.id); setShowAuth(false); setScreen("inbox"); setActiveConversationId(null);
     setConversationsByProfile((current) => ({ ...current, [profile.id]: current[profile.id] ?? [] }));
@@ -707,6 +757,7 @@ export default function App() {
 
   function removeProfile(profile: Profile) {
     const next = profiles.filter((item) => item.id !== profile.id);
+    void deleteSessionToken(profile.id);
     void deleteDeviceKeys(profile.id).catch(() => undefined);
     setProfiles(next);
     setConversationsByProfile((current) => { const rest = { ...current }; delete rest[profile.id]; return rest; });
@@ -717,6 +768,18 @@ export default function App() {
     delete syncCursorsRef.current[profile.id];
     setOutboxByProfile((current) => { const rest = { ...current }; delete rest[profile.id]; return rest; });
     if (activeProfileId === profile.id) { setActiveProfileId(next[0]?.id ?? null); setActiveConversationId(null); setScreen("inbox"); setShowAuth(next.length === 0); }
+  }
+
+  function expireProfileSession(profileId: string) {
+    void deleteSessionToken(profileId);
+    const next = profiles.filter((profile) => profile.id !== profileId);
+    setProfiles(next);
+    if (activeProfileId === profileId) {
+      setActiveProfileId(next[0]?.id ?? null);
+      setActiveConversationId(null);
+      setScreen("inbox");
+    }
+    setShowAuth(true);
   }
 
   function selectProfile(profile: Profile) {
@@ -751,7 +814,7 @@ export default function App() {
 
   function updateMessages(conversationId: string, update: (current: Message[]) => Message[]) {
     if (!activeProfileId) return;
-    setMessagesByProfile((current) => { const profileMessages = current[activeProfileId] ?? {}; return { ...current, [activeProfileId]: { ...profileMessages, [conversationId]: update(profileMessages[conversationId] ?? []) } }; });
+    setMessagesByProfile((current) => { const profileMessages = current[activeProfileId] ?? {}; return { ...current, [activeProfileId]: { ...profileMessages, [conversationId]: limitMessageList(update(profileMessages[conversationId] ?? [])) } }; });
   }
 
   function updateLocalMessage(conversationId: string, messageId: string, update: (message: Message) => Message) {
@@ -763,7 +826,8 @@ export default function App() {
     setOutboxByProfile((current) => {
       const entries = current[activeProfileId] ?? [];
       if (entries.some((entry) => entry.id === message.id)) return current;
-      return { ...current, [activeProfileId]: [...entries, { id: message.id, conversationId, message: { ...message, deliveryStatus: undefined }, attempts: 0, nextAttemptAt: Date.now() }] };
+      const next = limitOutboxEntries([...entries, { id: message.id, conversationId, message: { ...message, deliveryStatus: undefined }, attempts: 0, nextAttemptAt: Date.now() }]);
+      return { ...current, [activeProfileId]: next };
     });
   }
 
@@ -778,7 +842,11 @@ export default function App() {
   function failOutbox(messageId: string) {
     if (!activeProfileId) return;
     setOutboxByProfile((current) => {
-      const entries = (current[activeProfileId] ?? []).map((entry) => entry.id === messageId ? { ...entry, attempts: entry.attempts + 1, nextAttemptAt: Date.now() + retryDelay(entry.attempts + 1) } : entry);
+      const entries = (current[activeProfileId] ?? []).flatMap((entry) => {
+        if (entry.id !== messageId) return [entry];
+        const attempts = entry.attempts + 1;
+        return attempts >= MAX_OUTBOX_ATTEMPTS ? [] : [{ ...entry, attempts, nextAttemptAt: Date.now() + retryDelay(attempts) }];
+      });
       return { ...current, [activeProfileId]: entries };
     });
   }
@@ -844,7 +912,7 @@ export default function App() {
       setMediaUploadProgress(null);
       updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "failed" }));
       failOutbox(message.id);
-      if (isUnauthorized(reason)) { setShowAuth(true); setMessageError("Сессия сервера истекла. Войдите снова"); }
+      if (isUnauthorized(reason)) { expireProfileSession(activeProfile.id); setMessageError("Сессия сервера истекла. Войдите снова"); }
       else setMessageError(hasPendingMedia ? "Не удалось загрузить вложение. Сообщение не отправлено." : reason instanceof Error ? `Не удалось отправить: ${reason.message}` : "Сообщение сохранено локально. Повторю отправку автоматически.");
     }
   }

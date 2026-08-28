@@ -12,3 +12,5 @@ server/data/
 desktop/server/data/
 deploy/enter/data/
 *.log
+vscode-extension/*.vsix
+.DS_Store

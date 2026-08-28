@@ -43,6 +43,7 @@ cargo run --manifest-path server/Cargo.toml
 Для запуска контейнера с SQLite:
 
 Если локальный `cargo run` уже занимает порт `50121`, остановите его перед запуском контейнера.
+Этот compose-файл рассчитан на локальный запуск и по умолчанию публикует `http://127.0.0.1:50121`; для удалённых клиентов задайте `ENTER_SERVER_URL` адресом, доступным из сети клиентов. Для deploy-конфигурации используйте [deploy/enter/.env.example](deploy/enter/.env.example).
 
 ```bash
 docker compose up --build -d
@@ -59,7 +60,8 @@ docker compose down
 ## E2E
 
 Клиентский E2E v1 включён для сообщений и «Избранного»: device keys создаются
-через Web Crypto и приватные ключи хранятся локально в IndexedDB. Сервер получает
+через Web Crypto, а приватные ключи хранятся локально — в IndexedDB desktop-клиента
+и SecureStore mobile-клиента. Сервер получает
 только подписанные AES-256-GCM сообщения в зашифрованном transport-формате, без поля plaintext `text`. Публичные
 ключи публикуются через `/enter/v1/keys`, а клиент проверяет подпись и расшифровывает
 сообщения после синхронизации.
@@ -70,7 +72,7 @@ VS Code extension полностью изолирован в [vscode-extension](
 
 ```bash
 cd vscode-extension
-npm install
+npm ci
 npm test
 npm run package
 ```

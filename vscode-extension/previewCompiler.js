@@ -1,6 +1,35 @@
 const path = require("path");
 const fs = require("fs");
-const esbuild = require("esbuild");
+const esbuild = require("esbuild-wasm");
+
+let esbuildInitialization;
+
+function isFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function normalizeFilePath(filePath) {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function initializeEsbuild() {
+  if (!esbuildInitialization) {
+    esbuildInitialization = esbuild.initialize().catch((error) => {
+      esbuildInitialization = undefined;
+      throw error;
+    });
+  }
+
+  return esbuildInitialization;
+}
 
 function getLanguageLoader(filePath) {
   const extension = path.extname(filePath).toLowerCase();
@@ -54,25 +83,53 @@ function getStyleEntries(workspaceRoot) {
     "index.tsx", "index.ts", "index.jsx", "index.js"
   ];
   const entries = new Set();
-  const importPattern = /(?:import|export)\s+(?:[^"'`]+?\sfrom\s+)?["']([^"'`]+\.css)["']/g;
+  const importPattern = /(?:import|export)\s+(?:[^"'`]+?\sfrom\s+)?["']([^"'`]+)["']/g;
+  const dynamicImportPattern = /import\s*\(\s*["']([^"'`]+)["']\s*\)/g;
+  const visited = new Set();
+
+  function scanImport(importPath, fromPath) {
+    if (!importPath.startsWith(".")) {
+      return;
+    }
+
+    const importedPath = path.resolve(path.dirname(fromPath), importPath);
+    if (/\.css$/i.test(importPath)) {
+      if (isFile(importedPath)) {
+        entries.add(importedPath);
+      }
+      return;
+    }
+
+    const moduleCandidates = [
+      importedPath,
+      `${importedPath}.js`, `${importedPath}.jsx`, `${importedPath}.ts`, `${importedPath}.tsx`,
+      path.join(importedPath, "index.js"), path.join(importedPath, "index.jsx"),
+      path.join(importedPath, "index.ts"), path.join(importedPath, "index.tsx")
+    ];
+    const modulePath = moduleCandidates.find(isFile);
+    if (modulePath) {
+      scanModule(modulePath);
+    }
+  }
+
+  function scanModule(modulePath) {
+    const resolvedPath = path.resolve(modulePath);
+    if (visited.has(resolvedPath) || !isFile(resolvedPath)) {
+      return;
+    }
+    visited.add(resolvedPath);
+
+    const source = fs.readFileSync(resolvedPath, "utf8");
+    for (const match of source.matchAll(importPattern)) {
+      scanImport(match[1], resolvedPath);
+    }
+    for (const match of source.matchAll(dynamicImportPattern)) {
+      scanImport(match[1], resolvedPath);
+    }
+  }
 
   for (const candidate of candidates) {
-    const entryPath = path.join(workspaceRoot, candidate);
-    if (!fs.existsSync(entryPath)) {
-      continue;
-    }
-
-    const source = fs.readFileSync(entryPath, "utf8");
-    for (const match of source.matchAll(importPattern)) {
-      if (!match[1].startsWith(".")) {
-        continue;
-      }
-
-      const stylePath = path.resolve(path.dirname(entryPath), match[1]);
-      if (fs.existsSync(stylePath)) {
-        entries.add(stylePath);
-      }
-    }
+    scanModule(path.join(workspaceRoot, candidate));
   }
 
   return [...entries];
@@ -114,9 +171,20 @@ function getPublicAssetData(publicDirectory, urlPath) {
     return undefined;
   }
 
-  const assetPath = path.resolve(publicDirectory, decodeURIComponent(match[1]));
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(match[1]);
+  } catch {
+    return undefined;
+  }
+
+  const assetPath = path.resolve(publicDirectory, decodedPath);
   const relativePath = path.relative(publicDirectory, assetPath);
-  if (relativePath.startsWith("..") || path.isAbsolute(relativePath) || !fs.existsSync(assetPath)) {
+  if (
+    relativePath.startsWith("..") ||
+    path.isAbsolute(relativePath) ||
+    !isFile(assetPath)
+  ) {
     return undefined;
   }
 
@@ -205,7 +273,9 @@ async function processProjectStyles(styles, workspaceRoot) {
 }
 
 async function buildPreview({ document, preview, workspaceRoot }) {
+  await initializeEsbuild();
   const filePath = document.uri.fsPath;
+  const normalizedFilePath = normalizeFilePath(filePath);
   const source = document.getText();
   const generated = getPreviewSource(source, preview);
   const generatedSource = typeof generated === "string" ? generated : generated.source;
@@ -249,7 +319,7 @@ async function buildPreview({ document, preview, workspaceRoot }) {
         name: "react-preview-active-document",
         setup(build) {
           build.onLoad({ filter: /.*/ }, (args) => {
-            if (path.resolve(args.path) !== path.resolve(filePath)) {
+            if (normalizeFilePath(args.path) !== normalizedFilePath) {
               return undefined;
             }
 

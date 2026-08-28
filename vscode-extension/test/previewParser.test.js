@@ -46,4 +46,12 @@ assert.strictEqual(malformed.previews.length, 0);
 assert.strictEqual(malformed.errors.length, 1);
 assert.match(malformed.errors[0].message, /Блок|строк|кавыч/);
 
+const regexBody = parsePreviews('// #preview { /}/ }');
+assert.strictEqual(regexBody.errors.length, 0);
+assert.strictEqual(regexBody.previews[0].expression, "/}/");
+
+const identifierStartingWithDefault = parsePreviews('// #preview defaultButton {}');
+assert.strictEqual(identifierStartingWithDefault.errors.length, 0);
+assert.strictEqual(identifierStartingWithDefault.previews[0].target, "defaultButton");
+
 console.log("previewParser: ok");

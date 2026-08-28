@@ -79,8 +79,9 @@ function parseCache(value: unknown, limit = true): MessageCache | null {
 
   const messages = Object.fromEntries(Object.entries(payload.messages).map(([conversationId, conversationMessages]) => [conversationId, Array.isArray(conversationMessages) ? conversationMessages.filter(isMessage) : []]));
   const conversations = Array.isArray(payload.conversations) ? payload.conversations.filter(isConversation).map((conversation) => ({ ...conversation, online: conversation.handle === "official" ? true : conversation.online })) : undefined;
+  const overLimit = exceedsCacheLimits(messages);
   return {
-    cursor: typeof payload.cursor === "number" && payload.cursor >= 0 ? payload.cursor : 0,
+    cursor: overLimit ? 0 : typeof payload.cursor === "number" && payload.cursor >= 0 ? payload.cursor : 0,
     messages: limit ? limitMessages(messages) : messages,
     conversations,
     updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : undefined,
@@ -163,7 +164,7 @@ export async function readMessageCacheAsync(profileId: string | null | undefined
   const local = readMessageCache(profileId);
   try {
     const stored = await readIndexedCache(profileId);
-    const indexed = stored ? parseCache(stored, false) : null;
+    const indexed = stored ? parseCache(stored) : null;
     if ((indexed?.updatedAt ?? 0) >= (local?.updatedAt ?? 0)) return indexed ?? local;
   } catch {
     // IndexedDB is an enhancement; the synchronous local cache remains the fallback.
@@ -186,7 +187,7 @@ export function writeMessageCache(profileId: string, messages: Record<string, Me
   } catch {
     // Cache failures must never block sending or rendering messages.
   }
-  writeIndexedCache(profileId, { ...payload, cursor, messages });
+  writeIndexedCache(profileId, payload);
   return payload.updatedAt;
 }
 

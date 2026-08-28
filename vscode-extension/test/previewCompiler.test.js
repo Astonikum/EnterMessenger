@@ -1,56 +1,86 @@
 const assert = require("assert");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { parsePreviews } = require("../previewParser");
 const { buildPreview } = require("../previewCompiler");
 
+function writeFixture(root) {
+  const sourceDirectory = path.join(root, "src");
+  const componentDirectory = path.join(sourceDirectory, "components");
+  const styleDirectory = path.join(sourceDirectory, "styles");
+  const publicDirectory = path.join(root, "public");
+  const reactDirectory = path.join(root, "node_modules", "react");
+  const reactDomDirectory = path.join(root, "node_modules", "react-dom");
+
+  for (const directory of [componentDirectory, styleDirectory, publicDirectory, reactDirectory, reactDomDirectory]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+
+  fs.writeFileSync(path.join(root, "src", "main.tsx"), 'import "./app";\n');
+  fs.writeFileSync(path.join(root, "src", "app.tsx"), 'import "./styles/global.css";\n');
+  fs.writeFileSync(path.join(styleDirectory, "global.css"), ".app-shell { display: grid; }\n");
+  fs.writeFileSync(path.join(publicDirectory, "logo.png"), Buffer.from("preview-image"));
+  fs.writeFileSync(path.join(reactDirectory, "index.js"), `
+exports.createElement = (type, props, ...children) => ({ type, props, children });
+exports.Fragment = Symbol.for("react.fragment");
+`);
+  fs.writeFileSync(path.join(reactDomDirectory, "client.js"), `
+exports.createRoot = () => ({ render() {} });
+`);
+
+  const componentPath = path.join(componentDirectory, "Button.tsx");
+  fs.writeFileSync(componentPath, `
+import * as React from "react";
+
+const image = "/logo.png";
+export function Button({ label, disabled }) {
+  return <button disabled={disabled}><img src={image} />{label}</button>;
+}
+
+export default Button;
+`);
+  return componentPath;
+}
+
 async function main() {
-  const buildFixture = async (relativePath, directive) => {
-    const filePath = path.resolve("..", relativePath);
-    const source = `${fs.readFileSync(filePath, "utf8")}\n${directive}\n`;
-    const document = { uri: { fsPath: filePath }, getText: () => source };
-    const preview = parsePreviews(source).previews[0];
-    return buildPreview({ document, preview, workspaceRoot: path.resolve("..") });
-  };
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "react-preview-"));
 
-  const result = await buildFixture("src/main.tsx", '// #preview("Unsaved App") { <App /> }');
+  try {
+    const componentPath = writeFixture(fixtureRoot);
+    const buildFixture = async (directive) => {
+      const source = `${fs.readFileSync(componentPath, "utf8")}\n${directive}\n`;
+      const document = { uri: { fsPath: componentPath }, getText: () => source };
+      const parsed = parsePreviews(source);
+      assert.strictEqual(parsed.errors.length, 0);
+      return buildPreview({ document, preview: parsed.previews[0], workspaceRoot: fixtureRoot });
+    };
 
-  assert.ok(result.javascript.length > 1000, "expected a bundled preview script");
-  assert.ok(result.styles.length > 0, "expected CSS imported by the active document");
-  assert.match(result.javascript, /createRoot/);
+    const expressionPreview = await buildFixture('// #preview("JSX body") { <Button label="Continue" /> }');
+    assert.ok(expressionPreview.javascript.length > 100, "expected a bundled preview script");
+    assert.match(expressionPreview.javascript, /createRoot/);
+    assert.match(expressionPreview.javascript, /data:image\/png;base64,/);
+    assert.match(expressionPreview.styles, /\.app-shell\s*\{\s*display:\s*grid/);
 
-  const namedExport = await buildFixture(
-    "src/components/ui/button.tsx",
-    '// #preview Button {"children":"Continue"}'
-  );
-  assert.ok(namedExport.javascript.length > 1000, "expected named export preview bundle");
+    const namedExport = await buildFixture('// #preview Button {"label":"Continue"}');
+    assert.match(namedExport.javascript, /Continue/);
 
-  const defaultExport = await buildFixture("src/App.tsx", "// #preview default {}");
-  assert.ok(defaultExport.javascript.length > 1000, "expected default export preview bundle");
+    const defaultExport = await buildFixture("// #preview default {}");
+    assert.match(defaultExport.javascript, /createRoot/);
 
-  const componentPreview = await buildFixture(
-    "src/components/auth-page.tsx",
-    '// #preview "Server check" AuthPage {}'
-  );
-  assert.ok(componentPreview.styles.length > 0, "expected app styles in a component preview");
-  assert.match(componentPreview.styles, /\.flex\s*\{\s*display:\s*flex/, "expected Tailwind utilities in preview styles");
-  assert.match(componentPreview.styles, /\.w-32\s*\{\s*width:\s*8rem/, "expected Tailwind sizing utilities in preview styles");
-  assert.match(componentPreview.javascript, /data:image\/png;base64,/, "expected public image to be inlined");
-
-  const modulePreview = await buildFixture(
-    "src/components/ui/button.tsx",
-    `/* #preview-module("Button gallery")
+    const modulePreview = await buildFixture(`/* #preview-module("Button gallery")
 const demos = [
   <Button>Primary</Button>,
   <Button disabled>Disabled</Button>,
 ];
 return <section>{demos}</section>;
-*/`
-  );
-  assert.ok(modulePreview.javascript.length > 1000, "expected preview module bundle");
-  assert.match(modulePreview.javascript, /Button gallery|Primary/);
+*/`);
+    assert.match(modulePreview.javascript, /Primary/);
 
-  console.log("previewCompiler: ok");
+    console.log("previewCompiler: ok");
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 }
 
 main().catch((error) => {

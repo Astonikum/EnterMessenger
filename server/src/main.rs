@@ -380,6 +380,11 @@ const REALTIME_MAX_CONNECTIONS: usize = 256;
 const REALTIME_MAX_CONNECTIONS_PER_ACCOUNT: usize = 4;
 const REALTIME_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const REALTIME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENVELOPES_PER_MESSAGE: usize = 64;
+const MAX_ENVELOPE_BATCH_BYTES: usize = 3 * 1024 * 1024;
+const MAX_LOGO_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PASSWORD_BYTES: usize = 256;
 
 #[derive(Default)]
 struct RealtimeMetrics {
@@ -432,6 +437,22 @@ async fn server_logo(
             }),
         ));
     };
+    let metadata = tokio::fs::metadata(&path).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ProtocolErrorResponse {
+                error: "logo_not_found",
+            }),
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_LOGO_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ProtocolErrorResponse {
+                error: "logo_too_large",
+            }),
+        ));
+    }
     let bytes = tokio::fs::read(&path).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
@@ -453,65 +474,51 @@ async fn server_logo(
     Ok(response)
 }
 
-async fn federation_delivery(
-    State(state): State<AppState>,
-    Json(delivery): Json<protocol::FederationDelivery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ProtocolErrorResponse>)> {
-    if !protocol::is_supported_delivery(&delivery) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ProtocolErrorResponse {
-                error: "invalid_federation_delivery",
-            }),
-        ));
-    }
-
-    let envelope_json = serde_json::to_string(&delivery.envelope).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ProtocolErrorResponse {
-                error: "envelope_storage_failed",
-            }),
-        )
-    })?;
-    let inserted = state
-        .db
-        .store_federation_delivery(
-            &delivery.delivery_id,
-            &delivery.envelope.message_id,
-            &delivery.envelope.conversation_id,
-            &delivery.sender_server,
-            &envelope_json,
-            storage::now_ms(),
-        )
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ProtocolErrorResponse {
-                    error: "envelope_storage_failed",
-                }),
-            )
-        })?;
-
-    // The server deliberately stores ciphertext as an opaque envelope. Decryption and
-    // device delivery happen only after the identity/session layer is added.
-    Ok(Json(serde_json::json!({
-        "protocol": protocol::PROTOCOL_VERSION,
-        "delivery_id": delivery.delivery_id,
-        "accepted": true,
-        "stored_as": "opaque-federation-envelope",
-        "duplicate": !inserted,
-    })))
-}
-
 fn error(status: StatusCode, message: &'static str) -> (StatusCode, Json<ErrorResponse>) {
     (status, Json(ErrorResponse { error: message }))
 }
 
 fn enter_address_parts(address: &str) -> Option<(&str, &str)> {
-    let (handle, server) = address.trim().split_once('@')?;
-    (!handle.is_empty() && !server.is_empty()).then_some((handle, server))
+    let address = address.trim();
+    let (handle, server) = address.rsplit_once('@')?;
+    protocol::valid_address(address).then_some((handle, server))
+}
+
+fn valid_display_text(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && !value.chars().any(char::is_control)
+}
+
+fn valid_password(value: &str) -> bool {
+    value.len() >= 8 && value.len() <= MAX_PASSWORD_BYTES && !value.chars().any(char::is_control)
+}
+
+fn valid_key_material(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16_384
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
+}
+
+fn valid_envelope_batch(envelopes: &[protocol::EncryptedEnvelope]) -> bool {
+    envelopes.len() <= MAX_ENVELOPES_PER_MESSAGE
+        && envelopes
+            .iter()
+            .try_fold(0usize, |size, envelope| {
+                serde_json::to_vec(envelope)
+                    .ok()
+                    .and_then(|value| size.checked_add(value.len()))
+            })
+            .is_some_and(|size| size <= MAX_ENVELOPE_BATCH_BYTES)
+}
+
+fn envelope_belongs_to_account(
+    envelope: &protocol::EncryptedEnvelope,
+    account: &storage::StoredAccount,
+    public_url: &str,
+) -> bool {
+    enter_address_parts(&envelope.sender)
+        .is_some_and(|(handle, server)| handle == account.handle && same_server(public_url, server))
 }
 
 fn normalize_server(value: &str) -> String {
@@ -552,7 +559,7 @@ fn canonical_address(server_url: &str, handle: &str) -> String {
 
 async fn deliver_local_message(
     state: &AppState,
-    sender_account_id: &str,
+    sender: &storage::StoredAccount,
     envelope: &protocol::EncryptedEnvelope,
     envelope_json: &str,
     created_at: i64,
@@ -574,18 +581,11 @@ async fn deliver_local_message(
     else {
         return Ok(());
     };
-    if recipient.id == sender_account_id {
+    if recipient.id == sender.id {
         return Ok(());
     }
 
-    let (sender_handle, _) =
-        enter_address_parts(&envelope.sender).unwrap_or((envelope.sender.as_str(), ""));
-    let sender_address = canonical_address(&state.config.public_url, sender_handle);
-    let sender = state
-        .db
-        .account_by_handle(sender_handle)
-        .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    let sender_address = canonical_address(&state.config.public_url, &sender.handle);
     let delivery_id = format!("{}:{}", envelope.message_id, envelope.key_id);
     let delivered = state
         .db
@@ -593,11 +593,8 @@ async fn deliver_local_message(
             &recipient.id,
             &envelope.conversation_id,
             &sender_address,
-            sender
-                .as_ref()
-                .map(|value| value.name.as_str())
-                .unwrap_or(sender_handle),
-            sender_handle,
+            &sender.name,
+            &sender.handle,
             &delivery_id,
             envelope_json,
             created_at,
@@ -613,15 +610,11 @@ async fn deliver_local_message(
         {
             publish_stored_event(state, event).await;
         }
-        let title = sender
-            .as_ref()
-            .map(|value| value.name.as_str())
-            .unwrap_or(sender_handle);
         if notify {
             tokio::spawn(send_push_notification(
                 state.clone(),
                 recipient.id.clone(),
-                title.to_owned(),
+                sender.name.clone(),
                 envelope.conversation_id.clone(),
                 message.id.clone(),
             ));
@@ -699,7 +692,10 @@ async fn register(
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
     let name = request.name.unwrap_or_default().trim().to_owned();
     let handle = request.handle.trim().trim_start_matches('@').to_lowercase();
-    if name.is_empty() || handle.is_empty() || request.password.len() < 8 {
+    if !valid_display_text(&name, 160)
+        || !protocol::valid_handle(&handle)
+        || !valid_password(&request.password)
+    {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_registration"));
     }
 
@@ -737,6 +733,9 @@ async fn login(
     Json(request): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
     let handle = request.handle.trim().trim_start_matches('@').to_lowercase();
+    if !protocol::valid_handle(&handle) || !valid_password(&request.password) {
+        return Err(error(StatusCode::UNAUTHORIZED, "invalid_credentials"));
+    }
     let Some(account) = state
         .db
         .account_by_handle(&handle)
@@ -762,31 +761,51 @@ async fn login(
     Ok(Json(response))
 }
 
-async fn bearer_account_id(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
     let Some(value) = headers
-        .get("authorization")
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
         return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
     };
-    let Some(token) = value.strip_prefix("Bearer ") else {
+    let Some(token) = value.strip_prefix("Bearer ").map(str::trim) else {
         return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
     };
+    if token.is_empty() || token.len() > 128 || token.chars().any(char::is_control) {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(token)
+}
+
+async fn bearer_account_id(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(headers)?;
     state
         .db
-        .account_id_for_session(token)
+        .account_id_for_session(token, storage::now_ms())
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))
 }
 
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let token = bearer_token(&headers)?;
+    state
+        .db
+        .revoke_session(token)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
 fn conversation_response(
     value: storage::StoredConversation,
     server_id: &str,
-    _local_server: &str,
     now: i64,
 ) -> ConversationResponse {
     // `last_seen_at` is populated only when the storage join found a local peer.
@@ -864,7 +883,11 @@ async fn publish_stored_event(state: &AppState, event: storage::StoredEvent) {
 }
 
 async fn publish_presence(state: &AppState, account_id: &str, online: bool, last_seen_at: i64) {
-    let Ok(watchers) = state.db.presence_watchers(account_id).await else {
+    let Ok(watchers) = state
+        .db
+        .presence_watchers(account_id, &state.config.public_url)
+        .await
+    else {
         return;
     };
     for watcher in watchers {
@@ -904,7 +927,7 @@ async fn sync_payload(
         .map_err(|_| "storage_failed")?;
     let snapshot = state
         .db
-        .sync(account_id, since.max(0))
+        .sync(account_id, since.max(0), &state.config.public_url)
         .await
         .map_err(|_| "storage_failed")?;
     let messages = snapshot
@@ -918,14 +941,7 @@ async fn sync_payload(
         conversations: snapshot
             .conversations
             .into_iter()
-            .map(|conversation| {
-                conversation_response(
-                    conversation,
-                    &state.server_id,
-                    &state.config.public_url,
-                    now,
-                )
-            })
+            .map(|conversation| conversation_response(conversation, &state.server_id, now))
             .collect(),
         messages,
         read_receipts: snapshot
@@ -1086,7 +1102,11 @@ async fn realtime_session(mut socket: WebSocket, state: AppState) {
         fail_realtime(&mut socket, error_code, 1002).await;
         return;
     }
-    let Ok(Some(account_id)) = state.db.account_id_for_session(&hello.token).await else {
+    let Ok(Some(account_id)) = state
+        .db
+        .account_id_for_session(&hello.token, storage::now_ms())
+        .await
+    else {
         fail_realtime(&mut socket, "unauthorized", 1008).await;
         return;
     };
@@ -1207,6 +1227,9 @@ async fn mark_conversation_read(
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
+    if !protocol::valid_identifier(conversation_id.trim()) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_conversation"));
+    }
     let read_at = storage::now_ms();
     let message_ids = state
         .db
@@ -1233,6 +1256,9 @@ async fn mark_message_delivered(
     headers: HeaderMap,
 ) -> Result<Json<DeliveryAckResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
+    if !protocol::valid_identifier(message_id.trim()) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+    }
     let delivered_at = storage::now_ms();
     let event = state
         .db
@@ -1265,8 +1291,8 @@ async fn register_push_token(
     let platform = request.platform.trim().to_ascii_lowercase();
     if token.len() < 10
         || token.len() > 512
-        || device_id.is_empty()
-        || device_id.len() > 128
+        || token.chars().any(char::is_control)
+        || !protocol::valid_identifier(device_id)
         || !matches!(platform.as_str(), "android" | "ios")
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_push_token"));
@@ -1285,6 +1311,14 @@ async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
+    let Some(sender) = state
+        .db
+        .account_by_id(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    else {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    };
     let conversation_id = request.conversation_id.trim();
     let client_message_id = request.client_message_id.trim();
     let envelopes = if request.envelopes.is_empty() {
@@ -1295,16 +1329,30 @@ async fn send_message(
     let Some(primary) = envelopes.first() else {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
     };
-    if conversation_id.is_empty() || client_message_id.is_empty() {
+    if !protocol::valid_identifier(conversation_id)
+        || !protocol::valid_identifier(client_message_id)
+        || !valid_envelope_batch(&envelopes)
+    {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
     }
     for envelope in &envelopes {
         if client_message_id != envelope.message_id
             || envelope.conversation_id != conversation_id
             || !protocol::is_supported_envelope(envelope)
-            || envelope.ciphertext.len() > 1_500_000
         {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+        }
+        let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+            return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+        };
+        if !same_server(&state.config.public_url, recipient_server) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "remote_delivery_not_supported",
+            ));
+        }
+        if !envelope_belongs_to_account(envelope, &sender, &state.config.public_url) {
+            return Err(error(StatusCode::FORBIDDEN, "sender_identity_mismatch"));
         }
         let registered_device = state
             .db
@@ -1374,7 +1422,7 @@ async fn send_message(
             .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
         deliver_local_message(
             &state,
-            &account_id,
+            &sender,
             envelope,
             &envelope_json,
             created_at,
@@ -1428,7 +1476,7 @@ async fn upload_media(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .trim();
-    if !valid_media_id(media_id) || conversation_id.is_empty() || conversation_id.len() > 256 {
+    if !valid_media_id(media_id) || !protocol::valid_identifier(conversation_id) {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_media_metadata"));
     }
     match state
@@ -1507,17 +1555,37 @@ async fn device_history(
     Json(request): Json<DeviceHistoryRequest>,
 ) -> Result<Json<DeviceHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
-    if request.entries.len() > 50 {
+    let Some(sender) = state
+        .db
+        .account_by_id(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    else {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    };
+    let history_size = request.entries.iter().try_fold(0usize, |size, entry| {
+        serde_json::to_vec(&entry.envelope)
+            .ok()
+            .and_then(|value| size.checked_add(value.len()))
+    });
+    if request.entries.len() > 50 || history_size.is_none_or(|size| size > MAX_ENVELOPE_BATCH_BYTES)
+    {
         return Err(error(StatusCode::BAD_REQUEST, "too_many_history_entries"));
     }
 
     let mut accepted = 0;
     for entry in request.entries {
         let envelope = &entry.envelope;
-        if entry.message_id != envelope.message_id
+        if !protocol::valid_identifier(&entry.message_id)
+            || !protocol::valid_identifier(&entry.conversation_id)
+            || entry.message_id != envelope.message_id
             || entry.conversation_id != envelope.conversation_id
             || !protocol::is_supported_envelope(envelope)
-            || envelope.ciphertext.len() > 1_500_000
+            || !envelope_belongs_to_account(envelope, &sender, &state.config.public_url)
+            || entry
+                .source_key_id
+                .as_deref()
+                .is_some_and(|value| !protocol::valid_identifier(value))
         {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_history_entry"));
         }
@@ -1572,9 +1640,11 @@ async fn device_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        conversation_response, enter_address_parts, is_embedded_app_origin, normalize_server,
-        origin, realtime_error_payload, realtime_hello_error, realtime_origin_allowed, same_server,
-        RealtimeEvent, RealtimeHello, RealtimeHub, REALTIME_PROTOCOL_VERSION,
+        conversation_response, enter_address_parts, envelope_belongs_to_account,
+        is_embedded_app_origin, normalize_server, origin, realtime_error_payload,
+        realtime_hello_error, realtime_origin_allowed, same_server, valid_envelope_batch,
+        RealtimeEvent, RealtimeHello, RealtimeHub, MAX_ENVELOPES_PER_MESSAGE,
+        REALTIME_PROTOCOL_VERSION,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -1596,6 +1666,75 @@ mod tests {
         assert!(enter_address_parts("alice@").is_none());
         assert!(enter_address_parts("@example.test").is_none());
         assert!(enter_address_parts("alice").is_none());
+        assert!(enter_address_parts("alice@example.test/path").is_none());
+        assert!(enter_address_parts("alice@evil@example.test").is_none());
+    }
+
+    #[test]
+    fn envelope_sender_must_match_authenticated_account() {
+        let account = super::storage::StoredAccount {
+            id: "account-1".to_owned(),
+            name: "Alice".to_owned(),
+            handle: "alice".to_owned(),
+            password_hash: "hash".to_owned(),
+        };
+        let envelope = super::protocol::EncryptedEnvelope {
+            protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
+            message_id: "message-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            sender: "alice@example.test".to_owned(),
+            recipient: "bob@example.test".to_owned(),
+            sender_device: "device-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            created_at: "2026-08-28T00:00:00Z".to_owned(),
+            nonce: "nonce".to_owned(),
+            ephemeral_public_key: "ephemeral".to_owned(),
+            ciphertext: "ciphertext".to_owned(),
+            associated_data: "aad".to_owned(),
+            signature: "signature".to_owned(),
+        };
+        assert!(envelope_belongs_to_account(
+            &envelope,
+            &account,
+            "https://example.test"
+        ));
+        let mut forged = envelope.clone();
+        forged.sender = "mallory@example.test".to_owned();
+        assert!(!envelope_belongs_to_account(
+            &forged,
+            &account,
+            "https://example.test"
+        ));
+        forged.sender = "alice@evil.example".to_owned();
+        assert!(!envelope_belongs_to_account(
+            &forged,
+            &account,
+            "https://example.test"
+        ));
+    }
+
+    #[test]
+    fn envelope_fanout_is_bounded() {
+        let envelope = super::protocol::EncryptedEnvelope {
+            protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
+            message_id: "message-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            sender: "alice@example.test".to_owned(),
+            recipient: "bob@example.test".to_owned(),
+            sender_device: "device-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            created_at: "2026-08-28T00:00:00Z".to_owned(),
+            nonce: "nonce".to_owned(),
+            ephemeral_public_key: "ephemeral".to_owned(),
+            ciphertext: "ciphertext".to_owned(),
+            associated_data: "aad".to_owned(),
+            signature: "signature".to_owned(),
+        };
+        assert!(valid_envelope_batch(std::slice::from_ref(&envelope)));
+        assert!(!valid_envelope_batch(&vec![
+            envelope;
+            MAX_ENVELOPES_PER_MESSAGE + 1
+        ]));
     }
 
     #[test]
@@ -1616,7 +1755,6 @@ mod tests {
                 unread: 0,
             },
             "server-id",
-            "https://current-host.example",
             100_000,
         );
         assert!(response.online);
@@ -1733,15 +1871,24 @@ async fn create_conversation(
     let peer_address = request.peer_address.trim();
     let name = request.name.trim();
     let avatar = request.avatar.trim();
-    if peer_address.is_empty()
-        || peer_address.len() > 320
-        || enter_address_parts(peer_address).is_none()
-        || name.is_empty()
-        || name.len() > 160
-        || avatar.is_empty()
-        || avatar.len() > 320
+    let Some((_, peer_server)) = enter_address_parts(peer_address) else {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_conversation"));
+    };
+    if peer_address.len() > 320
+        || !valid_display_text(name, 160)
+        || !valid_display_text(avatar, 320)
+        || request
+            .subtitle
+            .as_deref()
+            .is_some_and(|value| !valid_display_text(value, 320))
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_conversation"));
+    }
+    if !same_server(&state.config.public_url, peer_server) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "remote_conversations_not_supported",
+        ));
     }
     let conversation = state
         .db
@@ -1758,7 +1905,6 @@ async fn create_conversation(
     Ok(Json(conversation_response(
         conversation,
         &state.server_id,
-        &state.config.public_url,
         storage::now_ms(),
     )))
 }
@@ -1769,52 +1915,50 @@ async fn register_device_key(
     Json(request): Json<RegisterDeviceKeyRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
-    if request.device_id.trim().is_empty()
-        || request.key_id.trim().is_empty()
-        || request.encryption_public_key.trim().is_empty()
-        || request.signing_public_key.trim().is_empty()
-        || request.encryption_public_key.len() > 16_384
-        || request.signing_public_key.len() > 16_384
+    let device_id = request.device_id.trim();
+    let key_id = request.key_id.trim();
+    if !protocol::valid_identifier(device_id)
+        || !protocol::valid_identifier(key_id)
+        || !valid_key_material(request.encryption_public_key.trim())
+        || !valid_key_material(request.signing_public_key.trim())
+        || request.created_at <= 0
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_device_key"));
     }
+    let account_key = match (
+        request.account_key_id.as_deref(),
+        request.account_encryption_public_key.as_deref(),
+    ) {
+        (Some(key_id), Some(public_key))
+            if protocol::valid_identifier(key_id.trim())
+                && valid_key_material(public_key.trim()) =>
+        {
+            Some((key_id.trim().to_owned(), public_key.trim().to_owned()))
+        }
+        (None, None) => None,
+        _ => return Err(error(StatusCode::BAD_REQUEST, "invalid_account_key")),
+    };
     state
         .db
         .register_device_key(
             &account_id,
             &storage::StoredDeviceKey {
-                device_id: request.device_id,
-                key_id: request.key_id,
-                encryption_public_key: request.encryption_public_key,
-                signing_public_key: request.signing_public_key,
+                device_id: device_id.to_owned(),
+                key_id: key_id.to_owned(),
+                encryption_public_key: request.encryption_public_key.trim().to_owned(),
+                signing_public_key: request.signing_public_key.trim().to_owned(),
                 created_at: request.created_at,
             },
             storage::now_ms(),
         )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
-    match (
-        request.account_key_id.as_deref(),
-        request.account_encryption_public_key.as_deref(),
-    ) {
-        (Some(key_id), Some(public_key))
-            if !key_id.trim().is_empty()
-                && !public_key.trim().is_empty()
-                && public_key.len() <= 16_384 =>
-        {
-            state
-                .db
-                .register_account_key(
-                    &account_id,
-                    key_id.trim(),
-                    public_key.trim(),
-                    storage::now_ms(),
-                )
-                .await
-                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
-        }
-        (None, None) => {}
-        _ => return Err(error(StatusCode::BAD_REQUEST, "invalid_account_key")),
+    if let Some((key_id, public_key)) = account_key {
+        state
+            .db
+            .register_account_key(&account_id, &key_id, &public_key, storage::now_ms())
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     }
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
@@ -1830,7 +1974,12 @@ async fn public_keys(
         .as_deref()
         .map(|value| value.trim().trim_start_matches('@').to_lowercase())
         .filter(|value| !value.is_empty());
-    if requested_handle.is_empty() && search_prefix.is_none() {
+    if (!requested_handle.is_empty() && !protocol::valid_handle(&requested_handle))
+        || search_prefix
+            .as_deref()
+            .is_some_and(|value| !protocol::valid_handle(value))
+        || (requested_handle.is_empty() && search_prefix.is_none())
+    {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_handle"));
     }
     let Some(account) = match search_prefix.as_deref() {
@@ -1904,10 +2053,14 @@ async fn main() {
         .route("/server/logo", get(server_logo))
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
         .route("/api/v1/sync", get(sync))
         .route("/api/v1/realtime", get(realtime))
         .route("/api/v1/messages", post(send_message))
-        .route("/api/v1/media", post(upload_media))
+        .route(
+            "/api/v1/media",
+            post(upload_media).layer(DefaultBodyLimit::max(max_media_body)),
+        )
         .route("/api/v1/media/:media_id", get(download_media))
         .route(
             "/api/v1/conversations/:conversation_id/read",
@@ -1922,9 +2075,8 @@ async fn main() {
         .route("/api/v1/conversations", post(create_conversation))
         .route("/enter/v1/keys", post(register_device_key))
         .route("/enter/v1/keys/:handle", get(public_keys))
-        .route("/enter/v1/federation/deliveries", post(federation_delivery))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(max_media_body))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(CorsLayer::permissive());
     let listener = tokio::net::TcpListener::bind(config.address)
         .await

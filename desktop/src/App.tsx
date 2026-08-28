@@ -9,7 +9,7 @@ import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKey
 import { encryptMedia, isAudioAttachment } from "./lib/media";
 import type { PendingMedia } from "./components/message-composer";
 import { formatMessageTime, makeId } from "./lib/utils";
-import { migrateLocalServerAddress } from "./lib/server-address";
+import { migrateLocalServerAddress, normalizeServerAddress } from "./lib/server-address";
 import { createRealtimeQueue, createSyncQueue } from "./lib/sync-queue";
 import { notifyIncomingMessage, subscribeToNotificationActions } from "./lib/notifications";
 import type { Conversation, Message, OutboxEntry, Profile } from "./types";
@@ -18,6 +18,9 @@ const LEGACY_OUTBOX_KEY = "enter-outbox";
 const OUTBOX_KEY_PREFIX = "enter-outbox:";
 const ALL_FOLDER = "all";
 const DEFAULT_FOLDER = "Личное";
+const MAX_DECRYPT_RETRIES = 3;
+const MAX_OUTBOX_ENTRIES = 100;
+const MAX_OUTBOX_ATTEMPTS = 5;
 
 function folderNames(conversations: Conversation[]) {
   return [...new Set([DEFAULT_FOLDER, ...conversations.map((conversation) => conversation.folder).filter((folder): folder is string => Boolean(folder))])];
@@ -32,14 +35,31 @@ function messagePreview(message: Message) {
   return attachments.length > 0 ? "[Файлы]" : "";
 }
 
+function isStoredProfile(value: unknown): value is Profile {
+  if (!value || typeof value !== "object") return false;
+  const profile = value as Partial<Profile>;
+  return typeof profile.id === "string"
+    && typeof profile.name === "string"
+    && typeof profile.handle === "string"
+    && typeof profile.server === "string"
+    && typeof profile.color === "string"
+    && typeof profile.token === "string"
+    && profile.token.length > 0;
+}
+
 function readProfiles() {
   try {
     const stored = localStorage.getItem("enter-profiles");
     const parsed = stored ? JSON.parse(stored) : null;
     if (!Array.isArray(parsed)) return [];
-    const profiles = (parsed as Profile[]).filter((profile) => typeof profile?.token === "string" && profile.token.length > 0);
-    const migrated = profiles.map((profile) => ({ ...profile, server: migrateLocalServerAddress(profile.server) }));
-    if (migrated.some((profile, index) => profile.server !== profiles[index].server)) localStorage.setItem("enter-profiles", JSON.stringify(migrated));
+    const profiles = parsed.filter(isStoredProfile);
+    const migrated = profiles.map((profile) => {
+      const server = normalizeServerAddress(migrateLocalServerAddress(profile.server));
+      return server ? { ...profile, server } : null;
+    }).filter((profile): profile is Profile => profile !== null);
+    if (migrated.length !== profiles.length || migrated.some((profile, index) => profile.server !== profiles[index]?.server)) {
+      try { localStorage.setItem("enter-profiles", JSON.stringify(migrated)); } catch { /* Keep valid profiles in memory. */ }
+    }
     return migrated;
   } catch {
     return [];
@@ -50,17 +70,50 @@ function profileAddress(profile: Profile) {
   return `${profile.handle.replace(/^@+/, "")}@${profile.server.replace(/^https?:\/\//, "")}`;
 }
 
+function isStoredOutboxEntry(value: unknown): value is OutboxEntry {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Partial<OutboxEntry>;
+  const message = entry.message as Partial<Message> | undefined;
+  return typeof entry.id === "string"
+    && typeof entry.conversationId === "string"
+    && Boolean(message)
+    && typeof message?.id === "string"
+    && (message.author === "me" || message.author === "them")
+    && typeof message.text === "string"
+    && typeof message.time === "string"
+    && typeof entry.attempts === "number"
+    && Number.isFinite(entry.attempts)
+    && entry.attempts >= 0
+    && typeof entry.nextAttemptAt === "number"
+    && Number.isFinite(entry.nextAttemptAt);
+}
+
+function sanitizeOutbox(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(isStoredOutboxEntry)
+    .filter((entry) => entry.attempts < MAX_OUTBOX_ATTEMPTS)
+    .map((entry) => ({ ...entry, attempts: Math.floor(entry.attempts) }))
+    .slice(-MAX_OUTBOX_ENTRIES);
+}
+
 function readOutbox(): Record<string, OutboxEntry[]> {
   const outbox: Record<string, OutboxEntry[]> = {};
   try {
     const legacy = JSON.parse(localStorage.getItem(LEGACY_OUTBOX_KEY) ?? "{}");
-    if (legacy && typeof legacy === "object") Object.assign(outbox, legacy as Record<string, OutboxEntry[]>);
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      for (const [profileId, entries] of Object.entries(legacy)) {
+        const sanitized = sanitizeOutbox(entries);
+        if (sanitized.length > 0) outbox[profileId] = sanitized;
+      }
+    }
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index);
       if (!key?.startsWith(OUTBOX_KEY_PREFIX)) continue;
       const profileId = key.slice(OUTBOX_KEY_PREFIX.length);
       const parsed = JSON.parse(localStorage.getItem(key) ?? "[]");
-      if (profileId && Array.isArray(parsed)) outbox[profileId] = parsed as OutboxEntry[];
+      const sanitized = sanitizeOutbox(parsed);
+      if (profileId && sanitized.length > 0) outbox[profileId] = sanitized;
     }
   } catch {
     // Outbox recovery must not block app startup.
@@ -71,7 +124,7 @@ function readOutbox(): Record<string, OutboxEntry[]> {
 function readOutboxProfile(profileId: string) {
   try {
     const parsed = JSON.parse(localStorage.getItem(`${OUTBOX_KEY_PREFIX}${profileId}`) ?? "[]");
-    return Array.isArray(parsed) ? parsed as OutboxEntry[] : [];
+    return sanitizeOutbox(parsed);
   } catch {
     return [];
   }
@@ -204,6 +257,23 @@ export default function App() {
   const cacheUpdatedAtRef = useRef<Record<string, number>>(Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id)?.updatedAt ?? 0])));
   const skipNextCacheWriteRef = useRef(false);
   const persistedOutboxProfilesRef = useRef(new Set(Object.keys(outboxByProfile)));
+  const mediaOperationRef = useRef(0);
+  const mediaAbortRef = useRef<AbortController | null>(null);
+
+  function cancelMediaOperation() {
+    mediaOperationRef.current += 1;
+    mediaAbortRef.current?.abort();
+    mediaAbortRef.current = null;
+    setMediaUploadProgress(null);
+  }
+
+  function setOutboxProfile(profileId: string, entries: OutboxEntry[]) {
+    const next = { ...outboxRef.current };
+    if (entries.length > 0) next[profileId] = entries;
+    else delete next[profileId];
+    outboxRef.current = next;
+    setOutboxByProfile(next);
+  }
 
   function persistMessageCache(profileId: string, profileMessages: Record<string, Message[]>, cursor: number, profileConversations: Conversation[]) {
     cacheUpdatedAtRef.current[profileId] = writeMessageCache(profileId, profileMessages, cursor, profileConversations);
@@ -411,12 +481,17 @@ export default function App() {
     const historySyncSent = new Map<string, Set<string>>();
     const profile = activeProfile;
     const senderDeviceCache = new Map<string, Promise<PublicDeviceKey[]>>();
+    const decryptAttempts = new Map<string, number>();
+    const quarantinedMessageIds = new Set<string>();
 
     function senderDevicesFor(address: string) {
       const cached = senderDeviceCache.get(address);
       if (cached) return cached;
       const request = fetchPublicDeviceKeys(profile, address);
       senderDeviceCache.set(address, request);
+      void request.catch(() => {
+        if (senderDeviceCache.get(address) === request) senderDeviceCache.delete(address);
+      });
       return request;
     }
 
@@ -441,7 +516,7 @@ export default function App() {
       } catch (reason) {
         nextPrepareAt = Date.now() + 5000;
         if (isUnauthorized(reason)) {
-          setMessageError("РЎРµСЃСЃРёСЏ СЃРµСЂРІРµСЂР° РёСЃС‚РµРєР»Р°. Р’РѕР№РґРёС‚Рµ СЃРЅРѕРІР°");
+          setMessageError("Сессия сервера истекла. Войдите снова");
           setShowAuth(true);
         }
         return null;
@@ -553,15 +628,32 @@ export default function App() {
       if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
       const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
       const deviceMessages = result.messages.filter((message) => ownKeyIds.has(message.envelope.key_id));
+      let quarantinedCount = 0;
+      const retryingFailures: string[] = [];
       const decryptedMessages = (await Promise.all(deviceMessages.map(async (message) => {
+        const messageId = message.envelope.message_id;
+        if (quarantinedMessageIds.has(messageId)) {
+          quarantinedCount += 1;
+          return null;
+        }
         try {
           const senderDevices = await senderDevicesFor(message.envelope.sender);
-          return { conversationId: message.conversationId, message: await decryptRemoteMessage(profile, message, senderDevices) };
+          const decrypted = await decryptRemoteMessage(profile, message, senderDevices);
+          decryptAttempts.delete(messageId);
+          return { conversationId: message.conversationId, message: decrypted };
         } catch {
+          const attempts = (decryptAttempts.get(messageId) ?? 0) + 1;
+          if (attempts >= MAX_DECRYPT_RETRIES) {
+            quarantinedMessageIds.add(messageId);
+            decryptAttempts.delete(messageId);
+            quarantinedCount += 1;
+          } else {
+            decryptAttempts.set(messageId, attempts);
+            retryingFailures.push(messageId);
+          }
           return null;
         }
       }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
-      const decryptFailures = deviceMessages.length - decryptedMessages.length;
       if (cancelled) return false;
       const acknowledged = [...new Set(decryptedMessages
         .filter(({ message }) => message.author === "them")
@@ -577,12 +669,16 @@ export default function App() {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decryptedMessages), result.readReceipts), result.deliveryReceipts) };
       });
-      if (decryptFailures === 0) advanceCursor(Math.max(cursor, result.nextCursor));
-      setMessageError(decryptFailures > 0 ? `Не удалось расшифровать ${decryptFailures} сообщений. Курсор не сдвинут, синхронизация повторится.` : "");
+      if (retryingFailures.length === 0) advanceCursor(Math.max(cursor, result.nextCursor));
+      setMessageError(retryingFailures.length > 0
+        ? `Не удалось расшифровать ${retryingFailures.length} сообщений. Повторю попытку (осталось ${MAX_DECRYPT_RETRIES - Math.max(...retryingFailures.map((messageId) => decryptAttempts.get(messageId) ?? 0))}).`
+        : quarantinedCount > 0
+          ? `Пропущено ${quarantinedCount} сообщений, которые не удалось расшифровать после ${MAX_DECRYPT_RETRIES} попыток.`
+          : "");
       void backfillHistoryToAccount();
       void backfillHistoryToDevices();
       void retryOutboxForProfile(profile.id);
-      return decryptFailures === 0;
+      return retryingFailures.length === 0;
     }
 
     const syncOnce = createSyncQueue(async () => {
@@ -752,7 +848,15 @@ export default function App() {
     const nextProfile = { ...profile, deviceId: device.deviceId };
     const nextProfiles = [...profiles.filter((item) => item.id !== nextProfile.id), nextProfile];
     setProfiles(nextProfiles);
-    localStorage.setItem("enter-profiles", JSON.stringify(nextProfiles));
+    try {
+      localStorage.setItem("enter-profiles", JSON.stringify(nextProfiles));
+    } catch {
+      throw new Error("Не удалось сохранить профиль на этом устройстве");
+    }
+    const pendingEntries = outboxRef.current[nextProfile.id] ?? [];
+    if (pendingEntries.some((entry) => entry.blocked)) {
+      setOutboxProfile(nextProfile.id, pendingEntries.map((entry) => ({ ...entry, blocked: undefined, attempts: 0, nextAttemptAt: Date.now() })));
+    }
     setActiveProfileId(nextProfile.id);
     const cached = readMessageCache(nextProfile.id);
     setMessagesByProfile((current) => ({ ...current, [nextProfile.id]: cached?.messages ?? EMPTY_MESSAGES }));
@@ -766,9 +870,12 @@ export default function App() {
   }
 
   async function removeProfile(profile: Profile) {
+    if (activeProfileId === profile.id) cancelMediaOperation();
     const nextProfiles = profiles.filter((item) => item.id !== profile.id);
     setProfiles(nextProfiles);
-    localStorage.setItem("enter-profiles", JSON.stringify(nextProfiles));
+    try {
+      localStorage.setItem("enter-profiles", JSON.stringify(nextProfiles));
+    } catch { /* Keep the in-memory removal; reload will restore the profile. */ }
     clearMessageCache(profile.id);
     void deleteDeviceKeys(profile.id).catch(() => undefined);
     setMessagesByProfile((current) => {
@@ -851,45 +958,71 @@ export default function App() {
   }
 
   function queueOutbox(profileId: string, conversationId: string, message: Message) {
-    setOutboxByProfile((current) => {
-      const entries = current[profileId] ?? [];
-      if (entries.some((entry) => entry.id === message.id)) return current;
-      return { ...current, [profileId]: [...entries, { id: message.id, conversationId, message: { ...message, deliveryStatus: undefined }, attempts: 0, nextAttemptAt: Date.now() }] };
-    });
+    const entries = outboxRef.current[profileId] ?? [];
+    if (entries.some((entry) => entry.id === message.id)) return true;
+    if (entries.length >= MAX_OUTBOX_ENTRIES) return false;
+    setOutboxProfile(profileId, [...entries, { id: message.id, conversationId, message: { ...message, deliveryStatus: undefined }, attempts: 0, nextAttemptAt: Date.now() }]);
+    return true;
   }
 
   function removeOutbox(profileId: string, messageId: string) {
-    setOutboxByProfile((current) => {
-      const entries = (current[profileId] ?? []).filter((entry) => entry.id !== messageId);
-      return entries.length === (current[profileId] ?? []).length ? current : { ...current, [profileId]: entries };
-    });
+    const current = outboxRef.current[profileId] ?? [];
+    const entries = current.filter((entry) => entry.id !== messageId);
+    if (entries.length !== current.length) setOutboxProfile(profileId, entries);
   }
 
-  function failOutbox(profileId: string, messageId: string) {
-    setOutboxByProfile((current) => {
-      const entries = (current[profileId] ?? []).map((entry) => entry.id === messageId ? { ...entry, attempts: entry.attempts + 1, nextAttemptAt: Date.now() + retryDelay(entry.attempts + 1) } : entry);
-      return { ...current, [profileId]: entries };
-    });
+  function failOutbox(profileId: string, messageId: string, blocked = false) {
+    const current = outboxRef.current[profileId] ?? [];
+    const entry = current.find((item) => item.id === messageId);
+    if (!entry) return 0;
+    const attempts = entry.attempts + 1;
+    const entries = blocked
+      ? current.map((item) => item.id === messageId ? { ...item, attempts, blocked: true, nextAttemptAt: Number.MAX_SAFE_INTEGER } : item)
+      : attempts >= MAX_OUTBOX_ATTEMPTS
+        ? current.filter((item) => item.id !== messageId)
+        : current.map((item) => item.id === messageId ? { ...item, attempts, nextAttemptAt: Date.now() + retryDelay(attempts) } : item);
+    setOutboxProfile(profileId, entries);
+    return attempts;
   }
 
   async function sendMessageToConversation(conversationId: string, message: Message, pendingMedia: PendingMedia[] = [], fromOutbox = false) {
     if (!activeProfileId || !activeProfile) return;
     const profile = activeProfile;
     const conversation = conversations.find((item) => item.id === conversationId || (conversationId === "favorites" && item.handle === "favorites"));
-    if (!conversation || conversation.canWrite === false) return;
+    if (!conversation || conversation.canWrite === false) {
+      if (fromOutbox) removeOutbox(profile.id, message.id);
+      else setMessageError("Этот чат больше недоступен для отправки");
+      return;
+    }
     const targetConversationId = conversation.id;
     const isEdit = Boolean(message.editOf);
     setMessageError("");
     const hasPendingMedia = pendingMedia.length > 0 && !fromOutbox;
+    if (!fromOutbox && !hasPendingMedia && !queueOutbox(profile.id, targetConversationId, message)) {
+      setMessageError("Очередь отправки переполнена. Дождитесь отправки предыдущих сообщений.");
+      return;
+    }
+    if (!fromOutbox && hasPendingMedia && (outboxRef.current[profile.id]?.length ?? 0) >= MAX_OUTBOX_ENTRIES) {
+      setMessageError("Очередь отправки переполнена. Дождитесь отправки предыдущих сообщений.");
+      return;
+    }
+    const mediaOperation = hasPendingMedia ? ++mediaOperationRef.current : null;
+    const mediaController = hasPendingMedia ? new AbortController() : null;
+    if (mediaController) {
+      mediaAbortRef.current?.abort();
+      mediaAbortRef.current = mediaController;
+    }
+    const updateMediaProgress = (progress: number) => {
+      if (mediaOperation === mediaOperationRef.current) setMediaUploadProgress(progress);
+    };
     if (hasPendingMedia) setMediaUploadProgress(0);
-    if (!hasPendingMedia) queueOutbox(activeProfile.id, targetConversationId, message);
     if (fromOutbox) {
-      updateLocalMessage(activeProfile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "pending" }));
+      updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "pending" }));
     } else if (!isEdit && !hasPendingMedia) {
       const pendingMessage = { ...message, deliveryStatus: "pending" } satisfies Message;
       setMessagesByProfile((current) => {
-        const profileMessages = current[activeProfile.id] ?? EMPTY_MESSAGES;
-        return { ...current, [activeProfile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
+        const profileMessages = current[profile.id] ?? EMPTY_MESSAGES;
+        return { ...current, [profile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
       });
       setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(message), time: message.time } : item));
     }
@@ -904,6 +1037,7 @@ export default function App() {
       const recipientDevices = isDirectConversation ? fetchedRecipientDevices : ownDevices;
       const recipientAccount = isDirectConversation ? fetchedRecipientAccount : account;
       const recipients = [recipientAccount, ...recipientDevices, ...ownDevices].filter((device): device is PublicDeviceKey | PublicAccountKey => Boolean(device)).filter((device, index, devices) => devices.findIndex((item) => item.keyId === device.keyId) === index);
+      if (recipients.length === 0) throw new Error("Не найдены ключи получателя");
       const mediaRecipient = recipients[0]?.address;
       if (hasPendingMedia && !mediaRecipient) throw new Error("Не найден получатель вложения");
       let uploadedAttachments = message.attachments;
@@ -911,19 +1045,19 @@ export default function App() {
         uploadedAttachments = [];
         for (const [index, { file }] of pendingMedia.entries()) {
           const encrypted = await encryptMedia(file);
-          await uploadMedia(profile, targetConversationId, encrypted.attachment.id, mediaRecipient!, encrypted.ciphertext, (progress) => setMediaUploadProgress(Math.round(((index + progress / 100) / pendingMedia.length) * 100)));
+          await uploadMedia(profile, targetConversationId, encrypted.attachment.id, mediaRecipient!, encrypted.ciphertext, (progress) => updateMediaProgress(Math.round(((index + progress / 100) / pendingMedia.length) * 100)), mediaController?.signal);
           uploadedAttachments.push(encrypted.attachment);
         }
-        setMediaUploadProgress(100);
+        updateMediaProgress(100);
       }
       const messageToSend: Message = uploadedAttachments ? { ...message, attachments: uploadedAttachments } : message;
       if (hasPendingMedia) {
-        queueOutbox(activeProfile.id, targetConversationId, messageToSend);
+        if (!queueOutbox(profile.id, targetConversationId, messageToSend)) throw new Error("OUTBOX_FULL");
         if (!isEdit) {
           const pendingMessage = { ...messageToSend, deliveryStatus: "pending" } satisfies Message;
           setMessagesByProfile((current) => {
-            const profileMessages = current[activeProfile.id] ?? EMPTY_MESSAGES;
-            return { ...current, [activeProfile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
+            const profileMessages = current[profile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [profile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
           });
           setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(messageToSend), time: messageToSend.time } : item));
         }
@@ -936,17 +1070,31 @@ export default function App() {
       updateLocalMessage(profile.id, targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage, time: formatMessageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
       removeOutbox(profile.id, messageToSend.id);
       setMessageError("");
-      setMediaUploadProgress(null);
+      if (mediaOperation === mediaOperationRef.current) {
+        if (mediaAbortRef.current === mediaController) mediaAbortRef.current = null;
+        setMediaUploadProgress(null);
+      }
     } catch (reason) {
-      setMediaUploadProgress(null);
+      if (hasPendingMedia && mediaOperation !== mediaOperationRef.current) return;
+      if (mediaOperation === mediaOperationRef.current) {
+        if (mediaAbortRef.current === mediaController) mediaAbortRef.current = null;
+        setMediaUploadProgress(null);
+      }
+      if (reason instanceof Error && reason.message === "OUTBOX_FULL") {
+        setMessageError("Очередь отправки переполнена. Дождитесь отправки предыдущих сообщений.");
+        return;
+      }
       updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "failed" }));
-      failOutbox(profile.id, message.id);
       if (isUnauthorized(reason)) {
+        failOutbox(profile.id, message.id, true);
         setShowAuth(true);
         setMessageError("Сессия сервера истекла. Войдите снова");
         return;
       }
-      setMessageError(hasPendingMedia ? "Не удалось загрузить вложение. Сообщение не отправлено." : "Сообщение сохранено локально. Повторю отправку после восстановления соединения.");
+      const attempts = failOutbox(profile.id, message.id);
+      setMessageError(attempts >= MAX_OUTBOX_ATTEMPTS
+        ? "Сообщение не отправлено после нескольких попыток и удалено из очереди."
+        : hasPendingMedia ? "Не удалось загрузить вложение. Сообщение не отправлено." : "Сообщение сохранено локально. Повторю отправку после восстановления соединения.");
     }
   }
 
@@ -954,7 +1102,7 @@ export default function App() {
     if (activeProfileId !== profileId) return;
     const now = Date.now();
     for (const entry of outboxRef.current[profileId] ?? []) {
-      if (entry.nextAttemptAt > now || retryingOutbox.current.has(entry.id)) continue;
+      if (entry.blocked || entry.attempts >= MAX_OUTBOX_ATTEMPTS || entry.nextAttemptAt > now || retryingOutbox.current.has(entry.id)) continue;
       retryingOutbox.current.add(entry.id);
       void sendMessageToConversation(entry.conversationId, entry.message, [], true).finally(() => retryingOutbox.current.delete(entry.id));
     }
@@ -1072,6 +1220,7 @@ export default function App() {
   }
 
   function selectProfile(profile: Profile) {
+    if (profile.id !== activeProfileId) cancelMediaOperation();
     if (activeProfileId) persistMessageCache(activeProfileId, messagesByProfile[activeProfileId] ?? EMPTY_MESSAGES, syncCursors[activeProfileId] ?? 0, conversations);
     const cached = readMessageCache(profile.id);
     setActiveProfileId(profile.id);

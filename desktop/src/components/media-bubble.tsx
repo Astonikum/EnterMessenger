@@ -68,9 +68,27 @@ function MediaViewer({ url, attachment, onClose }: { url: string; attachment: Me
   const [speed, setSpeed] = useState(1);
   const [speedOpen, setSpeedOpen] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [playbackError, setPlaybackError] = useState(false);
   const speedMenuRef = useRef<HTMLDivElement>(null);
   const zoomable = attachment.kind === "image" || attachment.kind === "video";
   const playable = attachment.kind === "video" || attachment.kind === "audio";
+
+  useEffect(() => {
+    setPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setPlaybackError(false);
+  }, [url]);
+
+  useEffect(() => () => { mediaRef.current?.pause(); }, []);
+
+  function playMedia(media: HTMLMediaElement) {
+    setPlaybackError(false);
+    void media.play().catch(() => {
+      setPlaying(false);
+      setPlaybackError(true);
+    });
+  }
 
   useEffect(() => {
     if (!mediaSize) return;
@@ -119,7 +137,7 @@ function MediaViewer({ url, attachment, onClose }: { url: string; attachment: Me
 
   const togglePlayback = () => {
     if (!mediaRef.current) return;
-    if (mediaRef.current.paused) void mediaRef.current.play();
+    if (mediaRef.current.paused) playMedia(mediaRef.current);
     else mediaRef.current.pause();
   };
 
@@ -130,10 +148,10 @@ function MediaViewer({ url, attachment, onClose }: { url: string; attachment: Me
   };
 
   const content = attachment.kind === "image"
-    ? <img src={url} alt={attachment.name} onLoad={(event) => setMediaSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
-    : attachment.kind === "video"
-      ? <video ref={(node) => { mediaRef.current = node; }} src={url} autoPlay playsInline onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setMediaSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight }); }} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
-      : <div className="flex w-[min(36rem,80vw)] flex-col items-center gap-3 rounded-3xl bg-white/10 px-8 py-10 text-center backdrop-blur-xl"><div className="grid size-16 place-items-center rounded-2xl bg-white/10"><Icon name="mic" className="size-8 text-white/80" /></div><p className="max-w-full truncate text-sm font-medium text-white">{attachment.name}</p><audio ref={(node) => { mediaRef.current = node; }} src={url} autoPlay onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} className="sr-only" /></div>;
+      ? <img src={url} alt={attachment.name} onLoad={(event) => setMediaSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
+      : attachment.kind === "video"
+      ? <video ref={(node) => { mediaRef.current = node; }} src={url} playsInline onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setMediaSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight }); playMedia(event.currentTarget); }} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
+      : <div className="flex w-[min(36rem,80vw)] flex-col items-center gap-3 rounded-3xl bg-white/10 px-8 py-10 text-center backdrop-blur-xl"><div className="grid size-16 place-items-center rounded-2xl bg-white/10"><Icon name="mic" className="size-8 text-white/80" /></div><p className="max-w-full truncate text-sm font-medium text-white">{attachment.name}</p><audio ref={(node) => { mediaRef.current = node; }} src={url} onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); playMedia(event.currentTarget); }} className="sr-only" /></div>;
   const mediaKind = attachment.kind === "image" ? "Фото" : attachment.kind === "video" ? "Видео" : "Аудио";
   return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
     <DialogContent aria-label={`Просмотр: ${attachment.name}`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -143,6 +161,7 @@ function MediaViewer({ url, attachment, onClose }: { url: string; attachment: Me
         {content}
         {playable && <div className="absolute bottom-4 left-1/2 z-10 flex w-[min(52rem,calc(100vw-2rem))] -translate-x-1/2 flex-col gap-2 rounded-2xl bg-black/65 px-3 py-2.5 shadow-2xl shadow-black/30 backdrop-blur-xl" onWheel={(event) => event.stopPropagation()}>
           <input aria-label="Позиция воспроизведения" title="Позиция воспроизведения" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => seek(Number(event.target.value))} className="h-1.5 w-full cursor-pointer accent-[#b3a4ff]" />
+          {playbackError && <span role="status" className="text-xs text-red-200">Не удалось воспроизвести файл. Нажмите ▶ для повтора.</span>}
           <div className="flex items-center gap-2">
             <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-xl text-white/85 hover:bg-white/15 hover:text-white" title={playing ? "Пауза" : "Воспроизвести"} aria-label={playing ? "Пауза" : "Воспроизвести"} onClick={togglePlayback}><Icon name={playing ? "pause" : "play"} className="size-4" /></Button>
             <span className="min-w-20 text-xs tabular-nums text-white/70">{formatTime(currentTime)} / {formatTime(duration)}</span>
@@ -185,17 +204,24 @@ function AudioBubble({ attachment, url, grouped, className, contextProps }: { at
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(initialDuration);
+  const [playbackError, setPlaybackError] = useState(false);
 
   useEffect(() => {
     setPlaying(false);
     setCurrentTime(0);
     setDuration(initialDuration);
+    setPlaybackError(false);
   }, [initialDuration, url]);
+
+  useEffect(() => () => { audioRef.current?.pause(); }, []);
 
   function togglePlayback() {
     const audio = audioRef.current;
     if (!audio) return;
-    if (audio.paused) void audio.play().catch(() => setPlaying(false));
+    if (audio.paused) {
+      setPlaybackError(false);
+      void audio.play().catch(() => { setPlaying(false); setPlaybackError(true); });
+    }
     else audio.pause();
   }
 
@@ -208,7 +234,7 @@ function AudioBubble({ attachment, url, grouped, className, contextProps }: { at
 
   const progress = duration > 0 ? Math.min(1, currentTime / duration) : 0;
   return <div {...contextProps} className={cn("flex min-w-60 items-center gap-2.5 rounded-xl bg-background/15 px-3 py-2.5 text-left transition-colors hover:bg-background/25", grouped && "h-full min-w-0 px-2", className)}>
-    <audio ref={audioRef} src={url} preload="metadata" className="sr-only" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : initialDuration)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} aria-label={attachment.name} />
+    <audio ref={audioRef} src={url} preload="metadata" className="sr-only" onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : initialDuration)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} aria-label={attachment.name} />
     <Button type="button" variant="ghost" size="icon" className="size-9 shrink-0 rounded-full bg-foreground/10 text-current hover:bg-foreground/20" title={playing ? "Пауза" : "Воспроизвести"} aria-label={playing ? `Поставить на паузу: ${attachment.name}` : `Воспроизвести: ${attachment.name}`} onClick={togglePlayback}><Icon name={playing ? "pause" : "play"} className="size-4" /></Button>
     <div className="min-w-0 flex-1">
       <div className="flex items-center gap-2 text-xs"><span className="min-w-0 flex-1 truncate font-medium">{attachment.name}</span><span className="shrink-0 tabular-nums opacity-70">{formatTime(currentTime)} / {formatTime(duration)}</span></div>
@@ -217,6 +243,7 @@ function AudioBubble({ attachment, url, grouped, className, contextProps }: { at
         <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center gap-0.5 overflow-hidden" style={{ width: `${progress * 100}%` }}>{audioWaveform.map((height, index) => <span key={index} className="w-0.5 shrink-0 rounded-full bg-current" style={{ height }} />)}</div>
         <input aria-label={`Позиция аудио: ${attachment.name}`} title="Позиция аудио" type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => seek(Number(event.target.value))} className="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
       </div>
+      {playbackError && <span role="status" className="block text-[0.6875rem] text-red-200">Не удалось воспроизвести</span>}
       <span className="block text-[0.6875rem] opacity-60">Аудио · {formatFileSize(attachment.size)}</span>
     </div>
     <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-current/65 hover:bg-foreground/10 hover:text-current" title="Сохранить аудио" aria-label={`Сохранить ${attachment.name}`} onClick={() => downloadObjectUrl(url, attachment.name)}><Icon name="download" className="size-4" /></Button>
@@ -227,23 +254,25 @@ export function MediaBubble({ profile, attachment, grouped = false, className, o
   const [url, setUrl] = useState<string>();
   const [error, setError] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
+  const profileKey = profile ? `${profile.id}:${profile.server}:${profile.token}` : "";
 
   useEffect(() => {
     let disposed = false;
+    const controller = new AbortController();
     let objectUrl: string | undefined;
     setUrl(undefined);
     setError(false);
     if (!profile) return () => undefined;
-    void downloadMedia(profile, attachment.id)
+    void downloadMedia(profile, attachment.id, controller.signal)
       .then((ciphertext) => decryptMedia(ciphertext, attachment))
       .then((plaintext) => {
         if (disposed) return;
-        objectUrl = URL.createObjectURL(new Blob([plaintext.buffer as ArrayBuffer], { type: attachment.mimeType }));
+        objectUrl = URL.createObjectURL(new Blob([plaintext.slice().buffer as ArrayBuffer], { type: attachment.mimeType }));
         setUrl(objectUrl);
       })
       .catch(() => { if (!disposed) setError(true); });
-    return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [attachment, profile]);
+    return () => { disposed = true; controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [attachment.id, attachment.key, attachment.nonce, attachment.sha256, attachment.mimeType, profileKey]);
 
   if (error) return <div className={cn("rounded-xl border border-destructive/30 bg-background/20 px-3 py-2 text-xs", className)}>Не удалось загрузить вложение</div>;
   if (!url) return <div className={cn("flex min-h-16 min-w-44 items-center gap-2 rounded-xl bg-background/15 px-3 py-2 text-xs text-current/70", grouped && "h-full min-w-0 justify-center", className)}><Icon name="progress_activity" className="size-4 animate-spin" />{!grouped && "Загрузка вложения…"}</div>;

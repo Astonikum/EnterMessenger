@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "self-check": "node --no-warnings --experimental-strip-types scripts/self-check.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "server": "cargo run --manifest-path ../server/Cargo.toml",

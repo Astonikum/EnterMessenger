@@ -66,6 +66,11 @@ function findBalanced(input, start, opening = "{", closing = "}") {
       continue;
     }
 
+    if (character === "/" && looksLikeRegex(input, index)) {
+      index = skipRegex(input, index) - 1;
+      continue;
+    }
+
     if (character === opening) {
       depth += 1;
     } else if (character === closing) {
@@ -192,7 +197,7 @@ function parseDeclaration(raw, index, start, end, marker = PREVIEW_MARKER) {
     };
   }
 
-  const targetMatch = /^(default|[A-Za-z_$][\w$]*)/.exec(input);
+  const targetMatch = /^(default\b|[A-Za-z_$][\w$]*)/.exec(input);
   if (!targetMatch) {
     throw new Error("Ожидалось имя экспортируемого React-компонента или JSX-тело");
   }
@@ -230,7 +235,7 @@ function getCommentPreview(text, commentStart, contentStart, commentEnd) {
 
 function looksLikeRegex(text, index) {
   const before = text.slice(0, index).match(/(?:^|[([{=,:;!&|?+\-*%^~])\s*$/);
-  return Boolean(before);
+  return Boolean(before) || /\b(?:case|delete|do|else|in|instanceof|of|return|throw|typeof|void|yield)\s*$/.test(text.slice(0, index));
 }
 
 function skipRegex(text, start) {
@@ -318,4 +323,3 @@ function parsePreviews(text) {
 }
 
 module.exports = { parsePreviews };
-

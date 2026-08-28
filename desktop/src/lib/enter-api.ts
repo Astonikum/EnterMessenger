@@ -1,9 +1,12 @@
 import { formatMessageTime } from "./utils";
-import { formatEnterAddress, parseEnterAddress, type EncryptedEnvelope } from "./enter-protocol";
+import { ENTER_PROTOCOL_VERSION, formatEnterAddress, parseEnterAddress, type EncryptedEnvelope } from "./enter-protocol";
+import { normalizeServerAddress } from "./server-address";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
 import type { Conversation, Message, Profile } from "../types";
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_ENVELOPE_CIPHERTEXT_LENGTH = 2_000_000;
+const MAX_SYNC_ITEMS = 1_000;
 
 export type RemoteConversation = {
   id: string;
@@ -80,6 +83,142 @@ type PublicKeyDirectoryResponse = {
   accountKey?: { keyId: string; encryptionPublicKey: string };
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isString(value: unknown, maxLength = 4096): value is string {
+  return typeof value === "string" && value.length <= maxLength;
+}
+
+function isDeviceKeyBundle(value: unknown): value is DeviceKeyBundle {
+  if (!isRecord(value)) return false;
+  return isString(value.deviceId, 256)
+    && isString(value.keyId, 256)
+    && isString(value.encryptionPublicKey, 16_384)
+    && isString(value.signingPublicKey, 16_384)
+    && typeof value.createdAt === "number"
+    && Number.isFinite(value.createdAt);
+}
+
+function isEnvelope(value: unknown): value is EncryptedEnvelope {
+  if (!isRecord(value) || value.protocol !== ENTER_PROTOCOL_VERSION) return false;
+  return ["message_id", "conversation_id", "sender", "recipient", "sender_device", "key_id", "created_at", "nonce", "ephemeral_public_key", "ciphertext", "associated_data", "signature"]
+    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENVELOPE_CIPHERTEXT_LENGTH : 4096));
+}
+
+function isRemoteConversation(value: unknown): value is RemoteConversation {
+  return isRecord(value)
+    && isString(value.id, 256)
+    && (value.serverId === undefined || isString(value.serverId, 256))
+    && isString(value.name, 256)
+    && (value.handle === undefined || value.handle === null || isString(value.handle, 512))
+    && isString(value.avatar, 2048)
+    && (value.subtitle === undefined || value.subtitle === null || isString(value.subtitle, 512))
+    && typeof value.canWrite === "boolean"
+    && isString(value.lastMessage, 2_000_000)
+    && (value.lastMessageAt === undefined || value.lastMessageAt === null || typeof value.lastMessageAt === "number")
+    && typeof value.pinned === "boolean"
+    && typeof value.online === "boolean"
+    && (value.lastSeenAt === undefined || value.lastSeenAt === null || typeof value.lastSeenAt === "number")
+    && typeof value.unread === "number"
+    && Number.isFinite(value.unread)
+    && value.unread >= 0;
+}
+
+function isRemoteMessage(value: unknown): value is RemoteMessage {
+  return isRecord(value)
+    && isString(value.id, 256)
+    && isString(value.conversationId, 256)
+    && (value.author === "me" || value.author === "them")
+    && typeof value.createdAt === "number"
+    && Number.isFinite(value.createdAt)
+    && isString(value.stackId, 256)
+    && isEnvelope(value.envelope);
+}
+
+function isReceipt(value: unknown, field: "readAt" | "deliveredAt") {
+  return isRecord(value)
+    && isString(value.messageId, 256)
+    && typeof value[field] === "number"
+    && Number.isFinite(value[field]);
+}
+
+function isSyncResponse(value: unknown): value is SyncResponse {
+  return isRecord(value)
+    && typeof value.nextCursor === "number"
+    && Number.isFinite(value.nextCursor)
+    && value.nextCursor >= 0
+    && Array.isArray(value.conversations)
+    && value.conversations.length <= MAX_SYNC_ITEMS
+    && value.conversations.every(isRemoteConversation)
+    && Array.isArray(value.messages)
+    && value.messages.length <= MAX_SYNC_ITEMS
+    && value.messages.every(isRemoteMessage)
+    && Array.isArray(value.readReceipts)
+    && value.readReceipts.length <= MAX_SYNC_ITEMS
+    && value.readReceipts.every((item) => isReceipt(item, "readAt"))
+    && Array.isArray(value.deliveryReceipts)
+    && value.deliveryReceipts.length <= MAX_SYNC_ITEMS
+    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"));
+}
+
+function isRealtimeEvent(value: unknown): value is RealtimeEvent {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  if (value.type === "ready") return typeof value.version === "number" && Number.isFinite(value.version);
+  if (value.type === "sync") return isSyncResponse(value);
+  if (value.type === "message") return typeof value.cursor === "number" && value.cursor >= 0 && isRemoteMessage(value.message);
+  if (value.type === "readReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "readAt");
+  if (value.type === "deliveryReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "deliveredAt");
+  if (value.type === "presence") return isString(value.conversationId, 256) && typeof value.online === "boolean" && typeof value.lastSeenAt === "number" && Number.isFinite(value.lastSeenAt);
+  if (value.type === "pong") return true;
+  return value.type === "error" && isString(value.code, 128);
+}
+
+function isAcceptedResponse(value: unknown): value is { accepted: boolean } {
+  return isRecord(value) && typeof value.accepted === "boolean";
+}
+
+function isTimestampResponse(value: unknown, field: "readAt" | "deliveredAt"): value is Record<string, number> {
+  return isRecord(value) && typeof value[field] === "number" && Number.isFinite(value[field]);
+}
+
+function isDeviceHistoryResponse(value: unknown): value is { accepted: number; nextCursor: number } {
+  return isRecord(value)
+    && typeof value.accepted === "number"
+    && Number.isFinite(value.accepted)
+    && value.accepted >= 0
+    && typeof value.nextCursor === "number"
+    && Number.isFinite(value.nextCursor)
+    && value.nextCursor >= 0;
+}
+
+function validateDirectory(value: unknown, expected?: { handle: string; server: string }): PublicKeyDirectoryResponse {
+  if (!isRecord(value)) throw new Error("Некорректный ответ каталога ключей");
+  const handle = typeof value.handle === "string" ? value.handle.trim().replace(/^@+/, "").toLowerCase() : "";
+  const server = typeof value.server === "string" && value.server.trim() ? normalizeServerAddress(value.server) : expected?.server ?? null;
+  const devices = Array.isArray(value.devices) ? value.devices : null;
+  if (!isString(value.id, 256) || !isString(value.name, 256) || !handle || !server || !devices || devices.length > 256 || !devices.every(isDeviceKeyBundle)) {
+    throw new Error("Некорректный ответ каталога ключей");
+  }
+  if (expected && (handle !== expected.handle || server !== expected.server)) {
+    throw new Error("Ответ каталога не соответствует запрошенному адресу");
+  }
+  const accountKey = value.accountKey;
+  if (accountKey !== undefined && (!isRecord(accountKey) || typeof accountKey.keyId !== "string" || typeof accountKey.encryptionPublicKey !== "string")) {
+    throw new Error("Некорректный ключ аккаунта в каталоге");
+  }
+  return {
+    id: value.id,
+    handle,
+    name: value.name,
+    server,
+    serverId: typeof value.serverId === "string" ? value.serverId : undefined,
+    devices,
+    accountKey: accountKey as PublicKeyDirectoryResponse["accountKey"],
+  };
+}
+
 export type SearchUser = {
   id: string;
   address: string;
@@ -105,24 +244,42 @@ function headers(profile: Profile) {
 async function request(input: RequestInfo | URL, init?: RequestInit) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const externalSignal = init?.signal;
+  const abort = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) abort();
+  else externalSignal?.addEventListener("abort", abort, { once: true });
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } finally {
     window.clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abort);
   }
 }
 
-async function readJson<T>(response: Response): Promise<T> {
-  if (!response.ok) throw new Error(`Enter API request failed: ${response.status}`);
-  return response.json() as Promise<T>;
+async function readJson<T>(response: Response, validate?: (value: unknown) => value is T): Promise<T> {
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: unknown } | null;
+    const detail = payload && typeof payload.error === "string" ? `: ${payload.error}` : "";
+    throw new Error(`Enter API request failed: ${response.status}${detail}`);
+  }
+  const payload: unknown = await response.json().catch(() => undefined);
+  if (validate && !validate(payload)) throw new Error("Enter API вернул некорректный ответ");
+  return payload as T;
+}
+
+async function fetchDirectory(profile: Profile, rawAddress: string) {
+  const address = parseEnterAddress(rawAddress, profile.server);
+  if (!address) throw new Error("Некорректный Enter-адрес");
+  const response = await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
+  const directory = validateDirectory(await readJson<unknown>(response), address);
+  return { address, directory };
 }
 
 export async function syncProfile(profile: Profile, since: number): Promise<SyncResponse> {
   const response = await request(`${apiUrl(profile, "/api/v1/sync")}?since=${Math.max(0, since)}`, {
     headers: headers(profile),
   });
-  const result = await readJson<SyncResponse>(response);
-  return { ...result, readReceipts: result.readReceipts ?? [], deliveryReceipts: result.deliveryReceipts ?? [] };
+  return readJson<SyncResponse>(response, isSyncResponse);
 }
 
 export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
@@ -130,8 +287,8 @@ export function openRealtime(profile: Profile, since: number, onEvent: (event: R
   websocket.onopen = () => websocket.send(JSON.stringify({ type: "hello", version: 1, token: profile.token, since: Math.max(0, since) }));
   websocket.onmessage = (event) => {
     try {
-      const value = JSON.parse(String(event.data)) as { type?: unknown };
-      if (typeof value.type === "string") onEvent(value as RealtimeEvent);
+      const value: unknown = JSON.parse(String(event.data));
+      if (isRealtimeEvent(value)) onEvent(value);
     } catch {
       // Ignore malformed frames; the next snapshot repairs state.
     }
@@ -145,7 +302,7 @@ export async function markConversationRead(profile: Profile, conversationId: str
     method: "POST",
     headers: headers(profile),
   });
-  return readJson<{ readAt: number }>(response);
+  return readJson<{ readAt: number }>(response, (value): value is { readAt: number } => isTimestampResponse(value, "readAt"));
 }
 
 export async function acknowledgeMessage(profile: Profile, messageId: string) {
@@ -153,7 +310,7 @@ export async function acknowledgeMessage(profile: Profile, messageId: string) {
     method: "POST",
     headers: headers(profile),
   });
-  return readJson<{ deliveredAt: number }>(response);
+  return readJson<{ deliveredAt: number }>(response, (value): value is { deliveredAt: number } => isTimestampResponse(value, "deliveredAt"));
 }
 
 export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundle, accountKey?: { keyId: string; encryptionPublicKey: string }) {
@@ -162,27 +319,21 @@ export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundl
     headers: headers(profile),
     body: JSON.stringify({ ...bundle, accountKeyId: accountKey?.keyId, accountEncryptionPublicKey: accountKey?.encryptionPublicKey }),
   });
-  await readJson<{ accepted: boolean }>(response);
+  await readJson<{ accepted: boolean }>(response, isAcceptedResponse);
 }
 
 export async function fetchPublicDeviceKeys(profile: Profile, rawAddress: string): Promise<PublicDeviceKey[]> {
-  const address = parseEnterAddress(rawAddress, profile.server);
-  if (!address) throw new Error("Некорректный Enter-адрес");
-  const response = await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
-  const directory = await readJson<PublicKeyDirectoryResponse>(response);
-  const recipientAddress = formatEnterAddress({ handle: directory.handle, server: directory.server || address.server });
+  const { address, directory } = await fetchDirectory(profile, rawAddress);
+  const recipientAddress = formatEnterAddress(address);
   return directory.devices.map((device) => ({ ...device, address: recipientAddress }));
 }
 
 export async function fetchPublicAccountKey(profile: Profile, rawAddress: string): Promise<PublicAccountKey | undefined> {
-  const address = parseEnterAddress(rawAddress, profile.server);
-  if (!address) throw new Error("Некорректный Enter-адрес");
-  const response = await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
-  const directory = await readJson<PublicKeyDirectoryResponse>(response);
+  const { address, directory } = await fetchDirectory(profile, rawAddress);
   if (!directory.accountKey) return undefined;
   return {
     ...directory.accountKey,
-    address: formatEnterAddress({ handle: directory.handle, server: directory.server || address.server }),
+    address: formatEnterAddress(address),
   };
 }
 
@@ -194,8 +345,8 @@ export async function searchUser(profile: Profile, rawQuery: string): Promise<Se
   const response = address
     ? await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`)
     : await request(`${apiUrl(profile, "/enter/v1/keys/search")}?q=${encodeURIComponent(query)}`);
-  const directory = await readJson<PublicKeyDirectoryResponse>(response);
-  const server = directory.server || address?.server || profile.server;
+  const directory = validateDirectory(await readJson<unknown>(response), address ?? undefined);
+  const server = directory.server;
   return {
     id: directory.id,
     address: formatEnterAddress({ handle: directory.handle, server }),
@@ -219,7 +370,7 @@ export async function createConversation(profile: Profile, user: SearchUser): Pr
       subtitle: user.address,
     }),
   });
-  return readJson<RemoteConversation>(response);
+  return readJson<RemoteConversation>(response, isRemoteConversation);
 }
 
 export async function sendMessage(profile: Profile, conversationId: string, message: Message, envelopes: EncryptedEnvelope[]): Promise<SendMessageResponse> {
@@ -232,12 +383,23 @@ export async function sendMessage(profile: Profile, conversationId: string, mess
       envelopes,
     }),
   });
-  return readJson<SendMessageResponse>(response);
+  return readJson<SendMessageResponse>(response, (value): value is SendMessageResponse => isRecord(value)
+    && typeof value.nextCursor === "number"
+    && Number.isFinite(value.nextCursor)
+    && value.nextCursor >= 0
+    && isRemoteMessage(value.message));
 }
 
-export function uploadMedia(profile: Profile, conversationId: string, mediaId: string, recipient: string, ciphertext: Uint8Array, onProgress?: (progress: number) => void) {
+export function uploadMedia(profile: Profile, conversationId: string, mediaId: string, recipient: string, ciphertext: Uint8Array, onProgress?: (progress: number) => void, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    if (signal?.aborted) {
+      reject(new DOMException("Загрузка вложения отменена", "AbortError"));
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
     xhr.open("POST", apiUrl(profile, "/api/v1/media"));
     xhr.timeout = REQUEST_TIMEOUT_MS;
     xhr.setRequestHeader("authorization", `Bearer ${profile.token}`);
@@ -249,24 +411,26 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
       if (event.lengthComputable) onProgress?.(Math.round((event.loaded / event.total) * 100));
     };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      if (xhr.status >= 200 && xhr.status < 300) { cleanup(); resolve(); }
       else {
         let detail = "";
         try {
           const payload = JSON.parse(xhr.responseText) as { error?: unknown };
           if (typeof payload.error === "string") detail = `: ${payload.error}`;
         } catch { /* Keep the HTTP status. */ }
+        cleanup();
         reject(new Error(`Enter media request failed: ${xhr.status}${detail}`));
       }
     };
-    xhr.onerror = () => reject(new Error("Не удалось загрузить вложение"));
-    xhr.ontimeout = () => reject(new Error("Загрузка вложения превысила тайм-аут"));
+    xhr.onerror = () => { cleanup(); reject(new Error("Не удалось загрузить вложение")); };
+    xhr.onabort = () => { cleanup(); reject(new DOMException("Загрузка вложения отменена", "AbortError")); };
+    xhr.ontimeout = () => { cleanup(); reject(new Error("Загрузка вложения превысила тайм-аут")); };
     xhr.send(ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength) as ArrayBuffer);
   });
 }
 
-export async function downloadMedia(profile: Profile, mediaId: string) {
-  const response = await request(apiUrl(profile, `/api/v1/media/${encodeURIComponent(mediaId)}`), { headers: { authorization: `Bearer ${profile.token}` } });
+export async function downloadMedia(profile: Profile, mediaId: string, signal?: AbortSignal) {
+  const response = await request(apiUrl(profile, `/api/v1/media/${encodeURIComponent(mediaId)}`), { headers: { authorization: `Bearer ${profile.token}` }, signal });
   if (!response.ok) throw new Error(`Enter media request failed: ${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
 }
@@ -278,7 +442,7 @@ export async function syncDeviceHistory(profile: Profile, entries: DeviceHistory
     headers: headers(profile),
     body: JSON.stringify({ entries }),
   });
-  return readJson<{ accepted: number; nextCursor: number }>(response);
+  return readJson<{ accepted: number; nextCursor: number }>(response, isDeviceHistoryResponse);
 }
 
 export function mapRemoteConversation(remote: RemoteConversation): Conversation {

@@ -17,7 +17,11 @@ function kindForMime(mimeType: string): MessageAttachment["kind"] {
 }
 
 export async function encryptMedia(source: MobileMediaSource): Promise<EncryptedMedia> {
+  if (source.size !== undefined && (!Number.isFinite(source.size) || source.size < 0 || source.size > MAX_MEDIA_BYTES)) {
+    throw new Error("Файл слишком большой или имеет некорректный размер");
+  }
   const response = await fetch(source.uri);
+  if (!response.ok) throw new Error("Не удалось прочитать вложение");
   const plaintext = new Uint8Array(await response.arrayBuffer());
   if (plaintext.byteLength > MAX_MEDIA_BYTES) throw new Error("Файл слишком большой. Максимум — 200 МБ.");
   const key = await getRandomBytesAsync(32);
@@ -39,7 +43,12 @@ export async function encryptMedia(source: MobileMediaSource): Promise<Encrypted
 }
 
 export function decryptMedia(ciphertext: Uint8Array, attachment: MessageAttachment) {
-  const plaintext = gcm(toByteArray(attachment.key), toByteArray(attachment.nonce)).decrypt(ciphertext);
+  if (ciphertext.byteLength < 16 || ciphertext.byteLength > MAX_MEDIA_BYTES + 16) throw new Error("Вложение имеет некорректный размер");
+  const key = toByteArray(attachment.key);
+  const nonce = toByteArray(attachment.nonce);
+  if (key.byteLength !== 32 || nonce.byteLength !== 12) throw new Error("Ключ вложения повреждён");
+  const plaintext = gcm(key, nonce).decrypt(ciphertext);
+  if (plaintext.byteLength > MAX_MEDIA_BYTES || plaintext.byteLength !== attachment.size) throw new Error("Размер вложения не совпадает");
   const digest = fromByteArray(sha256(plaintext));
   if (digest !== attachment.sha256) throw new Error("Проверка целостности вложения не пройдена");
   return plaintext;
