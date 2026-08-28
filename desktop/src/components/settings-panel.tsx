@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { changePassword as changeRemotePassword, getAccountSettings, getDevices, getSessions, revokeDevice, revokeOtherSessions, revokeSession, updateAccountSettings, type AccountSettings, type ManagedDevice, type ManagedSession } from "../lib/enter-api";
 import type { AccentPreference, CachePolicy, DensityPreference, FontScale, LocalClientSettings, ThemePreference } from "../lib/local-settings";
 import { Button } from "./ui/button";
@@ -83,8 +83,6 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [storageEstimate, setStorageEstimate] = useState<StorageEstimate | null>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
-
   const loadRemote = useCallback(async () => {
     setRemoteLoading(true);
     setRemoteError("");
@@ -109,22 +107,11 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
   useEffect(() => { void loadRemote(); refreshStorage(); }, [loadRemote, refreshStorage]);
 
   useEffect(() => {
-    const previousFocus = document.activeElement as HTMLElement | null;
-    const dialog = dialogRef.current;
-    const focusable = () => [...(dialog?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex=\"-1\"])") ?? [])];
-    focusable()[0]?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { event.preventDefault(); onClose(); return; }
-      if (event.key !== "Tab") return;
-      const elements = focusable();
-      if (elements.length === 0) return;
-      const first = elements[0];
-      const last = elements[elements.length - 1];
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      if (event.key === "Escape") { event.preventDefault(); onClose(); }
     };
     document.addEventListener("keydown", handleKeyDown);
-    return () => { document.removeEventListener("keydown", handleKeyDown); previousFocus?.focus(); };
+    return () => document.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
   function showSuccess(text: string) {
@@ -308,12 +295,10 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     return renderAbout();
   }
 
-  return <div className="settings-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <div ref={dialogRef} className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  return <div className="settings-workspace" role="region" aria-labelledby="settings-title">
       <header className="settings-panel-header"><div><p className="settings-eyebrow">Enter Messenger</p><h1 id="settings-title">Настройки</h1></div><button type="button" className="icon-button" title="Закрыть настройки" aria-label="Закрыть настройки" onClick={onClose}><Icon name="close" className="size-4" /></button></header>
       <div className="settings-panel-body"><nav className="settings-nav" aria-label="Разделы настроек">{sections.map((item) => <button key={item.id} type="button" className={item.id === section ? "settings-nav-item settings-nav-item-active" : "settings-nav-item"} aria-current={item.id === section ? "page" : undefined} onClick={() => setSection(item.id)}><Icon name={item.icon} className="size-4 shrink-0" /><span>{item.label}</span></button>)}</nav><div className="settings-main">{feedback && <div className={feedback.kind === "error" ? "settings-error settings-feedback" : "settings-success settings-feedback"} role={feedback.kind === "error" ? "alert" : "status"} aria-live="polite"><Icon name={feedback.kind === "error" ? "error" : "check_circle"} className="size-4 shrink-0" /><span>{feedback.text}</span></div>}{renderSection()}</div></div>
       {pendingAction && <div className="settings-confirm" role="alertdialog" aria-modal="true" aria-labelledby="settings-confirm-title"><div><h2 id="settings-confirm-title">Подтвердите действие</h2><p className="mt-1 text-sm text-muted-foreground">Вы действительно хотите: {pendingAction.label}? Это действие нельзя отменить.</p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setPendingAction(null)} disabled={Boolean(actionBusy)}>Отмена</Button><Button className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void executePendingAction()} disabled={Boolean(actionBusy)}>{actionBusy ? "Выполнение…" : "Подтвердить"}</Button></div></div>}
-    </div>
   </div>;
 }
 

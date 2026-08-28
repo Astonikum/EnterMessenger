@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { ChatHeader } from "../components/chat-header";
 import { ChatLoadingState } from "../components/chat-loading-state";
 import { ChatEmptyState } from "../components/chat-empty-state";
@@ -58,6 +58,7 @@ type MessengerViewProps = {
   messagesLoading?: boolean;
   showProfile?: boolean;
   showSettings?: boolean;
+  settingsPanel?: ReactNode;
   messageError?: string;
   searchUser?: SearchUser | null;
   searchBusy?: boolean;
@@ -113,6 +114,7 @@ export function MessengerView({
   messagesLoading = false,
   showProfile = false,
   showSettings = false,
+  settingsPanel,
   messageError = "",
   mediaUploadProgress = null,
   searchUser = null,
@@ -224,12 +226,14 @@ export function MessengerView({
         <ConversationList className="app-conversations" conversations={conversations} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onAddToFolder={onAddToFolder} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
         <div className="app-conversations-resizer" role="separator" aria-label="Изменить ширину списка чатов" aria-orientation="vertical" aria-valuemin={MIN_CONVERSATIONS_WIDTH} aria-valuemax={maxConversationsWidth()} aria-valuenow={conversationsWidth} tabIndex={0} onPointerDown={beginConversationsResize} onKeyDown={handleConversationsResizeKeyDown} title="Изменить ширину списка чатов" />
       </div>
-      <section className="app-chat flex min-w-0 flex-col overflow-hidden">
-        <ChatHeader conversation={activeConversation} searchOpen={searchOpen} searchQuery={searchQuery} searchResultsCount={visibleMessages.length} onSearchOpen={() => setSearchOpen(true)} onSearchClose={() => { setSearchOpen(false); setSearchQuery(""); }} onSearchQueryChange={setSearchQuery} />
-        {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} profile={activeProfile} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} uploadProgress={mediaUploadProgress} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
+      <section className={`app-chat chat-tab flex min-w-0 flex-col overflow-hidden${showSettings ? " chat-tab-settings" : ""}`}>
+        {showSettings && settingsPanel ? settingsPanel : <>
+          <ChatHeader conversation={activeConversation} searchOpen={searchOpen} searchQuery={searchQuery} searchResultsCount={visibleMessages.length} onSearchOpen={() => setSearchOpen(true)} onSearchClose={() => { setSearchOpen(false); setSearchQuery(""); }} onSearchQueryChange={setSearchQuery} />
+          {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} profile={activeProfile} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} uploadProgress={mediaUploadProgress} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
+        </>}
       </section>
       {showProfile && <ProfilePanel profile={activeProfile} onClose={onCloseProfile} onAddProfile={onAddProfile} />}
-      {messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
+      {!showSettings && messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
     </main>
   );
 }

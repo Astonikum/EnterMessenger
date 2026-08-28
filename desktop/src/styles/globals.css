@@ -238,8 +238,9 @@ html[data-density="compact"] { --radius: 0.625rem; }
 .profile-action-row:hover { background: hsl(var(--accent) / 0.55); }
 .profile-detail-icon { display: grid; flex: 0 0 auto; place-items: center; width: 2.25rem; height: 2.25rem; border-radius: 0.75rem; background: hsl(var(--primary) / 0.12); color: hsl(var(--primary)); }
 
-.settings-overlay { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 1rem; background: rgb(0 0 0 / 0.58); backdrop-filter: blur(0.5rem); }
-.settings-panel { display: flex; width: min(68rem, calc(100vw - 2rem)); height: min(46rem, calc(100dvh - 2rem)); min-height: 0; flex-direction: column; overflow: hidden; border: 0.0625rem solid hsl(var(--border) / 0.9); border-radius: 1.5rem; background: hsl(var(--surface) / 0.98); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 0.45); }
+.chat-tab { position: relative; }
+.chat-tab-settings { background: hsl(var(--surface) / 0.42); }
+.settings-workspace { display: flex; min-width: 0; min-height: 0; height: 100%; flex: 1; flex-direction: column; overflow: hidden; background: hsl(var(--surface) / 0.72); }
 .settings-panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; min-height: 5rem; padding: 1.25rem 1.5rem; border-bottom: 0.0625rem solid hsl(var(--border) / 0.7); }
 .settings-panel-header h1, .settings-section-heading h2, .settings-confirm h2 { margin: 0; font-family: "Montserrat", ui-sans-serif, system-ui, sans-serif; font-weight: 600; letter-spacing: -0.02em; }
 .settings-panel-header h1 { font-size: 1.5rem; }
@@ -290,8 +291,6 @@ html[data-density="compact"] { --radius: 0.625rem; }
 }
 
 @media (max-width: 48rem) {
-  .settings-overlay { padding: 0; }
-  .settings-panel { width: 100vw; height: 100dvh; border-radius: 0; }
   .settings-main { padding: 1rem; }
   .settings-detail-grid, .settings-form-grid { grid-template-columns: 1fr; }
   .settings-section-heading, .settings-confirm { align-items: stretch; flex-direction: column; }

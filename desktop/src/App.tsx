@@ -1286,6 +1286,7 @@ export default function App() {
         messageToForward={messageToForward}
         showProfile={showProfile}
         showSettings={showSettings}
+        settingsPanel={showSettings && activeProfile ? <SettingsPanel profile={activeProfile} localSettings={localSettings} messageCount={cachedMessageCount} outboxCount={activeOutboxCount} onLocalSettingsChange={updateLocalSettings} onClearMessageCache={clearActiveMessageCache} onClearOutbox={clearActiveOutbox} onRemoveProfile={removeProfile} onClose={() => setShowSettings(false)} /> : null}
         messageError={messageError}
         mediaUploadProgress={mediaUploadProgress}
         replyTo={replyTo}
@@ -1324,7 +1325,6 @@ export default function App() {
         onCloseForward={() => setMessageToForward(null)}
         onCancelMessageContext={() => { setReplyTo(null); setEditingMessage(null); }}
       />
-      {showSettings && activeProfile && <SettingsPanel profile={activeProfile} localSettings={localSettings} messageCount={cachedMessageCount} outboxCount={activeOutboxCount} onLocalSettingsChange={updateLocalSettings} onClearMessageCache={clearActiveMessageCache} onClearOutbox={clearActiveOutbox} onRemoveProfile={removeProfile} onClose={() => setShowSettings(false)} />}
     </>
   );
 }
