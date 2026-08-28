@@ -247,7 +247,7 @@ html[data-density="compact"] { --radius: 0.625rem; }
 .settings-workspace { display: flex; min-width: 0; min-height: 0; height: 100%; flex: 1; flex-direction: column; overflow: hidden; background: hsl(var(--background)); }
 .settings-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 4.5625rem; padding: 1rem 1.5rem; border-bottom: 0.0625rem solid hsl(var(--border) / 0.7); }
 .settings-panel-header h1, .settings-section-heading h2, .settings-confirm h2 { margin: 0; font-family: "Montserrat", ui-sans-serif, system-ui, sans-serif; font-weight: 600; letter-spacing: -0.02em; }
-.settings-panel-header h1 { font-size: 1.35rem; }
+.settings-panel-header h1 { font-size: 1.125rem; letter-spacing: -0.025em; }
 .settings-panel-body { display: grid; min-height: 0; flex: 1; grid-template-columns: 15rem minmax(0, 1fr); }
 .settings-nav { display: flex; min-height: 0; flex-direction: column; gap: 0.25rem; overflow-y: auto; border-right: 0.0625rem solid hsl(var(--border) / 0.7); background: hsl(var(--surface) / 0.35); padding: 1rem 0.75rem; }
 .settings-nav-item { display: flex; min-height: 3rem; align-items: center; gap: 0.7rem; border-radius: 0.8rem; padding: 0.5rem 0.65rem; color: hsl(var(--muted-foreground)); text-align: left; font-size: 0.875rem; transition: background-color 150ms ease, color 150ms ease; }
