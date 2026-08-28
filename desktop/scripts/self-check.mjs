@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createRealtimeQueue, createSyncQueue } from "../src/lib/sync-queue.ts";
 import { writeMessageCache } from "../src/lib/message-cache.ts";
 import { applyLocalSettings, DEFAULT_LOCAL_SETTINGS, readLocalSettings, writeLocalSettings } from "../src/lib/local-settings.ts";
+import { isManagedDeviceResponse } from "../src/lib/enter-api-contract.ts";
 
 const values = new Map();
 globalThis.localStorage = {
@@ -21,6 +22,8 @@ applyLocalSettings(customSettings);
 assert.equal(document.documentElement.dataset.theme, "light");
 assert.equal(document.documentElement.dataset.density, "compact");
 assert.equal(document.documentElement.lang, "en");
+
+assert.equal(isManagedDeviceResponse({ deviceId: "desktop-1", platform: "desktop", name: "Desktop", appVersion: "0.2.0", createdAt: 1_700_000_000_000, lastSeenAt: 1_700_000_000_000, current: true, revokedAt: null }), true);
 
 const cachedMessages = Array.from({ length: 201 }, (_, index) => ({
   id: String(index),

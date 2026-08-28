@@ -1,5 +1,6 @@
 import { formatMessageTime } from "./utils";
 import { ENTER_PROTOCOL_VERSION, formatEnterAddress, parseEnterAddress, type EncryptedEnvelope } from "./enter-protocol";
+import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
 import { normalizeServerAddress } from "./server-address";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
 import type { Conversation, Message, Profile } from "../types";
@@ -85,15 +86,9 @@ export type AccountSettings = {
 
 export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators">>;
 
-export type ManagedDevice = {
-  deviceId: string;
-  platform: string;
-  name?: string | null;
-  appVersion?: string | null;
-  createdAt: number;
-  lastSeenAt?: number | null;
-  revokedAt?: number | null;
-};
+export type ManagedDevice = ManagedDeviceResponse;
+
+export { isManagedDeviceResponse } from "./enter-api-contract";
 
 export type ManagedSession = {
   id: string;
@@ -237,18 +232,6 @@ function isAccountSettings(value: unknown): value is AccountSettings {
     && typeof value.typingIndicators === "boolean";
 }
 
-function isManagedDevice(value: unknown): value is ManagedDevice {
-  return isRecord(value)
-    && hasOnlyKeys(value, ["deviceId", "platform", "name", "appVersion", "createdAt", "lastSeenAt", "revokedAt"])
-    && isString(value.deviceId, 256)
-    && isString(value.platform, 64)
-    && (value.name === undefined || value.name === null || isString(value.name, 256))
-    && (value.appVersion === undefined || value.appVersion === null || isString(value.appVersion, 128))
-    && isNonNegativeTimestamp(value.createdAt)
-    && (value.lastSeenAt === undefined || value.lastSeenAt === null || isNonNegativeTimestamp(value.lastSeenAt))
-    && (value.revokedAt === undefined || value.revokedAt === null || isNonNegativeTimestamp(value.revokedAt));
-}
-
 function isManagedSession(value: unknown): value is ManagedSession {
   return isRecord(value)
     && hasOnlyKeys(value, ["id", "deviceId", "platform", "deviceName", "appVersion", "createdAt", "expiresAt", "lastSeenAt", "current"])
@@ -265,7 +248,7 @@ function isManagedSession(value: unknown): value is ManagedSession {
 }
 
 function isDevicesResponse(value: unknown): value is ManagedDevice[] {
-  return Array.isArray(value) && value.length <= 256 && value.every(isManagedDevice);
+  return Array.isArray(value) && value.length <= 256 && value.every(isManagedDeviceResponse);
 }
 
 function isSessionsResponse(value: unknown): value is ManagedSession[] {
