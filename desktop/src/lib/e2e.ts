@@ -10,8 +10,9 @@ import type { Message, Profile } from "../types";
 export { decodeMessagePayload, encodeMessagePayload } from "../../../common/src/message-payload.ts";
 export type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey, PublicEncryptionKey } from "../../../common/src/e2e-types.ts";
 
-const DATABASE_NAME = "enter-e2e";
-const DATABASE_VERSION = 2;
+// Keep the legacy CryptoKey database untouched; opening it can trigger WebKit's Keychain prompt.
+const DATABASE_NAME = "enter-e2e-jwk";
+const DATABASE_VERSION = 1;
 const DEVICE_STORE = "devices";
 const ACCOUNT_STORE = "accounts";
 const KEY_AGREEMENT: EcKeyGenParams = { name: "ECDH", namedCurve: "P-256" };
@@ -21,19 +22,26 @@ type StoredDevice = {
   profileId: string;
   deviceId: string;
   keyId: string;
-  encryptionPrivateKey: CryptoKey;
+  encryptionPrivateKey: JsonWebKey;
   encryptionPublicKey: JsonWebKey;
-  signingPrivateKey: CryptoKey;
+  signingPrivateKey: JsonWebKey;
   signingPublicKey: JsonWebKey;
   createdAt: number;
+};
+
+type RuntimeDevice = Omit<StoredDevice, "encryptionPrivateKey" | "signingPrivateKey"> & {
+  encryptionPrivateKey: CryptoKey;
+  signingPrivateKey: CryptoKey;
 };
 
 type StoredAccount = {
   profileId: string;
   keyId: string;
-  encryptionPrivateKey: CryptoKey;
+  encryptionPrivateKey: JsonWebKey;
   encryptionPublicKey: JsonWebKey;
 };
+
+type RuntimeAccount = Omit<StoredAccount, "encryptionPrivateKey"> & { encryptionPrivateKey: CryptoKey };
 
 function openDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
@@ -115,18 +123,12 @@ async function exportPublicKey(key: CryptoKey) {
   return crypto.subtle.exportKey("jwk", key);
 }
 
-async function makePrivateKeyNonExtractable(key: CryptoKey, algorithm: EcKeyImportParams, usages: KeyUsage[]) {
-  if (!key.extractable) return key;
-  const jwk = await crypto.subtle.exportKey("jwk", key);
-  return crypto.subtle.importKey("jwk", jwk, algorithm, false, usages);
-}
-
-async function hardenStoredDevice(device: StoredDevice) {
-  const encryptionPrivateKey = await makePrivateKeyNonExtractable(device.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
-  const signingPrivateKey = await makePrivateKeyNonExtractable(device.signingPrivateKey, SIGNATURE, ["sign"]);
-  return encryptionPrivateKey === device.encryptionPrivateKey && signingPrivateKey === device.signingPrivateKey
-    ? device
-    : { ...device, encryptionPrivateKey, signingPrivateKey };
+async function restoreDevice(device: StoredDevice): Promise<RuntimeDevice> {
+  return {
+    ...device,
+    encryptionPrivateKey: await crypto.subtle.importKey("jwk", device.encryptionPrivateKey, KEY_AGREEMENT, false, ["deriveBits"]),
+    signingPrivateKey: await crypto.subtle.importKey("jwk", device.signingPrivateKey, SIGNATURE, false, ["sign"]),
+  };
 }
 
 async function generateDevice(profileId: string): Promise<StoredDevice> {
@@ -136,9 +138,9 @@ async function generateDevice(profileId: string): Promise<StoredDevice> {
     profileId,
     deviceId: crypto.randomUUID(),
     keyId: crypto.randomUUID(),
-    encryptionPrivateKey: await makePrivateKeyNonExtractable(encryption.privateKey, KEY_AGREEMENT, ["deriveBits"]),
+    encryptionPrivateKey: await crypto.subtle.exportKey("jwk", encryption.privateKey),
     encryptionPublicKey: await exportPublicKey(encryption.publicKey),
-    signingPrivateKey: await makePrivateKeyNonExtractable(signing.privateKey, SIGNATURE, ["sign"]),
+    signingPrivateKey: await crypto.subtle.exportKey("jwk", signing.privateKey),
     signingPublicKey: await exportPublicKey(signing.publicKey),
     createdAt: Date.now(),
   };
@@ -146,14 +148,10 @@ async function generateDevice(profileId: string): Promise<StoredDevice> {
 
 export async function ensureDeviceKeys(profileId: string) {
   const existing = await readStoredDevice(profileId);
-  if (existing) {
-    const hardened = await hardenStoredDevice(existing);
-    if (hardened !== existing) await writeStoredDevice(hardened);
-    return hardened;
-  }
+  if (existing) return restoreDevice(existing);
   const created = await generateDevice(profileId);
   await writeStoredDevice(created);
-  return created;
+  return restoreDevice(created);
 }
 
 function accountPrivateBytes(profileId: string, password: string) {
@@ -174,39 +172,33 @@ function accountJwks(privateBytes: Uint8Array) {
   return { publicKey, privateKey: { ...publicKey, d } satisfies JsonWebKey };
 }
 
+async function restoreAccount(account: StoredAccount): Promise<RuntimeAccount> {
+  return {
+    ...account,
+    encryptionPrivateKey: await crypto.subtle.importKey("jwk", account.encryptionPrivateKey, KEY_AGREEMENT, false, ["deriveBits"]),
+  };
+}
+
 export async function ensureAccountKey(profileId: string, password: string) {
   const existing = await readStoredAccount(profileId);
-  if (existing) {
-    const hardened = await makePrivateKeyNonExtractable(existing.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
-    if (hardened !== existing.encryptionPrivateKey) {
-      const migrated = { ...existing, encryptionPrivateKey: hardened };
-      await writeStoredAccount(migrated);
-      return migrated;
-    }
-    return existing;
-  }
+  if (existing) return restoreAccount(existing);
   const jwks = accountJwks(accountPrivateBytes(profileId, password));
   const account: StoredAccount = {
     profileId,
     keyId: `account:${profileId}`,
-    encryptionPrivateKey: await crypto.subtle.importKey("jwk", jwks.privateKey, KEY_AGREEMENT, false, ["deriveBits"]),
+    encryptionPrivateKey: jwks.privateKey,
     encryptionPublicKey: jwks.publicKey,
   };
   await writeStoredAccount(account);
-  return account;
+  return restoreAccount(account);
 }
 
 export async function readAccountKey(profileId: string) {
   const existing = await readStoredAccount(profileId);
-  if (!existing) return undefined;
-  const hardened = await makePrivateKeyNonExtractable(existing.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
-  if (hardened === existing.encryptionPrivateKey) return existing;
-  const migrated = { ...existing, encryptionPrivateKey: hardened };
-  await writeStoredAccount(migrated);
-  return migrated;
+  return existing ? restoreAccount(existing) : undefined;
 }
 
-export function accountKeyBundle(account: StoredAccount, address: string): PublicAccountKey {
+export function accountKeyBundle(account: Pick<StoredAccount, "keyId" | "encryptionPublicKey">, address: string): PublicAccountKey {
   return { keyId: account.keyId, encryptionPublicKey: encodeJwk(account.encryptionPublicKey), address };
 }
 
@@ -220,7 +212,7 @@ export function deleteDeviceKeys(profileId: string) {
   }));
 }
 
-export function deviceKeyBundle(device: StoredDevice): DeviceKeyBundle {
+export function deviceKeyBundle(device: Pick<StoredDevice, "deviceId" | "keyId" | "encryptionPublicKey" | "signingPublicKey" | "createdAt">): DeviceKeyBundle {
   return {
     deviceId: device.deviceId,
     keyId: device.keyId,
@@ -310,7 +302,7 @@ export async function encryptMessage(profile: Profile, conversationId: string, m
 
 export async function decryptMessage(profile: Profile, encryptedMessage: EncryptedMessage, sender: PublicDeviceKey) {
   const device = await ensureDeviceKeys(profile.id);
-  const account = await readStoredAccount(profile.id);
+  const account = await readAccountKey(profile.id);
   const privateKey = encryptedMessage.key_id === account?.keyId
     ? account.encryptionPrivateKey
     : encryptedMessage.key_id === device.keyId
