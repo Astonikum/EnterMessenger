@@ -51,13 +51,13 @@ export function makeThemeColors(theme: "system" | "light" | "dark", accent: keyo
 }
 
 export const fonts = {
-  body: "System",
-  bodyMedium: "System",
-  bodySemibold: "System",
-  bodyBold: "System",
-  headingMedium: "System",
-  headingSemibold: "System",
-  headingBold: "System",
+  body: "IBMPlexSans-Regular",
+  bodyMedium: "IBMPlexSans-Medium",
+  bodySemibold: "IBMPlexSans-SemiBold",
+  bodyBold: "IBMPlexSans-Bold",
+  headingMedium: "Montserrat-Medium",
+  headingSemibold: "Montserrat-SemiBold",
+  headingBold: "Montserrat-Bold",
 } as const;
 
 export const radii = {
