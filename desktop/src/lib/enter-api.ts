@@ -132,7 +132,7 @@ export function clientDeviceMetadata(): ClientDeviceMetadata {
   const userAgent = navigator.userAgent;
   const browser = userAgent.includes("Edg/") ? "Edge" : userAgent.includes("Chrome/") ? "Chrome" : userAgent.includes("Firefox/") ? "Firefox" : userAgent.includes("Safari/") ? "Safari" : "Browser";
   const platform = navigator.platform || "desktop";
-  return { platform: "web", deviceName: `${browser} · ${platform}`.slice(0, 128), appVersion: "0.2.1" };
+  return { platform: "web", deviceName: `${browser} · ${platform}`.slice(0, 128), appVersion: "0.2.2" };
 }
 
 type PublicKeyDirectoryResponse = {

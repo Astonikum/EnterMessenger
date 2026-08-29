@@ -1,6 +1,6 @@
 import { Platform } from "react-native";
 import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./protocol";
-import { formatEnterAddress, parseEnterAddress } from "./rn-address";
+import { formatEnterAddress, getServerHostname, parseEnterAddress } from "./rn-address";
 import { messageTime as formatMessageTime } from "./data";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./rn-e2e";
 import type { Conversation, Message, Profile, SearchUser } from "./types";
@@ -15,12 +15,8 @@ const MAX_SYNC_ITEMS = 1_000;
 const MAX_FOLDERS = 100;
 
 function isLoopbackServer(server: string) {
-  try {
-    const hostname = new URL(server).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-    return hostname === "localhost" || hostname === "::1" || hostname === "0.0.0.0" || hostname.startsWith("127.");
-  } catch {
-    return false;
-  }
+  const hostname = getServerHostname(server).toLowerCase().replace(/^\[|\]$/g, "");
+  return hostname === "localhost" || hostname === "::1" || hostname === "0.0.0.0" || hostname.startsWith("127.");
 }
 
 const allowLoopbackDirectoryRewrite = typeof globalThis !== "undefined"
@@ -138,7 +134,7 @@ export function clientDeviceMetadata(): ClientDeviceMetadata {
       ? `Android${version}`
       : `${Platform.OS}${version}`;
   const deviceName = Platform.OS === "ios" ? "iOS device" : Platform.OS === "android" ? "Android device" : "Mobile device";
-  return { platform: platform.slice(0, 32), deviceName, appVersion: "0.2.1" };
+  return { platform: platform.slice(0, 32), deviceName, appVersion: "0.2.2" };
 }
 
 type PublicKeyDirectoryResponse = { id: string; handle: string; name: string; server: string; serverId?: string; devices: DeviceKeyBundle[]; accountKey?: { keyId: string; encryptionPublicKey: string } | null };
@@ -358,8 +354,8 @@ function headers(profile: Profile) {
 async function request(input: RequestInfo | URL, init?: RequestInit) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-  const path = (() => { try { return new URL(requestUrl).pathname; } catch { return "request"; } })();
+  const requestUrl = typeof input === "string" ? input : typeof (input as { url?: unknown }).url === "string" ? (input as { url: string }).url : String(input);
+  const path = requestUrl.replace(/^[a-z][a-z\d+.-]*:\/\/[^/?#]*/i, "").split(/[?#]/, 1)[0] || "/";
   const method = init?.method ?? "GET";
   try {
     const response = await fetch(requestUrl, { ...init, signal: controller.signal });

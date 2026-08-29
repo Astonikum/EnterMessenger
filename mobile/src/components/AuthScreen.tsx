@@ -5,7 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { Profile } from "../types";
 import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
-import { getSuggestedServerAddress, normalizeServerAddress } from "../rn-address";
+import { getSuggestedServerAddress, normalizeServerAddress, resolveServerResource } from "../rn-address";
 import { ENTER_PROTOCOL_VERSION } from "../protocol";
 import { clientDeviceMetadata } from "../rn-api";
 import { LogsScreen } from "./LogsScreen";
@@ -73,7 +73,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
 
   async function checkServer() {
     const url = normalizeServerAddress(serverInput);
-    if (!url) { setError("Введите IP, домен или полный URL сервера"); return; }
+    if (!url) { logEvent("auth", "Server address rejected", serverInput, "error"); setError("Введите IP, домен или полный URL сервера"); return; }
     setBusy(true); setError("");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SERVER_CHECK_TIMEOUT_MS);
@@ -83,7 +83,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
       const health: unknown = await response.json();
       if (!isHealthResponse(health)) throw new Error("unavailable");
       if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
-      setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? new URL(health.logo, `${url}/`).toString() : undefined); logEvent("auth", "Server is available", url, "success"); transitionToStep("auth", "forward");
+      setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? resolveServerResource(url, health.logo) : undefined); logEvent("auth", "Server is available", url, "success"); transitionToStep("auth", "forward");
     } catch (reason) {
       logEvent("auth", "Server check failed", reason instanceof Error ? reason.message : "Server unavailable", "error");
       setError(reason instanceof Error && reason.message === "unsupported_protocol"
@@ -124,7 +124,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     <StepIndicator step={step} />
     {step === "server" ? <View style={styles.form}>
       <Text style={styles.title}>Найдём ваш сервер</Text><Text style={styles.description}>Enter не использует встроенный сервер. Укажите адрес своего сервера — сначала проверим его доступность.</Text>
-      <Field label="Адрес сервера" value={serverInput} onChangeText={setServerInput} placeholder="IP компьютера:50121" autoFocus keyboardType="url" returnKeyType="go" onSubmitEditing={() => void checkServer()} />
+      <Field label="Адрес сервера" value={serverInput} onChangeText={setServerInput} placeholder="Адрес сервера" autoFocus keyboardType="url" returnKeyType="go" onSubmitEditing={() => void checkServer()} />
       {!!error && <ErrorMessage text={error} />}
       <PrimaryButton label="Проверить сервер" icon="checkCircle" busy={busy} onPress={checkServer} />
     </View> : <View style={styles.form}>

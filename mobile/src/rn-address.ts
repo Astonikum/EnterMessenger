@@ -23,30 +23,76 @@ export function getSuggestedServerAddress(hostname = runtimeHostname()) {
 }
 
 export function normalizeServerAddress(raw: string) {
-  const value = raw.trim();
-  if (!value) return null;
-  const hasScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(value);
-  const candidate = hasScheme ? value : `http://${value}`;
-  try {
-    const url = new URL(candidate);
-    if (isLocalHost(url.hostname) && !url.port) url.port = "50121";
-    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) return null;
-    url.hash = "";
-    return url.toString().replace(/\/$/, "");
-  } catch { return null; }
+  const parsed = parseServerUrl(raw);
+  return parsed ? formatServerUrl(parsed) : null;
 }
 
 export function migrateLocalServerAddress(raw: string) {
-  try {
-    const url = new URL(raw);
-    if (isLocalHost(url.hostname) && ["8080", "8081"].includes(url.port)) {
-      url.port = "50121";
-      return url.toString().replace(/\/$/, "");
-    }
-  } catch {
-    // Keep malformed or remote profile addresses unchanged.
+  const parsed = parseServerUrl(raw);
+  if (parsed && isLocalHost(parsed.hostname) && ["8080", "8081"].includes(parsed.port)) {
+    return formatServerUrl({ ...parsed, port: "50121" });
   }
   return raw;
+}
+
+export function getServerHostname(raw: string) {
+  return parseServerUrl(raw)?.hostname ?? "";
+}
+
+export function resolveServerResource(server: string, resource: string) {
+  const value = resource.trim();
+  if (!value) return undefined;
+  if (/^https?:\/\//i.test(value)) return value.replace(/#.*$/, "");
+  return `${server.replace(/\/+$/, "")}/${value.replace(/^\/+/, "")}`;
+}
+
+type ServerUrl = { protocol: "http:" | "https:"; hostname: string; port: string; pathname: string; search: string };
+
+function parseServerUrl(raw: string): ServerUrl | null {
+  const value = raw.trim();
+  if (!value) return null;
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `http://${value}`;
+  const match = candidate.match(/^(https?):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#.*)?$/i);
+  if (!match) return null;
+
+  const authority = match[2];
+  if (!authority || /[\s\u0000-\u001f\u007f@]/.test(authority)) return null;
+  let hostname = "";
+  let port = "";
+
+  if (authority.startsWith("[")) {
+    const closingBracket = authority.indexOf("]");
+    if (closingBracket < 0) return null;
+    hostname = authority.slice(1, closingBracket);
+    const suffix = authority.slice(closingBracket + 1);
+    if (suffix && !/^:\d+$/.test(suffix)) return null;
+    port = suffix.slice(1);
+  } else {
+    const firstColon = authority.indexOf(":");
+    if (firstColon >= 0) {
+      if (authority.indexOf(":", firstColon + 1) >= 0) return null;
+      hostname = authority.slice(0, firstColon);
+      port = authority.slice(firstColon + 1);
+      if (!/^\d+$/.test(port)) return null;
+    } else {
+      hostname = authority;
+    }
+  }
+
+  if (!hostname || !isValidHostname(hostname)) return null;
+  if (port && (Number(port) < 1 || Number(port) > 65535)) return null;
+  if (!port && isLocalHost(hostname)) port = "50121";
+  return { protocol: `${match[1].toLowerCase()}:` as "http:" | "https:", hostname, port, pathname: match[3] || "", search: match[4] === undefined ? "" : `?${match[4]}` };
+}
+
+function formatServerUrl(url: ServerUrl) {
+  const hostname = url.hostname.includes(":") ? `[${url.hostname}]` : url.hostname;
+  const pathname = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${hostname}${url.port ? `:${url.port}` : ""}${pathname}${url.search}`;
+}
+
+function isValidHostname(hostname: string) {
+  return /^[a-z\d._-]+$/i.test(hostname) || /^[a-f\d:.%]+$/i.test(hostname);
 }
 
 function isLocalHost(hostname: string) {

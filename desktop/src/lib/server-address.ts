@@ -27,6 +27,19 @@ export function migrateLocalServerAddress(raw: string) {
   return raw;
 }
 
+export function resolveServerResource(server: string, resource: string) {
+  const value = resource.trim();
+  if (!value) return undefined;
+  try {
+    const url = new URL(value, `${server.replace(/\/+$/, "")}/`);
+    if (!["http:", "https:"].includes(url.protocol)) return undefined;
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 function isLocalHost(hostname: string) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host === "::1" || host === "0.0.0.0") return true;

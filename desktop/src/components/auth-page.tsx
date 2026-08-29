@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import type { Profile } from "../types";
-import { normalizeServerAddress } from "../lib/server-address";
+import { normalizeServerAddress, resolveServerResource } from "../lib/server-address";
 import { ENTER_PROTOCOL_VERSION } from "../lib/enter-protocol";
 import { clientDeviceMetadata } from "../lib/enter-api";
 import { Button } from "./ui/button";
@@ -44,6 +44,7 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
     event.preventDefault();
     const url = normalizeServerAddress(serverInput);
     if (!url) {
+      logEvent("auth", "Server address rejected", serverInput, "error");
       setError("Введите localhost, IP, домен или полный URL сервера");
       return;
     }
@@ -59,7 +60,7 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
       if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
       setServerUrl(url);
       setServerName(health.serverName || "Enter");
-      setServerLogo(health.logo);
+      setServerLogo(health.logo ? resolveServerResource(url, health.logo) : undefined);
       logEvent("auth", "Server is available", url, "success");
       setStepDirection("forward");
       setStep("auth");
@@ -134,7 +135,7 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
           {step === "server" ? (
             <form onSubmit={checkServer} className="space-y-6">
               <div><h1 className="text-2xl font-semibold tracking-tight">Найдём ваш сервер</h1><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Enter не использует встроенный сервер. Укажите адрес своего сервера — сначала проверим его доступность.</p></div>
-              <label className="field-label">Адрес сервера<div className="relative"><Icon name="language" className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={serverInput} onChange={(event) => setServerInput(event.target.value)} className="h-12 pl-10" placeholder="localhost:50121" autoFocus /></div></label>
+              <label className="field-label">Адрес сервера<div className="relative"><Icon name="language" className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={serverInput} onChange={(event) => setServerInput(event.target.value)} className="h-12 pl-10" placeholder="Адрес сервера" autoFocus /></div></label>
               {error && <ErrorMessage text={error} />}
               <Button type="submit" className="h-12 w-full" disabled={busy}>{busy ? <Icon name="progress_activity" className="size-4 animate-spin" /> : <Icon name="check_circle" className="size-4" />}Проверить сервер</Button>
             </form>
