@@ -204,7 +204,7 @@ export function accountKeyBundle(account: Pick<StoredAccount, "keyId" | "encrypt
 
 export function deleteDeviceKeys(profileId: string) {
   return openDatabase().then((database) => new Promise<void>((resolve, reject) => {
-    const transaction = database.transaction(DEVICE_STORE, "readwrite");
+    const transaction = database.transaction([DEVICE_STORE, ACCOUNT_STORE], "readwrite");
     transaction.objectStore(DEVICE_STORE).delete(profileId);
     transaction.objectStore(ACCOUNT_STORE).delete(profileId);
     transaction.oncomplete = () => { database.close(); resolve(); };
