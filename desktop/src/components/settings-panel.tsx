@@ -7,7 +7,7 @@ import { Input } from "./ui/input";
 import { MessageList } from "./message-list";
 import type { Profile } from "../types";
 import { friendlyError } from "../lib/client-errors";
-import { CURRENT_VERSION, GITHUB_REPO_URL, fetchLatestRelease, isNewerVersion, type PlatformRelease } from "../lib/github-releases";
+import { CURRENT_VERSION, fetchLatestRelease, isNewerVersion, type PlatformRelease } from "../lib/github-releases";
 
 type SettingsSection = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "updates";
 type PendingAction = { kind: "device" | "session" | "other-sessions" | "outbox" | "profile" | "account"; targetId: string; label: string };
@@ -380,16 +380,20 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     const release = updateState.release;
     const status = release ? (isNewerVersion(release.version) ? `Доступна новая версия v${release.version}` : release.version === CURRENT_VERSION ? `Установлена последняя версия v${CURRENT_VERSION}` : `Установлена версия v${CURRENT_VERSION}`) : "";
     return <section aria-labelledby="settings-updates-title" className="settings-section-content">
-      <div className="settings-section-heading"><div><h2 id="settings-updates-title">Обновления</h2><p className="settings-muted mt-1">Проверка опубликованных desktop-релизов Enter Messenger на GitHub.</p></div></div>
+      <div className="settings-section-heading"><div><h2 id="settings-updates-title">Обновления</h2></div></div>
+      <div className="settings-card settings-version-card">
+        <p className="settings-card-section-title">Версия</p>
+        <div className="settings-version-row"><h3>Desktop-приложение</h3><span className="settings-version-badge">v{CURRENT_VERSION}</span></div>
+      </div>
       <div className="settings-card settings-update-card">
-        <div className="settings-update-summary"><div><h3>Enter Desktop</h3><p className="settings-muted mt-1">Установлена версия v{CURRENT_VERSION}</p></div><Button variant="outline" size="sm" onClick={() => setUpdateRefreshKey((value) => value + 1)} disabled={updateState.loading}><Icon name="rotate_left" className="size-4" />{updateState.loading ? "Проверка…" : "Проверить"}</Button></div>
+        <p className="settings-card-section-title">Проверка обновлений</p>
+        <div className="settings-update-summary"><div><h3>Enter Desktop</h3><p className="settings-muted mt-1">Ищем последний опубликованный desktop-релиз на GitHub</p></div><Button variant="outline" size="sm" onClick={() => setUpdateRefreshKey((value) => value + 1)} disabled={updateState.loading}><Icon name="rotate_left" className="size-4" />{updateState.loading ? "Проверка…" : "Проверить"}</Button></div>
         {updateState.loading && <p className="settings-muted">Запрашиваю последний опубликованный релиз…</p>}
         {updateState.error && <div className="settings-error" role="alert"><Icon name="error" className="size-4 shrink-0" /><span>{updateState.error}</span></div>}
         {!updateState.loading && !updateState.error && !release && <p className="settings-muted">Опубликованных desktop-релизов пока нет.</p>}
         {release && <div className="settings-update-result"><div className="settings-update-status"><Icon name={isNewerVersion(release.version) ? "download" : "check_circle"} className="size-5 shrink-0" /><div><strong>{status}</strong><span>{release.name} · опубликован {formatReleaseDate(release.publishedAt)}</span></div></div>{release.body && <div className="settings-update-notes">{release.body}</div>}<div className="settings-update-assets"><span className="text-xs font-medium text-muted-foreground">Файлы релиза</span>{release.assets.length ? release.assets.map((asset) => <a key={asset.browserDownloadUrl} className="settings-update-asset" href={asset.browserDownloadUrl} target="_blank" rel="noreferrer"><Icon name="download" className="size-4 shrink-0" /><span>{asset.name}</span></a>) : <span className="settings-muted">Файлы не прикреплены.</span>}</div><a className="settings-update-release-link" href={release.htmlUrl} target="_blank" rel="noreferrer">Открыть релиз на GitHub</a></div>}
         {updateState.checkedAt && <p className="settings-muted text-xs">Проверено {new Intl.DateTimeFormat("ru-RU", { timeStyle: "short" }).format(new Date(updateState.checkedAt))}</p>}
       </div>
-      <div className="settings-card"><h3>Источник обновлений</h3><p className="settings-muted mt-2">Релизы публикуются отдельно для desktop и mobile. Автоматическая установка не запускается: выберите подходящий файл в релизе GitHub.</p><a className="settings-update-release-link mt-3" href={`${GITHUB_REPO_URL}/releases`} target="_blank" rel="noreferrer">Все релизы Enter Messenger</a></div>
     </section>;
   }
 

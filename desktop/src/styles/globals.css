@@ -296,6 +296,11 @@ html[data-density="compact"] { --radius: 0.625rem; }
 .settings-success { border: 0.0625rem solid hsl(var(--primary) / 0.3); background: hsl(var(--primary) / 0.1); color: hsl(var(--foreground)); }
 .settings-feedback { margin-bottom: 1rem; }
 .settings-danger-card { border-color: hsl(var(--destructive) / 0.3); }
+.settings-version-card { display: grid; gap: 0.75rem; }
+.settings-card-section-title { margin: 0; color: hsl(var(--primary)); font-family: "Montserrat", ui-sans-serif, system-ui, sans-serif; font-size: 0.95rem; font-weight: 600; letter-spacing: 0.01em; }
+.settings-version-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-top: 0.0625rem solid hsl(var(--border) / 0.65); padding-top: 1rem; }
+.settings-version-row h3 { font-size: 1.05rem; }
+.settings-version-badge { flex: 0 0 auto; border-radius: 999px; background: hsl(var(--primary) / 0.2); padding: 0.55rem 0.9rem; color: hsl(var(--primary)); font-size: 1rem; font-weight: 700; }
 .settings-update-card { display: grid; gap: 1rem; }
 .settings-update-summary { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
 .settings-update-summary > button { flex: 0 0 auto; }
