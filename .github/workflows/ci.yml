@@ -121,4 +121,4 @@ jobs:
         run: cargo test --manifest-path server/Cargo.toml
 
       - name: Build server image
-        run: docker build --build-arg APP_VERSION=0.2.0 --tag enter-server:ci --file server/Dockerfile .
+        run: docker build --build-arg APP_VERSION=0.2.1 --tag enter-server:ci --file server/Dockerfile .

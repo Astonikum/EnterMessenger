@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: server/Dockerfile
       args:
-        APP_VERSION: "0.2.0"
+        APP_VERSION: "0.2.1"
     image: enter-server:local
     restart: unless-stopped
     ports:

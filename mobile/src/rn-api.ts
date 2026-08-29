@@ -138,7 +138,7 @@ export function clientDeviceMetadata(): ClientDeviceMetadata {
       ? `Android${version}`
       : `${Platform.OS}${version}`;
   const deviceName = Platform.OS === "ios" ? "iOS device" : Platform.OS === "android" ? "Android device" : "Mobile device";
-  return { platform: platform.slice(0, 32), deviceName, appVersion: "0.2.0" };
+  return { platform: platform.slice(0, 32), deviceName, appVersion: "0.2.1" };
 }
 
 type PublicKeyDirectoryResponse = { id: string; handle: string; name: string; server: string; serverId?: string; devices: DeviceKeyBundle[]; accountKey?: { keyId: string; encryptionPublicKey: string } | null };
