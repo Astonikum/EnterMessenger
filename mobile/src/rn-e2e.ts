@@ -5,10 +5,10 @@ import { pbkdf2 } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToUtf8, concatBytes, hexToBytes, utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
 import { fromByteArray, toByteArray } from "base64-js";
-import { getRandomBytesAsync } from "expo-crypto";
-import * as SecureStore from "expo-secure-store";
+import * as Keychain from "react-native-keychain";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
+import { randomBytes } from "./crypto-random";
 import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./protocol";
 import type { Message, MessageAttachment, Profile } from "./types";
 
@@ -121,7 +121,8 @@ function safeProfileKey(profileId: string) {
 }
 
 async function secureStoreAvailable() {
-  try { return await SecureStore.isAvailableAsync(); } catch { return false; }
+  if (Platform.OS === "web") return false;
+  try { await Keychain.getGenericPassword({ service: "enter-availability-probe" }); return true; } catch { return false; }
 }
 
 const webKeyStorage = Platform.OS === "web";
@@ -130,11 +131,16 @@ async function readPrivateValue(primaryKey: string, fallbackKey: string, unavail
   const secure = await secureStoreAvailable();
   if (!secure && !webKeyStorage) throw new Error(unavailableMessage);
   let raw: string | null;
-  try { raw = secure ? await SecureStore.getItemAsync(primaryKey) : await AsyncStorage.getItem(fallbackKey); } catch { throw new Error(readErrorMessage); }
+  try {
+    if (secure) {
+      const credentials = await Keychain.getGenericPassword({ service: primaryKey });
+      raw = credentials ? credentials.password : null;
+    } else raw = await AsyncStorage.getItem(fallbackKey);
+  } catch { throw new Error(readErrorMessage); }
   if (!raw && secure) {
     const legacy = await AsyncStorage.getItem(fallbackKey);
     if (legacy) {
-      await SecureStore.setItemAsync(primaryKey, legacy);
+      await Keychain.setGenericPassword("enter", legacy, { service: primaryKey });
       await AsyncStorage.removeItem(fallbackKey);
       raw = legacy;
     }
@@ -147,7 +153,7 @@ async function writePrivateValue(primaryKey: string, fallbackKey: string, value:
   if (!secure && !webKeyStorage) throw new Error(unavailableMessage);
   try {
     if (secure) {
-      await SecureStore.setItemAsync(primaryKey, value);
+      await Keychain.setGenericPassword("enter", value, { service: primaryKey });
       await AsyncStorage.removeItem(fallbackKey).catch(() => undefined);
     } else {
       await AsyncStorage.setItem(fallbackKey, value);
@@ -206,10 +212,6 @@ function bytesToBase64(value: Uint8Array) {
 
 function base64ToBytes(value: string) {
   return toByteArray(value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "="));
-}
-
-async function randomBytes(length: number) {
-  return getRandomBytesAsync(length);
 }
 
 async function randomPrivateKey() {
@@ -314,8 +316,8 @@ export function accountKeyBundle(account: StoredAccount, address: string): Publi
 export function deleteDeviceKeys(profileId: string) {
   return (async () => {
     if (await secureStoreAvailable()) {
-      try { await SecureStore.deleteItemAsync(cacheKey(profileId)); } catch { /* Continue with fallback cleanup. */ }
-      try { await SecureStore.deleteItemAsync(accountCacheKey(profileId)); } catch { /* Continue with fallback cleanup. */ }
+      try { await Keychain.resetGenericPassword({ service: cacheKey(profileId) }); } catch { /* Continue with fallback cleanup. */ }
+      try { await Keychain.resetGenericPassword({ service: accountCacheKey(profileId) }); } catch { /* Continue with fallback cleanup. */ }
     }
     await AsyncStorage.removeItem(fallbackCacheKey(profileId));
     await AsyncStorage.removeItem(fallbackAccountCacheKey(profileId));
@@ -327,8 +329,8 @@ export async function deletePrivateE2EKeys(profileId: string) {
   const secure = await secureStoreAvailable();
   if (!secure && !webKeyStorage) throw new Error("Безопасное хранилище недоступно на этом устройстве");
   if (secure) await Promise.all([
-    SecureStore.deleteItemAsync(cacheKey(profileId)),
-    SecureStore.deleteItemAsync(accountCacheKey(profileId)),
+    Keychain.resetGenericPassword({ service: cacheKey(profileId) }),
+    Keychain.resetGenericPassword({ service: accountCacheKey(profileId) }),
   ]);
   await AsyncStorage.multiRemove([fallbackCacheKey(profileId), fallbackAccountCacheKey(profileId)]);
 }

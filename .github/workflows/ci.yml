@@ -75,9 +75,9 @@ jobs:
         working-directory: mobile
         run: npm run test:realtime
 
-      - name: Export web bundle
+      - name: Validate native dependency graph
         working-directory: mobile
-        run: npm exec -- expo export --platform web
+        run: npx react-native config
 
   extension:
     name: VS Code extension checks

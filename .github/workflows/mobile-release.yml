@@ -6,36 +6,27 @@ on:
       platform:
         description: Platform to build
         type: choice
-        options: [android]
+        options: [android, ios, both]
         default: android
         required: true
-      submit:
-        description: Submit the completed build to the stores
-        type: boolean
-        default: false
-        required: true
-      profile:
-        description: EAS build profile (preview creates an installable APK)
+      artifact:
+        description: Android artifact type (ignored for iOS)
         type: choice
-        options: [preview, production]
-        default: preview
+        options: [apk, aab]
+        default: apk
         required: true
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: EAS ${{ inputs.platform }}
-    runs-on: ubuntu-latest
+  android:
+    name: Android ${{ inputs.artifact }}
+    if: ${{ inputs.platform == 'android' || inputs.platform == 'both' }}
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: mobile
-    env:
-      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-      EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
-      EXPO_OWNER: ${{ secrets.EXPO_OWNER }}
-      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
@@ -45,17 +36,16 @@ jobs:
           cache: npm
           cache-dependency-path: mobile/package-lock.json
 
-      - name: Install Expo/EAS CLI
-        uses: expo/expo-github-action@v8
+      - uses: actions/setup-java@v5
         with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
 
-      - name: Validate release secrets
-        shell: bash
-        run: |
-          test -n "$EXPO_TOKEN" || { echo "EXPO_TOKEN is required"; exit 1; }
-          test -n "$RELEASE_TOKEN" || { echo "RELEASE_TOKEN is required"; exit 1; }
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Install mobile dependencies
         run: npm ci
@@ -70,116 +60,149 @@ jobs:
         id: version
         shell: bash
         run: |
-          version="$(node -p "require('./app.json').expo.version")"
+          version="$(node -p "require('./app.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if [[ "${{ inputs.artifact }}" == "aab" && -z "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "AAB release requires ANDROID_KEYSTORE_BASE64 and Android signing secrets."
+            exit 1
+          fi
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" ]]; then
+            test -n "$ANDROID_KEYSTORE_PASSWORD" || { echo "ANDROID_KEYSTORE_PASSWORD is required"; exit 1; }
+            test -n "$ANDROID_KEY_ALIAS" || { echo "ANDROID_KEY_ALIAS is required"; exit 1; }
+            test -n "$ANDROID_KEY_PASSWORD" || { echo "ANDROID_KEY_PASSWORD is required"; exit 1; }
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/enter-release.keystore"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/enter-release.keystore"
+              echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Android artifact
+        working-directory: mobile/android
+        shell: bash
+        run: |
+          if [[ "${{ inputs.artifact }}" == "aab" ]]; then
+            ./gradlew --no-daemon bundleRelease
+            source_path="app/build/outputs/bundle/release/app-release.aab"
+          else
+            ./gradlew --no-daemon assembleRelease
+            source_path="app/build/outputs/apk/release/app-release.apk"
+          fi
+          cp "$source_path" "$RUNNER_TEMP/Enter-Mobile-v${{ steps.version.outputs.version }}-${{ inputs.artifact }}.${{ inputs.artifact }}"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Enter-Mobile-v${{ steps.version.outputs.version }}-android-${{ inputs.artifact }}
+          path: ${{ runner.temp }}/Enter-Mobile-v${{ steps.version.outputs.version }}-${{ inputs.artifact }}.${{ inputs.artifact }}
+          if-no-files-found: error
+
+  ios:
+    name: iOS simulator build
+    if: ${{ inputs.platform == 'ios' || inputs.platform == 'both' }}
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install mobile dependencies
+        run: npm ci
+
+      - name: Install CocoaPods dependencies
+        run: pod install --project-directory=ios
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Read mobile version
+        id: version
+        shell: bash
+        run: |
+          version="$(node -p "require('./app.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build iOS simulator app
+        shell: bash
+        run: |
+          derived_data="$RUNNER_TEMP/enter-ios-derived-data"
+          xcodebuild \
+            -workspace ios/EnterMobile.xcworkspace \
+            -scheme EnterMobile \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$derived_data/Build/Products/Debug-iphonesimulator/EnterMobile.app" \
+            "$RUNNER_TEMP/Enter-Mobile-v${{ steps.version.outputs.version }}-ios-simulator.app.zip"
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Enter-Mobile-v${{ steps.version.outputs.version }}-ios-simulator
+          path: ${{ runner.temp }}/Enter-Mobile-v${{ steps.version.outputs.version }}-ios-simulator.app.zip
+          if-no-files-found: error
+
+  release:
+    name: Create mobile draft release
+    needs: [android, ios]
+    if: ${{ always() && (needs.android.result == 'success' || needs.ios.result == 'success') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Read mobile version
+        id: version
+        run: |
+          version="$(node -p "require('./mobile/app.json').version")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=mobile-v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build Android artifact
-        id: artifact
-        run: |
-          profile="${{ inputs.profile }}"
-          if [[ "${{ inputs.submit }}" == "true" ]]; then
-            profile=production
-          fi
-
-          eas build \
-            --platform "${{ inputs.platform }}" \
-            --profile "$profile" \
-            --non-interactive \
-            --wait \
-            --json > build.json
-
-          if [[ "${{ inputs.submit }}" == "true" ]]; then
-            eas submit --platform android --profile production --latest --non-interactive
-          fi
-
-          artifact_url="$(node -e 'const fs=require("fs"); const builds=JSON.parse(fs.readFileSync("build.json", "utf8")); const url=builds[0]?.artifacts?.applicationArchiveUrl; if (!url) process.exit(1); process.stdout.write(url);')"
-          extension=apk
-          if [[ "$profile" == "production" ]]; then
-            extension=aab
-          fi
-          artifact_name="Enter-Mobile-v${{ steps.version.outputs.version }}.${extension}"
-          mkdir -p release
-          curl --fail --location --retry 3 "$artifact_url" --output "release/$artifact_name"
-          rm -f build.json
-          echo "path=release/$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "profile=$profile" >> "$GITHUB_OUTPUT"
-
-      - name: Upload mobile artifact
-        uses: actions/upload-artifact@v4
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: Enter-Mobile-v${{ steps.version.outputs.version }}-${{ steps.artifact.outputs.profile }}
-          path: mobile/${{ steps.artifact.outputs.path }}
-          if-no-files-found: error
-
-      - name: Add mobile artifact summary
-        run: |
-          echo "### Mobile artifact" >> "$GITHUB_STEP_SUMMARY"
-          echo "Uploaded Enter-Mobile-v${{ steps.version.outputs.version }}-${{ steps.artifact.outputs.profile }}." >> "$GITHUB_STEP_SUMMARY"
+          pattern: Enter-Mobile-*
+          path: artifacts
+          merge-multiple: true
 
       - name: Create or update mobile draft release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.version.outputs.tag }}"
           title="Enter Mobile v${{ steps.version.outputs.version }}"
-          notes="Android ${{ steps.artifact.outputs.profile }} artifact created by EAS."
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists."
+          notes="Native React Native mobile artifacts built with Gradle and Xcode."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes "$notes" --draft
           else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f "ref=refs/tags/$tag" \
-              -f "sha=$GITHUB_SHA" >/dev/null
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes "$notes" --draft
           fi
-
-          query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){releases(first:100,orderBy:{field:CREATED_AT,direction:DESC}){nodes{databaseId,tagName,name,isDraft,isPrerelease}}}}'
-          repo_name="${GITHUB_REPOSITORY#*/}"
-          release_rows="$(gh api graphql \
-            -F owner="$GITHUB_REPOSITORY_OWNER" \
-            -F name="$repo_name" \
-            -f query="$query" \
-            --jq '.data.repository.releases.nodes[] | [.databaseId, .tagName, .name] | @tsv')"
-          echo "Release lookup: $release_rows"
-          release_id="$(printf '%s\n' "$release_rows" | awk -F '\t' -v tag="$tag" '$2 == tag {print $1; exit}')"
-          if [[ -z "$release_id" ]]; then
-            release_id="$(printf '%s\n' "$release_rows" | awk -F '\t' -v title="$title" '$3 == title {print $1; exit}')"
-          fi
-
-          if [[ -n "$release_id" ]]; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-              -f "tag_name=$tag" \
-              -f "name=$title" \
-              -f "body=$notes" \
-              -F draft=true \
-              -F prerelease=false >/dev/null
-          else
-            release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
-              -f "tag_name=$tag" \
-              -f "target_commitish=$GITHUB_SHA" \
-              -f "name=$title" \
-              -f "body=$notes" \
-              -F draft=true \
-              -F prerelease=false --jq .id)"
-          fi
-
-          artifact_path="${{ steps.artifact.outputs.path }}"
-          asset_name="$(basename "$artifact_path")"
-          existing_assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
-            --jq '.[] | [.id, .name] | @tsv')"
-          while IFS=$'\t' read -r asset_id existing_name; do
-            if [[ "$existing_name" == "$asset_name" && -n "$asset_id" ]]; then
-              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
-            fi
-          done <<< "$existing_assets"
-
-          gh api --method POST \
-            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset_name" \
-            -H "Content-Type: application/octet-stream" \
-            --input "$artifact_path" >/dev/null
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -f "tag_name=$tag" \
-            -F draft=true \
-            -F prerelease=false >/dev/null
-          release_url="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq .html_url)"
+          for artifact in artifacts/*; do
+            gh release upload "$tag" "$artifact" --clobber
+          done
+          release_url="$(gh release view "$tag" --json url --jq .url)"
           echo "Draft release: $release_url" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tag: $tag" >> "$GITHUB_STEP_SUMMARY"

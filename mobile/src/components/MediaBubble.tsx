@@ -2,10 +2,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Alert, Image, Modal, PanResponder, Platform, Pressable, Share, StyleSheet, Text, useWindowDimensions, View } from "react-native";
-import { ResizeMode, Video, type AVPlaybackStatus } from "expo-av";
-import * as FileSystem from "expo-file-system";
-import * as MediaLibrary from "expo-media-library";
-import * as Network from "expo-network";
+import { CameraRoll } from "@react-native-camera-roll/camera-roll";
+import NetInfo, { type NetInfoState } from "@react-native-community/netinfo";
+import RNFS from "react-native-fs";
+import Video, { type OnLoadData, type OnPlaybackStateChangedData, type OnProgressData, type VideoRef } from "react-native-video";
 import { fromByteArray } from "base64-js";
 import { downloadMedia } from "../rn-api";
 import { decryptMedia } from "../media";
@@ -50,24 +50,14 @@ async function saveNativeFile(uri: string, attachment: MessageAttachment, toGall
     return;
   }
   if (toGallery && (attachment.kind === "image" || attachment.kind === "video")) {
-    const permission = await MediaLibrary.requestPermissionsAsync(true);
-    if (!permission.granted) throw new Error("Доступ к галерее не предоставлен");
-    await MediaLibrary.createAssetAsync(uri);
+    await CameraRoll.save(uri, { type: attachment.kind === "image" ? "photo" : "video" });
     return;
   }
   if (Platform.OS === "android") {
-    let directoryUri = await AsyncStorage.getItem(DOWNLOAD_DIRECTORY_KEY);
-    if (!directoryUri) {
-      const suggestedDirectory = FileSystem.StorageAccessFramework.getUriForDirectoryInRoot("Download");
-      const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(suggestedDirectory);
-      if (!permissions.granted) throw new Error("Доступ к папке загрузок не предоставлен");
-      directoryUri = permissions.directoryUri;
-      await AsyncStorage.setItem(DOWNLOAD_DIRECTORY_KEY, directoryUri);
-    }
     try {
-      const targetUri = await FileSystem.StorageAccessFramework.createFileAsync(directoryUri, attachment.name, attachment.mimeType);
-      const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
-      await FileSystem.StorageAccessFramework.writeAsStringAsync(targetUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+      const safeName = attachment.name.replace(/[\\/]/g, "_");
+      const targetPath = `${RNFS.DownloadDirectoryPath}/${safeName}`;
+      await RNFS.copyFile(uri.replace(/^file:\/\//, ""), targetPath);
       return;
     } catch {
       await AsyncStorage.removeItem(DOWNLOAD_DIRECTORY_KEY);
@@ -102,7 +92,7 @@ function touchDistance(touches: readonly { pageX: number; pageY: number }[]) {
 }
 
 function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: MessageAttachment; onClose: () => void }) {
-  const mediaRef = useRef<Video>(null);
+  const mediaRef = useRef<VideoRef>(null);
   const [rotation, setRotation] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -119,11 +109,6 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   const offsetRef = useRef({ x: 0, y: 0 });
   const gestureRef = useRef({ distance: 0, zoom: 1, offset: { x: 0, y: 0 } });
   const { width: viewportWidth, height: viewportHeight } = useWindowDimensions();
-
-  useEffect(() => () => {
-    const player = mediaRef.current;
-    if (player) void player.unloadAsync().catch(() => undefined);
-  }, []);
 
   const panResponder = useMemo(() => PanResponder.create({
     onStartShouldSetPanResponder: () => false,
@@ -160,29 +145,32 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
 
   useEffect(() => {
     if (attachment.kind === "image" || !mediaRef.current) return;
-    void mediaRef.current.setRateAsync(speed, true);
-    void mediaRef.current.setVolumeAsync(volume);
+    mediaRef.current.setVolume(volume);
   }, [attachment.kind, speed, volume]);
 
-  const handlePlaybackStatus = (status: AVPlaybackStatus) => {
-    if (!status.isLoaded) {
-      if (status.error) setPlaybackError(true);
-      return;
-    }
+  const handleLoad = (status: OnLoadData) => {
+    setDurationMillis(status.duration * 1000);
+    if (status.naturalSize.width && status.naturalSize.height) setMediaSize({ width: status.naturalSize.width, height: status.naturalSize.height });
+  };
+
+  const handleProgress = (status: OnProgressData) => {
+    setPositionMillis(status.currentTime * 1000);
+  };
+
+  const handlePlaybackState = (status: OnPlaybackStateChangedData) => {
     setPlaying(status.isPlaying);
-    setPositionMillis(status.positionMillis);
-    setDurationMillis(status.durationMillis ?? 0);
   };
 
   const togglePlayback = () => {
     if (!mediaRef.current) return;
-    void (playing ? mediaRef.current.pauseAsync() : mediaRef.current.playAsync());
+    if (playing) mediaRef.current.pause();
+    else mediaRef.current.resume();
   };
 
   const seekTo = (locationX: number) => {
     if (!mediaRef.current || !durationMillis || !progressWidth) return;
     const ratio = Math.max(0, Math.min(1, locationX / progressWidth));
-    void mediaRef.current.setPositionAsync(ratio * durationMillis);
+    mediaRef.current.seek(ratio * durationMillis / 1000);
   };
 
   const measuredMediaSize = mediaSize ?? (attachment.kind === "video" ? { width: 16, height: 9 } : undefined);
@@ -198,8 +186,8 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   const content = attachment.kind === "image"
     ? <Image source={{ uri }} onLoad={(event) => setMediaSize({ width: event.nativeEvent.source.width, height: event.nativeEvent.source.height })} style={styles.mediaFill} resizeMode="contain" />
     : attachment.kind === "audio"
-      ? <View style={styles.audioViewerCard}><View style={styles.audioViewerIcon}><Icon name="mic" size={28} color={colors.primary} /></View><Text style={styles.audioViewerName} numberOfLines={1}>{attachment.name}</Text><Video ref={mediaRef} source={{ uri }} onPlaybackStatusUpdate={handlePlaybackStatus} shouldPlay resizeMode={ResizeMode.CONTAIN} style={styles.audioEngine} /></View>
-      : <Video ref={mediaRef} source={{ uri }} onError={() => setPlaybackError(true)} onReadyForDisplay={(event) => { const { width, height } = event.naturalSize; if (width && height) setMediaSize({ width, height }); }} onPlaybackStatusUpdate={handlePlaybackStatus} shouldPlay resizeMode={ResizeMode.CONTAIN} style={styles.mediaFill} />;
+      ? <View style={styles.audioViewerCard}><View style={styles.audioViewerIcon}><Icon name="mic" size={28} color={colors.primary} /></View><Text style={styles.audioViewerName} numberOfLines={1}>{attachment.name}</Text><Video ref={mediaRef} source={{ uri }} onLoad={handleLoad} onProgress={handleProgress} onPlaybackStateChanged={handlePlaybackState} onError={() => setPlaybackError(true)} paused={!playing} rate={speed} volume={volume} resizeMode="contain" style={styles.audioEngine} /></View>
+      : <Video ref={mediaRef} source={{ uri }} onLoad={handleLoad} onProgress={handleProgress} onPlaybackStateChanged={handlePlaybackState} onError={() => setPlaybackError(true)} paused={!playing} rate={speed} volume={volume} resizeMode="contain" style={styles.mediaFill} />;
   const mediaKind = attachment.kind === "image" ? "Фото" : attachment.kind === "video" ? "Видео" : "Аудио";
 
   return <Modal visible transparent animationType="fade" onRequestClose={onClose}><View style={styles.viewer}>
@@ -243,13 +231,13 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
   useEffect(() => {
     if (Platform.OS === "web") return;
     let mounted = true;
-    const applyNetwork = (state: Network.NetworkState) => {
+    const applyNetwork = (state: NetInfoState) => {
       if (!mounted) return;
-      setNetwork(state.type === Network.NetworkStateType.WIFI ? "wifi" : state.type === Network.NetworkStateType.CELLULAR ? "cellular" : "other");
+      setNetwork(state.type === "wifi" ? "wifi" : state.type === "cellular" ? "cellular" : "other");
     };
-    void Network.getNetworkStateAsync().then(applyNetwork).catch(() => undefined);
-    const subscription = Network.addNetworkStateListener(applyNetwork);
-    return () => { mounted = false; subscription.remove(); };
+    void NetInfo.fetch().then(applyNetwork).catch(() => undefined);
+    const unsubscribe = NetInfo.addEventListener(applyNetwork);
+    return () => { mounted = false; unsubscribe(); };
   }, []);
 
   const shouldDownload = manualDownload || autoDownloadAllowed(attachment, mediaSettings, network);
@@ -274,20 +262,18 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
       .then((ciphertext) => decryptMedia(ciphertext, attachment))
       .then(async (plaintext) => {
         if (Platform.OS === "web") {
-          const nextObjectUrl = URL.createObjectURL(new Blob([plaintext.buffer as ArrayBuffer], { type: attachment.mimeType }));
+          const nextObjectUrl = URL.createObjectURL(new Blob([fromByteArray(plaintext)], { type: attachment.mimeType }));
           if (disposed) URL.revokeObjectURL(nextObjectUrl);
           else { objectUrl = nextObjectUrl; setUri(nextObjectUrl); }
           return;
         }
-        const directory = FileSystem.cacheDirectory;
-        if (!directory) throw new Error("Кэш файлов недоступен");
-        const path = `${directory}enter-${attachment.id}.${extensionFor(attachment)}`;
-        await FileSystem.writeAsStringAsync(path, fromByteArray(plaintext), { encoding: FileSystem.EncodingType.Base64 });
+        const path = `${RNFS.CachesDirectoryPath}/enter-${attachment.id}.${extensionFor(attachment)}`;
+        await RNFS.writeFile(path, fromByteArray(plaintext), "base64");
         if (!gallerySaved.current && mediaSettings?.saveToGallery.privateChats && (attachment.kind === "image" || attachment.kind === "video")) {
           gallerySaved.current = true;
           await saveNativeFile(path, attachment, true).catch(() => undefined);
         }
-        if (!disposed) setUri(path);
+        if (!disposed) setUri(`file://${path}`);
       })
       .catch(() => { if (!disposed) setError(true); });
     return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
@@ -298,7 +284,7 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
   if (!uri) return <View style={grouped ? styles.groupLoading : styles.loading}><Icon name="attach" size={17} color={colors.primary} />{!grouped && <Text style={styles.loadingText}>Загрузка вложения…</Text>}</View>;
   const longPress = onAttachmentLongPress ? openActions : undefined;
   if (attachment.kind === "image") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupImageButton : styles.imageButton, captioned && styles.captionedMedia]}><Image source={{ uri }} onError={() => setError(true)} style={grouped ? styles.groupImage : styles.image} resizeMode="cover" /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} onError={() => setError(true)} resizeMode={ResizeMode.CONTAIN} shouldPlay={Boolean(mediaSettings?.autoplayVideo && !energySavingActive)} style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} onError={() => setError(true)} paused={!Boolean(mediaSettings?.autoplayVideo && !energySavingActive)} resizeMode="contain" style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   if (attachment.kind === "audio") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[styles.audioButton, grouped && styles.groupAudioButton, outgoing && styles.outgoingMedia]}><Icon name="mic" size={20} color={outgoing ? colors.primaryText : colors.primary} /><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>Аудио · {formatFileSize(attachment.size)}</Text></View></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   return <Pressable style={({ pressed }) => [styles.file, grouped && styles.groupFile, outgoing && styles.outgoingMedia, pressed && styles.pressed]} onPress={() => saveWithFeedback(uri, attachment)} onLongPress={longPress}><View style={[styles.fileIcon, outgoing && styles.outgoingFileIcon]}><Icon name="attach" size={19} color={outgoing ? colors.primaryText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>{formatFileSize(attachment.size)} · сохранить</Text></View><Icon name="share" size={18} color={outgoing ? colors.primaryText : colors.muted} /></Pressable>;
 }

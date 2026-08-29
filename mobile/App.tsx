@@ -1,19 +1,9 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useFonts } from "expo-font";
-import { IBMPlexSans_400Regular } from "@expo-google-fonts/ibm-plex-sans/400Regular";
-import { IBMPlexSans_500Medium } from "@expo-google-fonts/ibm-plex-sans/500Medium";
-import { IBMPlexSans_600SemiBold } from "@expo-google-fonts/ibm-plex-sans/600SemiBold";
-import { IBMPlexSans_700Bold } from "@expo-google-fonts/ibm-plex-sans/700Bold";
-import { Montserrat_500Medium } from "@expo-google-fonts/montserrat/500Medium";
-import { Montserrat_600SemiBold } from "@expo-google-fonts/montserrat/600SemiBold";
-import { Montserrat_700Bold } from "@expo-google-fonts/montserrat/700Bold";
-import * as NavigationBar from "expo-navigation-bar";
-import * as Battery from "expo-battery";
-import * as Notifications from "expo-notifications";
-import { Alert, Animated, AppState, Appearance, Easing, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View, useColorScheme, useWindowDimensions } from "react-native";
+import notifee, { EventType } from "@notifee/react-native";
+import { useBatteryLevel } from "react-native-device-info";
+import { Alert, Animated, AppState, Appearance, Easing, Image, PanResponder, Platform, Pressable, StatusBar, StyleSheet, Text, View, useColorScheme, useWindowDimensions } from "react-native";
 import { initialWindowMetrics, SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { StatusBar } from "expo-status-bar";
 import { AuthScreen } from "./src/components/AuthScreen";
 import { ConversationList, type Action } from "./src/components/ConversationList";
 import { ChatScreen, ForwardSheet } from "./src/components/ChatScreen";
@@ -179,7 +169,6 @@ function mergeDeliveryReceipts(current: Record<string, Message[]>, receipts: Rem
 }
 
 export default function App() {
-  const [fontsLoaded] = useFonts({ IBMPlexSans_400Regular, IBMPlexSans_500Medium, IBMPlexSans_600SemiBold, IBMPlexSans_700Bold, Montserrat_500Medium, Montserrat_600SemiBold, Montserrat_700Bold });
   const [hydrated, setHydrated] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
@@ -202,7 +191,7 @@ export default function App() {
   const [messageError, setMessageError] = useState("");
   const [mediaUploadProgress, setMediaUploadProgress] = useState<number | null>(null);
   const [localSettings, setLocalSettings] = useState<MobileSettings>(DEFAULT_SETTINGS);
-  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
+  const batteryLevel = useBatteryLevel();
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [forwardMessage, setForwardMessage] = useState<Message | null>(null);
@@ -241,14 +230,6 @@ export default function App() {
     Appearance.setColorScheme(localSettings.theme === "system" ? null : localSettings.theme);
   }, [localSettings.theme]);
 
-  useEffect(() => {
-    if (Platform.OS === "web") return;
-    let mounted = true;
-    void Battery.getBatteryLevelAsync().then((level) => { if (mounted) setBatteryLevel(level); }).catch(() => undefined);
-    const subscription = Battery.addBatteryLevelListener(({ batteryLevel: level }) => setBatteryLevel(level));
-    return () => { mounted = false; subscription.remove(); };
-  }, []);
-
   useLayoutEffect(() => {
     if (!hasRenderedScreen.current) {
       hasRenderedScreen.current = true;
@@ -263,20 +244,15 @@ export default function App() {
     Animated.timing(screenMotion, { toValue: 1, duration: energySavingActive && !localSettings.energySaving.smoothTransitions ? 0 : 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
   }, [energySavingActive, localSettings.energySaving.smoothTransitions, screen, screenMotion]);
 
-  useEffect(() => {
-    if (Platform.OS !== "android") return;
-    void NavigationBar.setBackgroundColorAsync(themeColors.background);
-    void NavigationBar.setButtonStyleAsync(themeColors.background === "#f5f5f7" ? "dark" : "light");
-  }, [themeColors.background]);
-
   useEffect(() => { activeConversationIdRef.current = activeConversationId; }, [activeConversationId]);
   useEffect(() => { screenRef.current = screen; }, [screen]);
   useEffect(() => { void configureNotifications(); }, []);
 
   useEffect(() => {
     if (Platform.OS === "web") return;
-    const openNotification = (response: Notifications.NotificationResponse) => {
-      const data = response.notification.request.content.data as { profileId?: unknown; conversationId?: unknown; messageId?: unknown };
+    const openNotification = (notification?: { data?: Record<string, unknown> }) => {
+      if (!notification) return;
+      const data = notification.data ?? {};
       if (typeof data.conversationId !== "string") return;
       const messageId = typeof data.messageId === "string" ? data.messageId : undefined;
       if (messageId && handledNotificationRef.current === messageId) return;
@@ -293,9 +269,11 @@ export default function App() {
       setActiveConversationByProfile((current) => ({ ...current, [profileId]: next.conversationId }));
       setScreen("chat");
     };
-    const subscription = Notifications.addNotificationResponseReceivedListener(openNotification);
-    void Notifications.getLastNotificationResponseAsync().then((response) => { if (response) openNotification(response); });
-    return () => subscription.remove();
+    const unsubscribe = notifee.onForegroundEvent(({ type, detail }) => {
+      if (type === EventType.PRESS) openNotification(detail.notification);
+    });
+    void notifee.getInitialNotification().then((initial) => { if (initial) openNotification(initial.notification); });
+    return unsubscribe;
   }, [activeProfileId, hydrated, profiles]);
 
   useEffect(() => {
@@ -1171,10 +1149,10 @@ export default function App() {
     if (action === "mute") updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, muted: !item.muted } : item));
   }
 
-  if (!hydrated || !fontsLoaded) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider>;
+  if (!hydrated) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider>;
   if (profiles.length === 0 || showAuth) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider>;
 
-  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar style={themeColors.background === "#f5f5f7" ? "dark" : "light"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
+  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar barStyle={themeColors.background === "#f5f5f7" ? "dark-content" : "light-content"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
     <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} themeColors={themeColors} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} onDeleteAccount={deleteAccountAndProfile} onSettingsChange={setLocalSettings} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} messageTextSize={localSettings.messageTextSize} bubbleRadius={localSettings.bubbleRadius} themeColors={themeColors} mediaSettings={localSettings.media} energySavingActive={energySavingActive} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} themeColors={themeColors} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} listLayout={localSettings.chatListLayout} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
     {screen !== "chat" && <BottomNav themeColors={themeColors} screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
     <ProfileSheet visible={showProfiles} profiles={profiles} activeProfile={activeProfile} onClose={() => setShowProfiles(false)} onSelect={selectProfile} onAdd={() => setShowAuth(true)} onRemove={removeProfile} />

@@ -1,6 +1,6 @@
 import appJson from "../app.json";
 
-export const CURRENT_VERSION = appJson.expo.version;
+export const CURRENT_VERSION = appJson.version;
 export const GITHUB_REPO_URL = "https://github.com/Astonikum/EnterMessenger";
 
 const RELEASES_API_URL = "https://api.github.com/repos/Astonikum/EnterMessenger/releases?per_page=100";
@@ -39,7 +39,6 @@ export function isNewerVersion(version: string, currentVersion = CURRENT_VERSION
 export async function fetchLatestRelease(platform: "desktop" | "mobile", signal?: AbortSignal): Promise<PlatformRelease | null> {
   const response = await fetch(RELEASES_API_URL, {
     headers: { Accept: "application/vnd.github+json" },
-    cache: "no-store",
     signal,
   });
   if (!response.ok) {

@@ -1,7 +1,7 @@
 import { gcm } from "@noble/ciphers/aes";
 import { sha256 } from "@noble/hashes/sha2";
 import { fromByteArray, toByteArray } from "base64-js";
-import { getRandomBytesAsync } from "expo-crypto";
+import { randomBytes } from "./crypto-random";
 import type { MessageAttachment } from "./types";
 
 export const MAX_MEDIA_BYTES = 200 * 1024 * 1024;
@@ -31,12 +31,12 @@ export async function encryptMediaBytes(
   metadata: Pick<MobileMediaSource, "name" | "mimeType"> & Partial<Pick<MessageAttachment, "kind" | "width" | "height" | "durationMs">>,
 ): Promise<EncryptedMedia> {
   if (plaintext.byteLength > MAX_MEDIA_BYTES) throw new Error("Файл слишком большой. Максимум — 200 МБ.");
-  const key = await getRandomBytesAsync(32);
-  const nonce = await getRandomBytesAsync(12);
+  const key = randomBytes(32);
+  const nonce = randomBytes(12);
   const ciphertext = gcm(key, nonce).encrypt(plaintext);
   return {
     attachment: {
-      id: `${Date.now().toString(36)}-${Array.from(await getRandomBytesAsync(8), (value) => value.toString(16).padStart(2, "0")).join("")}`,
+      id: `${Date.now().toString(36)}-${Array.from(randomBytes(8), (value) => value.toString(16).padStart(2, "0")).join("")}`,
       kind: metadata.kind ?? kindForMime(metadata.mimeType || "application/octet-stream"),
       name: metadata.name || "Вложение",
       mimeType: metadata.mimeType || "application/octet-stream",

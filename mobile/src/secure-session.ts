@@ -1,5 +1,6 @@
-import * as SecureStore from "expo-secure-store";
+import * as Keychain from "react-native-keychain";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 
 const SESSION_KEY_PREFIX = "enter-session-";
 const FALLBACK_SESSION_KEY_PREFIX = "enter-session-fallback-";
@@ -13,19 +14,23 @@ function fallbackKey(profileId: string) {
 }
 
 async function available() {
-  try { return await SecureStore.isAvailableAsync(); } catch { return false; }
+  if (Platform.OS === "web") return false;
+  try { await Keychain.getGenericPassword({ service: "enter-availability-probe" }); return true; } catch { return false; }
 }
 
 export async function readSessionToken(profileId: string) {
   if (await available()) {
-    try { return (await SecureStore.getItemAsync(key(profileId))) || undefined; } catch { return undefined; }
+    try {
+      const credentials = await Keychain.getGenericPassword({ service: key(profileId) });
+      return credentials ? credentials.password : undefined;
+    } catch { return undefined; }
   }
   try { return (await AsyncStorage.getItem(fallbackKey(profileId))) || undefined; } catch { return undefined; }
 }
 
 export async function writeSessionToken(profileId: string, token: string) {
   if (await available()) {
-    await SecureStore.setItemAsync(key(profileId), token);
+    await Keychain.setGenericPassword("enter", token, { service: key(profileId) });
     await AsyncStorage.removeItem(fallbackKey(profileId)).catch(() => undefined);
     return;
   }
@@ -34,7 +39,7 @@ export async function writeSessionToken(profileId: string, token: string) {
 
 export async function deleteSessionToken(profileId: string) {
   if (await available()) {
-    try { await SecureStore.deleteItemAsync(key(profileId)); } catch { /* Session cleanup is best effort. */ }
+    try { await Keychain.resetGenericPassword({ service: key(profileId) }); } catch { /* Session cleanup is best effort. */ }
   }
   try { await AsyncStorage.removeItem(fallbackKey(profileId)); } catch { /* Session cleanup is best effort. */ }
 }

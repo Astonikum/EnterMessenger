@@ -1,4 +1,4 @@
-import { randomUUID } from "expo-crypto";
+import { randomUUID } from "./crypto-random";
 import type { Message } from "./types";
 
 export const EMPTY_MESSAGES: Record<string, Message[]> = {};

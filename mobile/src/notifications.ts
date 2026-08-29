@@ -1,36 +1,28 @@
-import * as Notifications from "expo-notifications";
+import notifee, { AndroidImportance, AuthorizationStatus } from "@notifee/react-native";
 import { Platform } from "react-native";
 import { readSettings } from "./settings";
 
-Notifications.setNotificationHandler({
-  handleNotification: async (notification) => {
-    const isLocal = notification.request.content.data?.local === true;
-    return { shouldShowAlert: isLocal, shouldPlaySound: isLocal && notification.request.content.data?.sound === true, shouldSetBadge: isLocal };
-  },
-});
-
+const MESSAGE_CHANNEL_ID = "messages";
 let notificationSetup: Promise<boolean> | null = null;
 
 export function configureNotifications(): Promise<boolean> {
   if (Platform.OS === "web") return Promise.resolve(false);
   if (notificationSetup) return notificationSetup;
   notificationSetup = (async () => {
-    if (Platform.OS === "android") {
-      try {
-        await Notifications.setNotificationChannelAsync("messages", {
+    try {
+      const permission = await notifee.requestPermission();
+      if (permission.authorizationStatus === AuthorizationStatus.DENIED) return false;
+      if (Platform.OS === "android") {
+        await notifee.createChannel({
+          id: MESSAGE_CHANNEL_ID,
           name: "Сообщения",
-          importance: Notifications.AndroidImportance.HIGH,
+          importance: AndroidImportance.HIGH,
+          vibration: true,
           vibrationPattern: [0, 250, 250, 250],
           sound: "default",
         });
-      } catch {
-        // A channel failure must not prevent permission/token setup.
       }
-    }
-    try {
-      const permissions = await Notifications.getPermissionsAsync();
-      if (permissions.status === "granted") return true;
-      return (await Notifications.requestPermissionsAsync()).status === "granted";
+      return true;
     } catch {
       return false;
     }
@@ -39,13 +31,8 @@ export function configureNotifications(): Promise<boolean> {
 }
 
 export async function registerForPushNotifications() {
-  if (Platform.OS === "web") return null;
-  if (!(await configureNotifications())) return null;
-  try {
-    return (await Notifications.getExpoPushTokenAsync()).data;
-  } catch {
-    return null;
-  }
+  await configureNotifications();
+  return null;
 }
 
 export async function notifyIncomingMessage(input: {
@@ -58,15 +45,18 @@ export async function notifyIncomingMessage(input: {
   try {
     const settings = await readSettings();
     if (!settings.notifications.desktop || !settings.notifications.allAccounts || !settings.notifications.privateChats) return;
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title: input.title,
-        body: settings.notifications.preview && settings.notifications.inAppPreview ? input.text : "Новое сообщение",
+    await configureNotifications();
+    await notifee.displayNotification({
+      id: input.messageId,
+      title: input.title,
+      body: settings.notifications.preview && settings.notifications.inAppPreview ? input.text : "Новое сообщение",
+      data: { local: "true", sound: settings.notifications.sound ? "true" : "false", profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
+      android: {
+        channelId: MESSAGE_CHANNEL_ID,
+        pressAction: { id: "open-chat" },
         sound: settings.notifications.sound && settings.notifications.inAppSound ? "default" : undefined,
-        badge: settings.notifications.showCounter ? 1 : undefined,
-        data: { local: true, sound: settings.notifications.sound, profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
       },
-      trigger: Platform.OS === "android" ? { channelId: "messages", seconds: 1 } : null,
+      ios: { sound: settings.notifications.sound && settings.notifications.inAppSound ? "default" : undefined },
     });
   } catch {
     // Ignore unavailable notification providers; realtime delivery still works.

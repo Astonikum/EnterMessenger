@@ -362,7 +362,7 @@ async function request(input: RequestInfo | URL, init?: RequestInit) {
   const path = (() => { try { return new URL(requestUrl).pathname; } catch { return "request"; } })();
   const method = init?.method ?? "GET";
   try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(requestUrl, { ...init, signal: controller.signal });
     logEvent("network", `${method} ${path}`, `HTTP ${response.status}`, response.ok ? "info" : "warn");
     return response;
   } catch (reason) {
@@ -504,7 +504,7 @@ export function openRealtime(profile: Profile, since: number, onEvent: (event: R
       // Ignore malformed frames; the next snapshot repairs state.
     }
   };
-  websocket.onclose = (event) => onClose({ code: event.code, reason: event.reason, wasClean: event.wasClean });
+  websocket.onclose = (event) => onClose({ code: event.code ?? 1000, reason: event.reason ?? "", wasClean: "wasClean" in event ? Boolean(event.wasClean) : false });
   return websocket;
 }
 

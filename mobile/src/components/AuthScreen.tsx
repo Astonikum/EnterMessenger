@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { ActivityIndicator, Animated, Easing, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { StatusBar } from "expo-status-bar";
+import { StatusBar } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { Profile } from "../types";
 import { colors, fonts, radii } from "../theme";
@@ -115,9 +115,9 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     setError("");
   }
 
-  if (showLogs) return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><StatusBar style="light" /><LogsScreen onClose={() => setShowLogs(false)} /></SafeAreaView>;
+  if (showLogs) return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><StatusBar barStyle="light-content" /><LogsScreen onClose={() => setShowLogs(false)} /></SafeAreaView>;
 
-  return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><KeyboardAvoidingView style={styles.page} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}><StatusBar style="light" /><ScrollView bounces={false} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
+  return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><KeyboardAvoidingView style={styles.page} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}><StatusBar barStyle="light-content" /><ScrollView bounces={false} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
     {(onCancel || step === "auth") && <Pressable style={styles.back} onPress={goBack}><Icon name="arrowBack" size={20} color={colors.foreground} /><Text style={styles.backText}>Назад</Text></Pressable>}
     <View style={styles.brand}><Image source={require("../../assets/enter_logo.png")} style={styles.brandLogo} resizeMode="contain" accessibilityLabel="Enter" /></View>
     <Animated.View style={[styles.stepPage, { opacity: stepOpacity, transform: [{ translateX: stepOffset }] }]}>

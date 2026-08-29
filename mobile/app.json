@@ -1,27 +1,5 @@
 {
-  "expo": {
-    "name": "Enter",
-    "slug": "enter-client",
-    "version": "0.2.1",
-    "orientation": "portrait",
-    "userInterfaceStyle": "dark",
-    "scheme": "enter",
-    "icon": "./assets/enter-icon.png",
-    "android": {
-      "package": "com.enter.messenger",
-      "usesCleartextTraffic": true
-    },
-    "ios": {
-      "bundleIdentifier": "com.enter.messenger",
-      "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
-      }
-    },
-    "plugins": [
-      "expo-font",
-      "expo-asset",
-      "expo-secure-store",
-      "expo-notifications"
-    ]
-  }
+  "name": "EnterMobile",
+  "displayName": "Enter",
+  "version": "0.2.1"
 }
