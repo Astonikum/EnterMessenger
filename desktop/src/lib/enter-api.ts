@@ -1,6 +1,6 @@
 import { formatEnterAddress, parseEnterAddress } from "./enter-protocol";
 import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
-import { normalizeServerAddress } from "./server-address";
+import { normalizeServerAddress, sameServerAddress } from "./server-address";
 import { logEvent } from "./logs";
 import { MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
@@ -115,7 +115,7 @@ function validateDirectory(value: unknown, expected?: { handle: string; server: 
   if (!isString(value.id, 256) || !isString(value.name, 256) || !handle || !server || !devices || devices.length > 256 || !devices.every(isDeviceKeyBundle)) {
     throw new Error("Некорректный ответ каталога ключей");
   }
-  if (expected && (handle !== expected.handle || server !== expected.server)) {
+  if (expected && (handle !== expected.handle || !sameServerAddress(server, expected.server))) {
     throw new Error("Ответ каталога не соответствует запрошенному адресу");
   }
   const accountKey = value.accountKey;

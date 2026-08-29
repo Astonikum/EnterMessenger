@@ -8,6 +8,7 @@ import { formatEnterAddress, parseEnterAddress } from "../common/src/address.ts"
 import { isAuthDraftValid, isAuthHealthResponse, isAuthResponse } from "../common/src/auth.ts";
 import { messagePreview } from "../common/src/messages.ts";
 import { normalizeClientSettings } from "../common/src/settings.ts";
+import { sameServerAddress } from "../common/src/server-address.ts";
 import { limitMessagesByTotal, sanitizeOutboxByProfile } from "../common/src/storage-models.ts";
 import { mapRemoteConversation, mapRemoteMessage } from "../common/src/api-mappers.ts";
 
@@ -69,6 +70,14 @@ test("common Enter address grammar delegates server normalization", () => {
   const address = parseEnterAddress("@Alex@example.test/", "server.test", normalize);
   assert.deepEqual(address, { handle: "alex", server: "https://example.test" });
   assert.equal(formatEnterAddress(address), "alex@example.test");
+});
+
+test("common server addresses accept only equivalent local aliases", () => {
+  assert.ok(sameServerAddress("http://localhost:50121", "http://127.0.0.1:50121"));
+  assert.ok(sameServerAddress("http://0.0.0.0:50121", "http://[::1]:50121"));
+  assert.ok(!sameServerAddress("http://localhost:50121", "https://127.0.0.1:50121"));
+  assert.ok(!sameServerAddress("http://localhost:50121", "http://127.0.0.1:50122"));
+  assert.ok(!sameServerAddress("http://10.0.0.2:50121", "http://192.168.1.2:50121"));
 });
 
 test("common auth models validate form and response boundaries", () => {

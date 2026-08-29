@@ -11,6 +11,17 @@ export function normalizeServerAddress(raw: string) {
   return parsed ? formatServerUrl(parsed) : null;
 }
 
+export function sameServerAddress(left: string, right: string) {
+  const leftUrl = parseServerUrl(left);
+  const rightUrl = parseServerUrl(right);
+  if (!leftUrl || !rightUrl) return false;
+  return leftUrl.protocol === rightUrl.protocol
+    && leftUrl.port === rightUrl.port
+    && leftUrl.pathname === rightUrl.pathname
+    && leftUrl.search === rightUrl.search
+    && canonicalHostname(leftUrl.hostname) === canonicalHostname(rightUrl.hostname);
+}
+
 export function migrateLocalServerAddress(raw: string) {
   const parsed = parseServerUrl(raw);
   if (parsed && isLocalHost(parsed.hostname) && ["8080", "8081"].includes(parsed.port)) {
@@ -87,4 +98,9 @@ function isLocalHost(hostname: string) {
   const octets = host.split(".").map(Number);
   if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
   return octets[0] === 10 || octets[0] === 127 || octets[0] === 169 && octets[1] === 254 || octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31 || octets[0] === 192 && octets[1] === 168;
+}
+
+function canonicalHostname(hostname: string) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return ["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(host) ? "127.0.0.1" : host;
 }
