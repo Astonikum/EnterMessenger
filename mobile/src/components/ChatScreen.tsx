@@ -5,8 +5,8 @@ import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import type { Conversation, Message, MessageAttachment, Profile } from "../types";
 import { MediaBubble, MediaGroup } from "./MediaBubble";
-import type { MobileMediaSource } from "../media";
-import { makeId } from "../data";
+import type { EncryptedMedia, MobileMediaSource } from "../media";
+import { makeId, messageTime } from "../data";
 import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
 import { ConversationAvatar } from "./Avatar";
@@ -33,7 +33,10 @@ type Props = {
   onCancelContext: () => void;
 };
 
-export type PendingMedia = { source: MobileMediaSource };
+export type PendingMedia = { source: MobileMediaSource } | { encrypted: EncryptedMedia };
+
+const MIN_MESSAGE_INPUT_HEIGHT = 21;
+const MAX_MESSAGE_INPUT_HEIGHT = 112;
 
 function formatFileSize(size?: number) {
   if (!size) return "";
@@ -47,13 +50,26 @@ function sameStack(left?: Message, right?: Message) {
   return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
 }
 
+function presenceLabel(conversation: Conversation) {
+  if (conversation.online) return "В сети";
+  if (!conversation.lastSeenAt) return "был(а) давно";
+  const date = new Date(conversation.lastSeenAt);
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return `был(а) сегодня в ${messageTime(date)}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `был(а) вчера в ${messageTime(date)}`;
+  return `был(а) ${new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long" }).format(date)} в ${messageTime(date)}`;
+}
+
 export function ChatScreen({ profile, conversation, messages, error = "", uploadProgress = null, replyTo, editingMessage, onBack, onSend, onReply, onStartEdit, onEdit, onPin, onSave, onDelete, onReact, onForward, onCancelContext }: Props) {
   const [text, setText] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [localEditingMessage, setLocalEditingMessage] = useState<Message | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [inputHeight, setInputHeight] = useState(36);
+  const [inputHeight, setInputHeight] = useState(MIN_MESSAGE_INPUT_HEIGHT);
+  const [inputScrollable, setInputScrollable] = useState(false);
   const [pendingMedia, setPendingMedia] = useState<PendingMedia[]>([]);
   const [attachmentMenuVisible, setAttachmentMenuVisible] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
@@ -82,7 +98,20 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
     if (uploadProgress !== null || ((!value && pendingMedia.length === 0) || conversation.canWrite === false)) return;
     if (activeEditingMessage) onEdit({ ...activeEditingMessage, text: value, edited: true });
     else onSend({ id: makeId(), author: "me", text: value, time: new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" }).format(new Date()), replyTo: replyTo ? { id: replyTo.id, text: replyTo.text } : undefined }, pendingMedia);
-    setText(""); setPendingMedia([]); setInputHeight(36); setLocalEditingMessage(null); onCancelContext();
+    setText(""); setPendingMedia([]); setInputHeight(MIN_MESSAGE_INPUT_HEIGHT); setInputScrollable(false); setLocalEditingMessage(null); onCancelContext();
+  }
+
+  function handleInputTextChange(value: string) {
+    setText(value);
+    setInputScrollable(false);
+    if (!value) setInputHeight(MIN_MESSAGE_INPUT_HEIGHT);
+  }
+
+  function handleInputContentSizeChange(event: { nativeEvent: { contentSize: { height: number } } }) {
+    const contentHeight = Math.ceil(event.nativeEvent.contentSize.height);
+    const nextHeight = Math.min(MAX_MESSAGE_INPUT_HEIGHT, Math.max(MIN_MESSAGE_INPUT_HEIGHT, contentHeight));
+    setInputHeight(nextHeight);
+    setInputScrollable(nextHeight >= MAX_MESSAGE_INPUT_HEIGHT);
   }
 
   function appendSources(sources: MobileMediaSource[]) {
@@ -102,7 +131,7 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
   }
 
   return <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={Platform.OS === "ios" ? 4 : 0}>
-    <View style={styles.header}>{searchOpen ? <><Pressable onPress={() => { setSearchOpen(false); setSearchQuery(""); }} style={styles.headerButton} hitSlop={6}><Icon name="arrowBack" size={22} color={colors.foreground} /></Pressable><View style={styles.searchHeaderInput}><Icon name="search" size={18} color={colors.muted} /><TextInput value={searchQuery} onChangeText={setSearchQuery} placeholder="Поиск сообщений" placeholderTextColor={colors.muted} style={styles.searchInput} autoFocus /></View>{searchQuery.trim() ? <Text style={styles.matchCount}>{visibleMessages.length}</Text> : null}</> : <><Pressable onPress={onBack} style={styles.headerButton} hitSlop={6}><Icon name="arrowBack" size={22} color={colors.foreground} /></Pressable><ConversationAvatar conversation={conversation} size={44} /><View style={styles.headerCopy}><Text style={styles.headerName} numberOfLines={1}>{conversation.name}</Text><Text style={styles.headerSub} numberOfLines={1}>{conversation.subtitle ?? (conversation.online ? "в сети" : "был(а) недавно")}</Text></View><View style={styles.headerActions}><Pressable style={styles.headerButton} onPress={() => setSearchOpen(true)}><Icon name="search" size={20} color={colors.muted} /></Pressable></View></> }</View>
+  <View style={styles.header}>{searchOpen ? <><Pressable onPress={() => { setSearchOpen(false); setSearchQuery(""); }} style={styles.headerButton} hitSlop={6}><Icon name="arrowBack" size={22} color={colors.foreground} /></Pressable><View style={styles.searchHeaderInput}><Icon name="search" size={18} color={colors.muted} /><TextInput value={searchQuery} onChangeText={setSearchQuery} placeholder="Поиск сообщений" placeholderTextColor={colors.muted} style={styles.searchInput} autoFocus /></View>{searchQuery.trim() ? <Text style={styles.matchCount}>{visibleMessages.length}</Text> : null}</> : <><Pressable onPress={onBack} style={styles.headerButton} hitSlop={6}><Icon name="arrowBack" size={22} color={colors.foreground} /></Pressable><ConversationAvatar conversation={conversation} size={44} /><View style={styles.headerCopy}><Text style={styles.headerName} numberOfLines={1}>{conversation.name}</Text><Text style={styles.headerSub} numberOfLines={1}>{presenceLabel(conversation)}</Text></View><View style={styles.headerActions}><Pressable style={styles.headerButton} onPress={() => setSearchOpen(true)}><Icon name="search" size={20} color={colors.muted} /></Pressable></View></> }</View>
     {visibleMessages.length ? <View style={styles.messageArea}>
       {selectedIds.length > 0 && <View style={styles.selectionBar}><Text style={styles.selectionText}>Выбрано: {selectedIds.length}</Text><Pressable onPress={() => setSelectedIds([])} style={styles.selectionClose} hitSlop={8}><Icon name="close" size={17} color={colors.foreground} /></Pressable></View>}
       <FlatList
@@ -119,7 +148,7 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
       />
     </View> : <View style={styles.emptyChat}><View style={styles.emptyChatIcon}><Icon name={searchQuery.trim() ? "search" : conversation.canWrite === false ? "info" : "chat"} size={28} color={colors.primary} /></View><Text style={styles.emptyChatTitle}>{searchQuery.trim() ? "Ничего не найдено" : "Нет сообщений"}</Text><Text style={styles.emptyChatText}>{searchQuery.trim() ? "Попробуйте изменить запрос." : conversation.canWrite === false ? "Обновления появятся здесь." : "Начните общение"}</Text></View>}
     {error ? <Text style={styles.error}>{error}</Text> : null}
-    {conversation.canWrite === false ? <View style={styles.readOnly}><Text style={styles.readOnlyText}>Этот чат доступен только для чтения</Text></View> : <View style={styles.composerWrap}>{(replyTo || activeEditingMessage) && <Animated.View style={{ opacity: contextMotion, transform: [{ translateX: contextMotion.interpolate({ inputRange: [0, 1], outputRange: [6, 0] }) }] }}><View style={styles.context}><View style={styles.contextAccent} /><View style={styles.contextCopy}><Text style={styles.contextTitle}>{activeEditingMessage ? "Редактирование сообщения" : "Ответ на сообщение"}</Text><Text style={styles.contextText} numberOfLines={1}>{activeEditingMessage?.text ?? replyTo?.text}</Text></View><Pressable onPress={() => { setText(""); setLocalEditingMessage(null); setInputHeight(36); onCancelContext(); }} hitSlop={10}><Icon name="close" size={18} color={colors.muted} /></Pressable></View></Animated.View>}{uploadProgress !== null && <View style={styles.uploadProgress}><View style={styles.uploadProgressHeader}><Text style={styles.uploadProgressLabel}>{uploadProgress < 1 ? "Подготовка вложения…" : "Отправка вложения…"}</Text><Text style={styles.uploadProgressValue}>{uploadProgress}%</Text></View><View style={styles.uploadTrack}><View style={[styles.uploadFill, { width: `${uploadProgress}%` }]} /></View></View>}{pendingMedia.length > 0 && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pendingList}>{pendingMedia.map(({ source }, index) => <View key={`${source.name}-${index}`} style={styles.pendingItem}>{source.mimeType.startsWith("image/") ? <Image source={{ uri: source.uri }} style={styles.pendingThumb} /> : <View style={styles.pendingIcon}><Icon name={source.mimeType.startsWith("video/") ? "videocam" : "attach"} size={16} color={colors.primary} /></View>}<View style={styles.pendingCopy}><Text style={styles.pendingName} numberOfLines={1}>{source.name}</Text><Text style={styles.pendingSize}>{formatFileSize(source.size)}</Text></View><Pressable onPress={() => setPendingMedia((current) => current.filter((_, itemIndex) => itemIndex !== index))} hitSlop={8}><Icon name="close" size={15} color={colors.muted} /></Pressable></View>)}</ScrollView>}<View style={styles.composer}><Pressable style={[styles.composerButton, activeEditingMessage && styles.disabledAction]} onPress={() => setAttachmentMenuVisible(true)} disabled={Boolean(activeEditingMessage) || uploadProgress !== null}><Icon name="attach" size={20} color={colors.muted} /></Pressable><TextInput value={text} onChangeText={setText} placeholder="Написать сообщение…" placeholderTextColor={colors.muted} multiline maxLength={4000} scrollEnabled={inputHeight >= 112} onContentSizeChange={(event) => setInputHeight(text.trim().length === 0 ? 36 : Math.min(112, Math.max(36, event.nativeEvent.contentSize.height)))} style={[styles.messageInput, inputHeight <= 36 ? styles.messageInputSingle : styles.messageInputMulti, { height: inputHeight }]} onSubmitEditing={(event) => { if (Platform.OS !== "ios" && !event.nativeEvent.text.includes("\n")) submit(); }} blurOnSubmit={false} /><Pressable style={[styles.send, (uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)) && styles.sendDisabled]} onPress={submit} disabled={uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)}><Icon name="send" size={18} color={colors.primaryText} /></Pressable></View><Modal visible={attachmentMenuVisible} transparent animationType="slide" onRequestClose={() => setAttachmentMenuVisible(false)}><SafeAreaSheet onClose={() => setAttachmentMenuVisible(false)} sheetStyle={styles.attachmentSheet}><View style={styles.handle} /><Text style={styles.sheetTitle}>Добавить контент</Text><Pressable style={styles.attachmentOption} onPress={() => void pickGallery()}><View style={styles.attachmentIcon}><Icon name="videocam" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Фото и видео</Text><Text style={styles.attachmentSubtitle}>Выбрать из галереи</Text></View></Pressable><Pressable style={styles.attachmentOption} onPress={() => void pickFiles()}><View style={styles.attachmentIcon}><Icon name="attach" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Файл</Text><Text style={styles.attachmentSubtitle}>Открыть файловый менеджер</Text></View></Pressable></SafeAreaSheet></Modal></View>}
+    {conversation.canWrite === false ? <View style={styles.readOnly}><Text style={styles.readOnlyText}>Этот чат доступен только для чтения</Text></View> : <View style={styles.composerWrap}>{(replyTo || activeEditingMessage) && <Animated.View style={{ opacity: contextMotion, transform: [{ translateX: contextMotion.interpolate({ inputRange: [0, 1], outputRange: [6, 0] }) }] }}><View style={styles.context}><View style={styles.contextAccent} /><View style={styles.contextCopy}><Text style={styles.contextTitle}>{activeEditingMessage ? "Редактирование сообщения" : "Ответ на сообщение"}</Text><Text style={styles.contextText} numberOfLines={1}>{activeEditingMessage?.text ?? replyTo?.text}</Text></View><Pressable onPress={() => { setText(""); setLocalEditingMessage(null); setInputHeight(MIN_MESSAGE_INPUT_HEIGHT); setInputScrollable(false); onCancelContext(); }} hitSlop={10}><Icon name="close" size={18} color={colors.muted} /></Pressable></View></Animated.View>}{uploadProgress !== null && <View style={styles.uploadProgress}><View style={styles.uploadProgressHeader}><Text style={styles.uploadProgressLabel}>{uploadProgress < 1 ? "Подготовка вложения…" : "Отправка вложения…"}</Text><Text style={styles.uploadProgressValue}>{uploadProgress}%</Text></View><View style={styles.uploadTrack}><View style={[styles.uploadFill, { width: `${uploadProgress}%` }]} /></View></View>}{pendingMedia.length > 0 && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pendingList}>{pendingMedia.map((item, index) => { const source = "source" in item ? item.source : undefined; const attachment = "encrypted" in item ? item.encrypted.attachment : undefined; const name = source?.name ?? attachment?.name ?? "Вложение"; const mimeType = source?.mimeType ?? attachment?.mimeType ?? "application/octet-stream"; const size = source?.size ?? attachment?.size; return <View key={`${name}-${index}`} style={styles.pendingItem}>{source && mimeType.startsWith("image/") ? <Image source={{ uri: source.uri }} style={styles.pendingThumb} /> : <View style={styles.pendingIcon}><Icon name={mimeType.startsWith("video/") ? "videocam" : "attach"} size={16} color={colors.primary} /></View>}<View style={styles.pendingCopy}><Text style={styles.pendingName} numberOfLines={1}>{name}</Text><Text style={styles.pendingSize}>{formatFileSize(size)}</Text></View><Pressable onPress={() => setPendingMedia((current) => current.filter((_, itemIndex) => itemIndex !== index))} hitSlop={8}><Icon name="close" size={15} color={colors.muted} /></Pressable></View>; })}</ScrollView>}<View style={[styles.composer, inputHeight > MIN_MESSAGE_INPUT_HEIGHT && styles.composerExpanded]}><Pressable style={[styles.composerButton, activeEditingMessage && styles.disabledAction]} onPress={() => setAttachmentMenuVisible(true)} disabled={Boolean(activeEditingMessage) || uploadProgress !== null}><Icon name="attach" size={20} color={colors.muted} /></Pressable><TextInput value={text} onChangeText={handleInputTextChange} placeholder="Написать сообщение…" placeholderTextColor={colors.muted} multiline maxLength={4000} scrollEnabled={inputScrollable} onContentSizeChange={handleInputContentSizeChange} style={[styles.messageInput, { height: inputHeight }]} onSubmitEditing={(event) => { if (Platform.OS !== "ios" && !event.nativeEvent.text.includes("\n")) submit(); }} blurOnSubmit={false} /><Pressable style={[styles.send, (uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)) && styles.sendDisabled]} onPress={submit} disabled={uploadProgress !== null || (!text.trim() && pendingMedia.length === 0)}><Icon name="send" size={18} color={colors.primaryText} /></Pressable></View><Modal visible={attachmentMenuVisible} transparent animationType="slide" onRequestClose={() => setAttachmentMenuVisible(false)}><SafeAreaSheet onClose={() => setAttachmentMenuVisible(false)} sheetStyle={styles.attachmentSheet}><View style={styles.handle} /><Text style={styles.sheetTitle}>Добавить контент</Text><Pressable style={styles.attachmentOption} onPress={() => void pickGallery()}><View style={styles.attachmentIcon}><Icon name="videocam" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Фото и видео</Text><Text style={styles.attachmentSubtitle}>Выбрать из галереи</Text></View></Pressable><Pressable style={styles.attachmentOption} onPress={() => void pickFiles()}><View style={styles.attachmentIcon}><Icon name="attach" size={20} color={colors.primary} /></View><View><Text style={styles.attachmentTitle}>Файл</Text><Text style={styles.attachmentSubtitle}>Открыть файловый менеджер</Text></View></Pressable></SafeAreaSheet></Modal></View>}
   </KeyboardAvoidingView>;
 }
 
@@ -181,8 +210,8 @@ const styles = StyleSheet.create({
   header: { minHeight: 70, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 8, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: 1, borderBottomColor: colors.border },
   headerButton: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" },
   headerCopy: { flex: 1, gap: 4 },
-  headerName: { color: colors.foreground, fontFamily: fonts.bodyBold, fontSize: 15 },
-  headerSub: { color: colors.muted, fontFamily: fonts.body, fontSize: 12 },
+  headerName: { color: colors.foreground, fontFamily: fonts.bodySemibold, fontSize: 15 },
+  headerSub: { color: colors.muted, fontFamily: fonts.bodyMedium, fontSize: 14 },
   headerActions: { flexDirection: "row", gap: 0, flexShrink: 0 },
   disabledAction: { opacity: 0.4 },
   searchHeaderInput: { flex: 1, minHeight: 42, borderRadius: 21, backgroundColor: colors.surface, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 7 },
@@ -251,11 +280,10 @@ const styles = StyleSheet.create({
   pendingCopy: { maxWidth: 160, gap: 2 },
   pendingName: { color: colors.foreground, fontFamily: fonts.bodySemibold, fontSize: 12 },
   pendingSize: { color: colors.muted, fontFamily: fonts.body, fontSize: 10 },
-  composer: { minHeight: 48, borderWidth: 1, borderColor: colors.border, borderRadius: 24, backgroundColor: colors.surface, flexDirection: "row", alignItems: "flex-end", padding: 5, gap: 4 },
-  composerButton: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
-  messageInput: { flex: 1, color: "#ffffff", fontFamily: fonts.body, fontSize: 15, minHeight: 36, maxHeight: 112, paddingHorizontal: 6 },
-  messageInputSingle: { paddingVertical: 0, textAlignVertical: "center" },
-  messageInputMulti: { paddingVertical: 6, textAlignVertical: "top" },
+  composer: { minHeight: 48, borderWidth: 1, borderColor: colors.border, borderRadius: 24, backgroundColor: colors.surface, flexDirection: "row", alignItems: "center", padding: 5, gap: 4 },
+  composerExpanded: { alignItems: "flex-end" },
+  composerButton: { width: 36, height: 36, borderRadius: 18, backgroundColor: "rgba(240,240,240,0.08)", alignItems: "center", justifyContent: "center" },
+  messageInput: { flex: 1, color: "#ffffff", fontFamily: fonts.body, fontSize: 15, lineHeight: 21, minHeight: MIN_MESSAGE_INPUT_HEIGHT, maxHeight: MAX_MESSAGE_INPUT_HEIGHT, paddingHorizontal: 6, paddingVertical: 0, textAlignVertical: "top" },
   send: { width: 38, height: 38, borderRadius: 19, backgroundColor: colors.primary, alignItems: "center", justifyContent: "center" },
   sendDisabled: { opacity: 0.42 },
   context: { minHeight: 48, backgroundColor: colors.surfaceRaised, borderRadius: radii.sm, padding: 8, flexDirection: "row", alignItems: "center", gap: 8 },

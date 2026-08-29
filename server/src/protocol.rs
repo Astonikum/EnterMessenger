@@ -38,7 +38,7 @@ pub struct CryptoProfile {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct EncryptedEnvelope {
+pub struct EncryptedMessage {
     pub protocol: String,
     pub message_id: String,
     pub conversation_id: String,
@@ -54,7 +54,7 @@ pub struct EncryptedEnvelope {
     pub signature: String,
 }
 
-/// A user-visible message carried between home servers. The encrypted envelope
+/// A user-visible message carried between home servers. The encrypted message
 /// is deliberately nested so transport metadata is not confused with a message.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +62,7 @@ pub struct FederationMessage {
     pub id: String,
     pub conversation_id: String,
     pub created_at: i64,
-    pub envelope: EncryptedEnvelope,
+    pub encrypted_message: EncryptedMessage,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -155,20 +155,20 @@ pub fn discovery(
     }
 }
 
-pub fn is_supported_envelope(envelope: &EncryptedEnvelope) -> bool {
-    envelope.protocol == PROTOCOL_VERSION
-        && valid_identifier(&envelope.message_id)
-        && valid_identifier(&envelope.conversation_id)
-        && valid_address(&envelope.sender)
-        && valid_address(&envelope.recipient)
-        && valid_identifier(&envelope.sender_device)
-        && valid_identifier(&envelope.key_id)
-        && valid_timestamp(&envelope.created_at)
-        && valid_encoded(&envelope.nonce, 128)
-        && valid_encoded(&envelope.ephemeral_public_key, 16_384)
-        && valid_encoded(&envelope.associated_data, 16_384)
-        && valid_encoded(&envelope.ciphertext, 1_500_000)
-        && valid_encoded(&envelope.signature, 512)
+pub fn is_supported_message(encrypted_message: &EncryptedMessage) -> bool {
+    encrypted_message.protocol == PROTOCOL_VERSION
+        && valid_identifier(&encrypted_message.message_id)
+        && valid_identifier(&encrypted_message.conversation_id)
+        && valid_address(&encrypted_message.sender)
+        && valid_address(&encrypted_message.recipient)
+        && valid_identifier(&encrypted_message.sender_device)
+        && valid_identifier(&encrypted_message.key_id)
+        && valid_timestamp(&encrypted_message.created_at)
+        && valid_encoded(&encrypted_message.nonce, 128)
+        && valid_encoded(&encrypted_message.ephemeral_public_key, 16_384)
+        && valid_encoded(&encrypted_message.associated_data, 16_384)
+        && valid_encoded(&encrypted_message.ciphertext, 1_500_000)
+        && valid_encoded(&encrypted_message.signature, 512)
 }
 
 pub fn is_supported_delivery(delivery: &FederationDelivery) -> bool {
@@ -180,9 +180,9 @@ pub fn is_supported_delivery(delivery: &FederationDelivery) -> bool {
         && valid_identifier(&delivery.message.id)
         && valid_identifier(&delivery.message.conversation_id)
         && delivery.message.created_at > 0
-        && delivery.message.id == delivery.message.envelope.message_id
-        && delivery.message.conversation_id == delivery.message.envelope.conversation_id
-        && is_supported_envelope(&delivery.message.envelope)
+        && delivery.message.id == delivery.message.encrypted_message.message_id
+        && delivery.message.conversation_id == delivery.message.encrypted_message.conversation_id
+        && is_supported_message(&delivery.message.encrypted_message)
 }
 
 fn valid_delivery_identifier(value: &str) -> bool {
@@ -292,8 +292,8 @@ fn valid_encoded(value: &str, max_len: usize) -> bool {
 mod tests {
     use super::*;
 
-    fn envelope() -> EncryptedEnvelope {
-        EncryptedEnvelope {
+    fn encrypted_message() -> EncryptedMessage {
+        EncryptedMessage {
             protocol: PROTOCOL_VERSION.to_owned(),
             message_id: "message-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
@@ -311,30 +311,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_complete_current_envelope() {
-        assert!(is_supported_envelope(&envelope()));
+    fn accepts_complete_current_encrypted_message() {
+        assert!(is_supported_message(&encrypted_message()));
     }
 
     #[test]
     fn rejects_plaintext_only_delivery() {
-        let mut value = envelope();
+        let mut value = encrypted_message();
         value.ciphertext.clear();
-        assert!(!is_supported_envelope(&value));
+        assert!(!is_supported_message(&value));
     }
 
     #[test]
-    fn rejects_malformed_or_oversized_envelope_fields() {
-        let mut value = envelope();
+    fn rejects_malformed_or_oversized_encrypted_message_fields() {
+        let mut value = encrypted_message();
         value.sender = "alice@example.test/path".to_owned();
-        assert!(!is_supported_envelope(&value));
+        assert!(!is_supported_message(&value));
 
-        let mut value = envelope();
+        let mut value = encrypted_message();
         value.message_id = "x".repeat(129);
-        assert!(!is_supported_envelope(&value));
+        assert!(!is_supported_message(&value));
 
-        let mut value = envelope();
+        let mut value = encrypted_message();
         value.ciphertext = "!".to_owned();
-        assert!(!is_supported_envelope(&value));
+        assert!(!is_supported_message(&value));
     }
 
     #[test]
@@ -366,8 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn federation_delivery_contains_a_message_with_an_envelope() {
-        let envelope = envelope();
+    fn federation_delivery_contains_a_message_with_an_encrypted_message() {
+        let encrypted_message = encrypted_message();
         let delivery = FederationDelivery {
             protocol: PROTOCOL_VERSION.to_owned(),
             delivery_id: "message-1:key-1".to_owned(),
@@ -375,16 +375,16 @@ mod tests {
             sender_name: "Alice".to_owned(),
             sender_avatar: "alice".to_owned(),
             message: FederationMessage {
-                id: envelope.message_id.clone(),
-                conversation_id: envelope.conversation_id.clone(),
+                id: encrypted_message.message_id.clone(),
+                conversation_id: encrypted_message.conversation_id.clone(),
                 created_at: 1,
-                envelope,
+                encrypted_message,
             },
         };
         assert!(is_supported_delivery(&delivery));
         let value = serde_json::to_value(&delivery).expect("serialize delivery");
-        assert!(value["message"]["envelope"].is_object());
-        assert!(value.get("envelope").is_none());
+        assert!(value["message"]["encryptedMessage"].is_object());
+        assert!(value.get("encryptedMessage").is_none());
 
         let mut long_delivery = delivery;
         long_delivery.delivery_id = format!(

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { changePassword as changeRemotePassword, getAccountSettings, getDevices, getSessions, revokeDevice, revokeOtherSessions, revokeSession, updateAccountSettings, type AccountSettings, type ManagedDevice, type ManagedSession } from "../lib/enter-api";
+import { changePassword as changeRemotePassword, getAccountSettings, getDevices, getSessions, refreshSessionMetadata, revokeDevice, revokeOtherSessions, revokeSession, updateAccountSettings, type AccountSettings, type ManagedDevice, type ManagedSession } from "../lib/enter-api";
 import type { AccentPreference, CachePolicy, DensityPreference, FontScale, LocalClientSettings, ThemePreference } from "../lib/local-settings";
 import { Button } from "./ui/button";
 import { Icon } from "./ui/icon";
 import { Input } from "./ui/input";
 import type { Profile } from "../types";
+import { friendlyError } from "../lib/client-errors";
 
-type SettingsSection = "account" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "about";
+type SettingsSection = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "about";
 type PendingAction = { kind: "device" | "session" | "other-sessions" | "outbox" | "profile"; targetId: string; label: string };
 type Feedback = { kind: "success" | "error"; text: string } | null;
 
@@ -23,7 +24,7 @@ type SettingsPanelProps = {
 };
 
 const sections: Array<{ id: SettingsSection; label: string; icon: string }> = [
-  { id: "account", label: "Аккаунт", icon: "person" },
+  { id: "password", label: "Пароль", icon: "key" },
   { id: "security", label: "Безопасность и устройства", icon: "security" },
   { id: "notifications", label: "Уведомления", icon: "notifications" },
   { id: "appearance", label: "Внешний вид", icon: "tune" },
@@ -31,11 +32,6 @@ const sections: Array<{ id: SettingsSection; label: string; icon: string }> = [
   { id: "storage", label: "Данные и хранилище", icon: "database" },
   { id: "about", label: "О приложении", icon: "info" },
 ];
-
-function formatDate(value: number | null | undefined, locale: string) {
-  if (value === null || value === undefined) return "—";
-  return new Intl.DateTimeFormat(locale === "en" ? "en" : "ru", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-}
 
 function formatBytes(value: number | undefined) {
   if (value === undefined || !Number.isFinite(value)) return "—";
@@ -51,14 +47,57 @@ function formatBytes(value: number | undefined) {
   return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
 }
 
-function FieldLabel({ children, htmlFor }: { children: string; htmlFor: string }) {
-  return <label htmlFor={htmlFor} className="field-label">{children}</label>;
+function knownValue(value: string | null | undefined) {
+  const normalized = value?.trim();
+  return normalized && normalized.toLowerCase() !== "unknown" ? normalized : undefined;
 }
 
-function ToggleRow({ id, label, checked, onChange }: { id: string; label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+function shortId(value: string | null | undefined) {
+  return value ? value.slice(0, 8) : "—";
+}
+
+function formatSessionDate(value: number | null | undefined) {
+  return value && Number.isFinite(value)
+    ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value))
+    : "—";
+}
+
+function deviceTitle(device: ManagedDevice) {
+  return knownValue(device.name) || `Устройство ${shortId(device.deviceId)}`;
+}
+
+function deviceDetails(device: ManagedDevice) {
+  return [
+    knownValue(device.platform) || "Платформа не указана",
+    knownValue(device.appVersion) ? `версия ${knownValue(device.appVersion)}` : undefined,
+    `ID ${shortId(device.deviceId)}`,
+    `активно ${formatSessionDate(device.lastSeenAt ?? device.createdAt)}`,
+  ].filter(Boolean).join(" · ");
+}
+
+function sessionTitle(session: ManagedSession) {
+  return knownValue(session.deviceName) || `Устройство ${shortId(session.deviceId || session.id)}`;
+}
+
+function sessionDetails(session: ManagedSession) {
+  return [
+    knownValue(session.platform) || "Платформа не указана",
+    knownValue(session.appVersion) ? `версия ${knownValue(session.appVersion)}` : undefined,
+    session.deviceId ? `ID ${shortId(session.deviceId)}` : `сессия ${shortId(session.id)}`,
+    `создана ${formatSessionDate(session.createdAt)}`,
+    `активна ${formatSessionDate(session.lastSeenAt ?? session.createdAt)}`,
+    session.current ? "текущая" : `до ${formatSessionDate(session.expiresAt)}`,
+  ].filter(Boolean).join(" · ");
+}
+
+function FieldLabel({ children, htmlFor, description }: { children: string; htmlFor: string; description?: string }) {
+  return <label htmlFor={htmlFor} className="field-label"><span>{children}</span>{description && <span className="mt-1 block text-xs font-normal leading-5 text-muted-foreground">{description}</span>}</label>;
+}
+
+function ToggleRow({ id, label, description, checked, onChange }: { id: string; label: string; description?: string; checked: boolean; onChange: (checked: boolean) => void }) {
   return (
     <label htmlFor={id} className="settings-toggle-row">
-      <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{label}</span></span>
+      <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{label}</span>{description && <span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span>}</span>
       <input id={id} type="checkbox" className="settings-toggle" checked={checked} onChange={(event) => onChange(event.target.checked)} />
     </label>
   );
@@ -69,13 +108,12 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLocalSettingsChange, onClearMessageCache, onClearOutbox, onRemoveProfile, onClose }: SettingsPanelProps) {
-  const [section, setSection] = useState<SettingsSection>("account");
+  const [section, setSection] = useState<SettingsSection>("password");
   const [account, setAccount] = useState<AccountSettings | null>(null);
   const [devices, setDevices] = useState<ManagedDevice[]>([]);
   const [sessions, setSessions] = useState<ManagedSession[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(true);
   const [remoteError, setRemoteError] = useState("");
-  const [name, setName] = useState(profile.name);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
@@ -87,13 +125,13 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     setRemoteLoading(true);
     setRemoteError("");
     try {
+      await refreshSessionMetadata(profile).catch(() => undefined);
       const [nextAccount, nextDevices, nextSessions] = await Promise.all([getAccountSettings(profile), getDevices(profile), getSessions(profile)]);
       setAccount(nextAccount);
-      setName(nextAccount.name);
       setDevices(nextDevices);
       setSessions(nextSessions);
     } catch (reason) {
-      setRemoteError(reason instanceof Error ? reason.message : "Не удалось загрузить настройки сервера");
+      setRemoteError(friendlyError(reason, "Не удалось загрузить настройки сервера"));
     } finally {
       setRemoteLoading(false);
     }
@@ -119,29 +157,12 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
   }
 
   function showError(reason: unknown, fallback: string) {
-    setFeedback({ kind: "error", text: reason instanceof Error ? reason.message : fallback });
+    setFeedback({ kind: "error", text: friendlyError(reason, fallback) });
   }
 
   function updateLocal<K extends keyof LocalClientSettings>(key: K, value: LocalClientSettings[K]) {
     onLocalSettingsChange({ ...localSettings, [key]: value });
     showSuccess("Сохранено на этом устройстве");
-  }
-
-  async function saveAccount(event: FormEvent) {
-    event.preventDefault();
-    if (!name.trim()) { showError(null, "Имя не может быть пустым"); return; }
-    setActionBusy("account");
-    setFeedback(null);
-    try {
-      const next = await updateAccountSettings(profile, { name: name.trim() });
-      setAccount((current) => current ? { ...current, ...next } : next);
-      setName(next.name);
-      showSuccess("Данные аккаунта сохранены");
-    } catch (reason) {
-      showError(reason, "Не удалось сохранить данные аккаунта");
-    } finally {
-      setActionBusy(null);
-    }
   }
 
   async function savePrivacy() {
@@ -238,55 +259,47 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     return <div className="settings-error" role="alert"><Icon name="error" className="size-4 shrink-0" /><span className="min-w-0 flex-1">{remoteError}</span><Button variant="outline" size="sm" onClick={() => void loadRemote()}>Повторить</Button></div>;
   }
 
-  function renderAccount() {
-    return <section aria-labelledby="settings-account-title" className="settings-section-content">
-      <div className="settings-section-heading"><div><p className="settings-eyebrow">Профиль</p><h2 id="settings-account-title">Аккаунт</h2></div></div>
-      {remoteLoading ? <p className="settings-muted">Загрузка настроек сервера…</p> : remoteError ? renderRemoteError() : <>
-        <form className="settings-card space-y-4" onSubmit={saveAccount}>
-          <div><FieldLabel htmlFor="settings-name">Имя</FieldLabel><Input id="settings-name" value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" maxLength={160} /></div>
-          <div className="settings-detail-grid"><DetailRow label="Логин" value={`@${account?.handle ?? profile.handle.replace(/^@/, "")}`} /><DetailRow label="ID аккаунта" value={account?.id ?? profile.id} /><DetailRow label="Сервер" value={profile.server.replace(/^https?:\/\//, "")} /></div>
-          <div className="flex justify-end"><Button type="submit" disabled={actionBusy === "account"}>{actionBusy === "account" ? "Сохранение…" : "Сохранить"}</Button></div>
-        </form>
-        <div className="settings-card"><h3>Текущий профиль</h3><DetailRow label="Устройство" value={profile.deviceId ?? "Не определено"} /></div>
-      </>}
+  function renderPassword() {
+    return <section aria-labelledby="settings-password-title" className="settings-section-content">
+      <div className="settings-section-heading"><div><h2 id="settings-password-title">Пароль</h2></div></div>
+      <form className="settings-card space-y-4" onSubmit={submitPassword}><div><h3>Изменить пароль</h3></div><div className="settings-form-grid"><div><FieldLabel htmlFor="settings-current-password">Текущий пароль</FieldLabel><Input id="settings-current-password" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></div><div><FieldLabel htmlFor="settings-new-password">Новый пароль</FieldLabel><Input id="settings-new-password" type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" /></div><div><FieldLabel htmlFor="settings-confirm-password">Повторите новый пароль</FieldLabel><Input id="settings-confirm-password" type="password" value={passwordConfirmation} onChange={(event) => setPasswordConfirmation(event.target.value)} autoComplete="new-password" /></div></div><div className="flex justify-end"><Button type="submit" disabled={actionBusy === "password"}>{actionBusy === "password" ? "Изменение…" : "Изменить пароль"}</Button></div></form>
     </section>;
   }
 
   function renderSecurity() {
     return <section aria-labelledby="settings-security-title" className="settings-section-content">
-      <div className="settings-section-heading"><div><p className="settings-eyebrow">Доступ</p><h2 id="settings-security-title">Безопасность и устройства</h2></div><Button variant="outline" size="sm" onClick={() => void loadRemote()} disabled={remoteLoading}><Icon name="rotate_left" className="size-4" />Обновить</Button></div>
-      <form className="settings-card space-y-4" onSubmit={submitPassword}><div><h3>Изменить пароль</h3></div><div className="settings-form-grid"><div><FieldLabel htmlFor="settings-current-password">Текущий пароль</FieldLabel><Input id="settings-current-password" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></div><div><FieldLabel htmlFor="settings-new-password">Новый пароль</FieldLabel><Input id="settings-new-password" type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" /></div><div><FieldLabel htmlFor="settings-confirm-password">Повторите новый пароль</FieldLabel><Input id="settings-confirm-password" type="password" value={passwordConfirmation} onChange={(event) => setPasswordConfirmation(event.target.value)} autoComplete="new-password" /></div></div><div className="flex justify-end"><Button type="submit" disabled={actionBusy === "password"}>{actionBusy === "password" ? "Изменение…" : "Изменить пароль"}</Button></div></form>
+      <div className="settings-section-heading"><div><h2 id="settings-security-title">Безопасность и устройства</h2></div><Button variant="outline" size="sm" onClick={() => void loadRemote()} disabled={remoteLoading}><Icon name="rotate_left" className="size-4" />Обновить</Button></div>
       {remoteLoading ? <p className="settings-muted">Загрузка устройств и сессий…</p> : remoteError ? renderRemoteError() : <>
-        <div className="settings-card"><div className="mb-3 flex items-start justify-between gap-3"><h3>Устройства</h3></div><div className="settings-list">{devices.length === 0 ? <p className="settings-muted">Устройства не зарегистрированы.</p> : devices.map((device) => { const current = device.current || device.deviceId === profile.deviceId; return <div key={device.deviceId} className="settings-list-row"><span className="settings-list-icon"><Icon name="database" className="size-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{device.name || device.platform || "Устройство"}{current && <span className="ml-2 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">Это устройство</span>}</span><span className="mt-1 block truncate text-xs text-muted-foreground">{device.deviceId} · последнее подключение {formatDate(device.lastSeenAt, localSettings.locale)}</span></span><Button variant="outline" size="sm" disabled={current || Boolean(device.revokedAt) || actionBusy === "device"} onClick={() => requestAction({ kind: "device", targetId: device.deviceId, label: `устройство «${device.name || device.deviceId}»` })}>{device.revokedAt ? "Отозвано" : "Отозвать"}</Button></div>; })}</div></div>
-        <div className="settings-card"><div className="mb-3 flex items-start justify-between gap-3"><h3>Сессии</h3><Button variant="outline" size="sm" disabled={sessions.filter((session) => !session.current).length === 0 || actionBusy === "other-sessions"} onClick={() => requestAction({ kind: "other-sessions", targetId: "all-other-sessions", label: "все остальные сессии" })}>Отозвать остальные</Button></div><div className="settings-list">{sessions.length === 0 ? <p className="settings-muted">Сессии не найдены.</p> : sessions.map((session) => <div key={session.id} className="settings-list-row"><span className="settings-list-icon"><Icon name="security" className="size-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{session.deviceName || session.platform || "Сессия"}{session.current && <span className="ml-2 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">Текущая</span>}</span><span className="mt-1 block truncate text-xs text-muted-foreground">Создана {formatDate(session.createdAt, localSettings.locale)} · до {formatDate(session.expiresAt, localSettings.locale)}</span></span><Button variant="outline" size="sm" disabled={session.current || actionBusy === "session"} onClick={() => requestAction({ kind: "session", targetId: session.id, label: `сессию «${session.deviceName || session.id}»` })}>Отозвать</Button></div>)}</div></div>
+        <div className="settings-card"><div className="mb-3 flex items-start justify-between gap-3"><h3>Устройства</h3></div><div className="settings-list">{devices.length === 0 ? <p className="settings-muted">Устройства не зарегистрированы.</p> : devices.map((device) => { const current = device.current || device.deviceId === profile.deviceId; return <div key={device.deviceId} className="settings-list-row"><span className="settings-list-icon"><Icon name="database" className="size-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{deviceTitle(device)}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{deviceDetails(device)}{current ? " · это устройство" : ""}</span></span><Button variant="outline" size="sm" disabled={current || Boolean(device.revokedAt) || actionBusy === "device"} onClick={() => requestAction({ kind: "device", targetId: device.deviceId, label: `устройство «${deviceTitle(device)}»` })}>{device.revokedAt ? "Отозвано" : "Отозвать"}</Button></div>; })}</div></div>
+        <div className="settings-card"><div className="mb-3 flex items-start justify-between gap-3"><h3>Сессии</h3><Button variant="outline" size="sm" disabled={sessions.filter((session) => !session.current).length === 0 || actionBusy === "other-sessions"} onClick={() => requestAction({ kind: "other-sessions", targetId: "all-other-sessions", label: "все остальные сессии" })}>Отозвать остальные</Button></div><div className="settings-list">{sessions.length === 0 ? <p className="settings-muted">Сессии не найдены.</p> : sessions.map((session) => <div key={session.id} className="settings-list-row"><span className="settings-list-icon"><Icon name="security" className="size-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{sessionTitle(session)}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{sessionDetails(session)}</span></span><Button variant="outline" size="sm" disabled={session.current || actionBusy === "session"} onClick={() => requestAction({ kind: "session", targetId: session.id, label: `сессию «${sessionTitle(session)}»` })}>Отозвать</Button></div>)}</div></div>
       </>}
     </section>;
   }
 
   function renderNotifications() {
-    return <section aria-labelledby="settings-notifications-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Локально</p><h2 id="settings-notifications-title">Уведомления</h2></div></div><div className="settings-card settings-list"><ToggleRow id="settings-desktop-notifications" label="Показывать уведомления" checked={localSettings.notifications.desktop} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, desktop: checked })} /><ToggleRow id="settings-notification-sound" label="Звук уведомлений" checked={localSettings.notifications.sound} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, sound: checked })} /><ToggleRow id="settings-notification-preview" label="Показывать текст сообщения" checked={localSettings.notifications.preview} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, preview: checked })} /></div></section>;
+    return <section aria-labelledby="settings-notifications-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-notifications-title">Уведомления</h2></div></div><div className="settings-card settings-list"><ToggleRow id="settings-desktop-notifications" label="Показывать уведомления" description="Показывать новые сообщения в системе" checked={localSettings.notifications.desktop} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, desktop: checked })} /><ToggleRow id="settings-notification-sound" label="Звук уведомлений" description="Воспроизводить звук для новых сообщений" checked={localSettings.notifications.sound} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, sound: checked })} /><ToggleRow id="settings-notification-preview" label="Показывать текст сообщения" description="Показывать текст сообщения в уведомлении" checked={localSettings.notifications.preview} onChange={(checked) => updateLocal("notifications", { ...localSettings.notifications, preview: checked })} /></div></section>;
   }
 
   function renderAppearance() {
-    return <section aria-labelledby="settings-appearance-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Локально</p><h2 id="settings-appearance-title">Внешний вид</h2></div></div><div className="settings-card settings-form-grid"><div><FieldLabel htmlFor="settings-theme">Тема</FieldLabel><select id="settings-theme" className="settings-select" value={localSettings.theme} onChange={(event) => updateLocal("theme", event.target.value as ThemePreference)}><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></div><div><FieldLabel htmlFor="settings-font-scale">Размер текста</FieldLabel><select id="settings-font-scale" className="settings-select" value={localSettings.fontScale} onChange={(event) => updateLocal("fontScale", Number(event.target.value) as FontScale)}><option value="0.9">Маленький</option><option value="1">Обычный</option><option value="1.1">Крупный</option></select></div><div><FieldLabel htmlFor="settings-density">Плотность</FieldLabel><select id="settings-density" className="settings-select" value={localSettings.density} onChange={(event) => updateLocal("density", event.target.value as DensityPreference)}><option value="comfortable">Комфортная</option><option value="compact">Компактная</option></select></div><div><FieldLabel htmlFor="settings-accent">Акцентный цвет</FieldLabel><select id="settings-accent" className="settings-select" value={localSettings.accent} onChange={(event) => updateLocal("accent", event.target.value as AccentPreference)}><option value="violet">Фиолетовый</option><option value="blue">Синий</option><option value="green">Зелёный</option><option value="rose">Розовый</option></select></div><div><FieldLabel htmlFor="settings-locale">Язык дат и интерфейса</FieldLabel><select id="settings-locale" className="settings-select" value={localSettings.locale} onChange={(event) => updateLocal("locale", event.target.value as "ru" | "en")}><option value="ru">Русский</option><option value="en">English</option></select></div><div><FieldLabel htmlFor="settings-cache-policy">Политика кэша</FieldLabel><select id="settings-cache-policy" className="settings-select" value={localSettings.cachePolicy} onChange={(event) => updateLocal("cachePolicy", event.target.value as CachePolicy)}><option value="standard">Стандартная</option><option value="minimal">Минимальная</option><option value="disabled">Отключён</option></select></div></div></section>;
+    return <section aria-labelledby="settings-appearance-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-appearance-title">Внешний вид</h2></div></div><div className="settings-card settings-form-grid"><div><FieldLabel htmlFor="settings-theme" description="Системная, светлая или тёмная тема">Тема</FieldLabel><select id="settings-theme" className="settings-select" value={localSettings.theme} onChange={(event) => updateLocal("theme", event.target.value as ThemePreference)}><option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></div><div><FieldLabel htmlFor="settings-font-scale" description="Размер текста в чатах">Размер текста</FieldLabel><select id="settings-font-scale" className="settings-select" value={localSettings.fontScale} onChange={(event) => updateLocal("fontScale", Number(event.target.value) as FontScale)}><option value="0.9">Маленький</option><option value="1">Обычный</option><option value="1.1">Крупный</option></select></div><div><FieldLabel htmlFor="settings-density" description="Расстояние между элементами интерфейса">Плотность</FieldLabel><select id="settings-density" className="settings-select" value={localSettings.density} onChange={(event) => updateLocal("density", event.target.value as DensityPreference)}><option value="comfortable">Комфортная</option><option value="compact">Компактная</option></select></div><div><FieldLabel htmlFor="settings-accent" description="Цвет кнопок и выделения">Акцентный цвет</FieldLabel><select id="settings-accent" className="settings-select" value={localSettings.accent} onChange={(event) => updateLocal("accent", event.target.value as AccentPreference)}><option value="violet">Фиолетовый</option><option value="blue">Синий</option><option value="green">Зелёный</option><option value="rose">Розовый</option></select></div><div><FieldLabel htmlFor="settings-locale" description="Язык интерфейса и дат">Язык дат и интерфейса</FieldLabel><select id="settings-locale" className="settings-select" value={localSettings.locale} onChange={(event) => updateLocal("locale", event.target.value as "ru" | "en")}><option value="ru">Русский</option><option value="en">English</option></select></div><div><FieldLabel htmlFor="settings-cache-policy" description="Правила локального хранения сообщений">Политика кэша</FieldLabel><select id="settings-cache-policy" className="settings-select" value={localSettings.cachePolicy} onChange={(event) => updateLocal("cachePolicy", event.target.value as CachePolicy)}><option value="standard">Стандартная</option><option value="minimal">Минимальная</option><option value="disabled">Отключён</option></select></div></div></section>;
   }
 
   function renderPrivacy() {
-    if (remoteLoading) return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Сервер</p><h2 id="settings-privacy-title">Приватность</h2></div></div><p className="settings-muted">Загрузка настроек сервера…</p></section>;
-    if (remoteError || !account) return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Сервер</p><h2 id="settings-privacy-title">Приватность</h2></div></div>{remoteError ? renderRemoteError() : <p className="settings-muted">Настройки недоступны.</p>}</section>;
-    return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Сервер</p><h2 id="settings-privacy-title">Приватность</h2></div></div><div className="settings-card settings-list"><ToggleRow id="settings-show-online" label="Показывать статус онлайн" checked={account.showOnline} onChange={(checked) => updatePrivacy("showOnline", checked)} /><ToggleRow id="settings-show-last-seen" label="Показывать время последнего посещения" checked={account.showLastSeen} onChange={(checked) => updatePrivacy("showLastSeen", checked)} /><ToggleRow id="settings-read-receipts" label="Отправлять отметки о прочтении" checked={account.readReceipts} onChange={(checked) => updatePrivacy("readReceipts", checked)} /><ToggleRow id="settings-typing-indicators" label="Показывать набор текста" checked={account.typingIndicators} onChange={(checked) => updatePrivacy("typingIndicators", checked)} /><div className="flex justify-end border-t border-border/70 pt-3"><Button onClick={() => void savePrivacy()} disabled={actionBusy === "privacy"}>{actionBusy === "privacy" ? "Сохранение…" : "Сохранить"}</Button></div></div></section>;
+    if (remoteLoading) return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-privacy-title">Приватность</h2></div></div><p className="settings-muted">Загрузка настроек сервера…</p></section>;
+    if (remoteError || !account) return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-privacy-title">Приватность</h2></div></div>{remoteError ? renderRemoteError() : <p className="settings-muted">Настройки недоступны.</p>}</section>;
+    return <section aria-labelledby="settings-privacy-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-privacy-title">Приватность</h2></div></div><div className="settings-card settings-list"><ToggleRow id="settings-show-online" label="Показывать статус онлайн" description="Показывать собеседникам, что вы активны" checked={account.showOnline} onChange={(checked) => updatePrivacy("showOnline", checked)} /><ToggleRow id="settings-show-last-seen" label="Показывать время последнего посещения" description="Показывать время последней активности" checked={account.showLastSeen} onChange={(checked) => updatePrivacy("showLastSeen", checked)} /><ToggleRow id="settings-read-receipts" label="Отправлять отметки о прочтении" description="Показывать собеседникам, что сообщение прочитано" checked={account.readReceipts} onChange={(checked) => updatePrivacy("readReceipts", checked)} /><ToggleRow id="settings-typing-indicators" label="Показывать набор текста" description="Показывать, когда вы печатаете" checked={account.typingIndicators} onChange={(checked) => updatePrivacy("typingIndicators", checked)} /><div className="flex justify-end border-t border-border/70 pt-3"><Button onClick={() => void savePrivacy()} disabled={actionBusy === "privacy"}>{actionBusy === "privacy" ? "Сохранение…" : "Сохранить"}</Button></div></div></section>;
   }
 
   function renderStorage() {
-    return <section aria-labelledby="settings-storage-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Локально</p><h2 id="settings-storage-title">Данные и хранилище</h2></div><Button variant="outline" size="sm" onClick={refreshStorage}><Icon name="rotate_left" className="size-4" />Обновить</Button></div><div className="settings-card"><h3>Состояние хранилища</h3><div className="settings-detail-grid mt-3"><DetailRow label="Используется" value={formatBytes(storageEstimate?.usage)} /><DetailRow label="Лимит" value={formatBytes(storageEstimate?.quota)} /><DetailRow label="Кэш сообщений" value={`${messageCount} сообщений`} /><DetailRow label="Очередь исходящих" value={`${outboxCount} сообщений`} /></div></div><div className="settings-card settings-danger-card"><h3>Очистка</h3><div className="mt-4 flex flex-wrap gap-2"><Button variant="outline" onClick={clearCache}>Очистить кэш сообщений</Button><Button variant="outline" className="border-destructive/50 text-destructive hover:bg-destructive/10" disabled={outboxCount === 0 || actionBusy === "outbox"} onClick={() => requestAction({ kind: "outbox", targetId: "outbox", label: "очередь исходящих сообщений" })}>Очистить очередь</Button></div></div><div className="settings-card settings-danger-card"><h3>Удалить локальный профиль</h3><div className="mt-4 flex justify-end"><Button variant="outline" className="border-destructive/50 text-destructive hover:bg-destructive/10" onClick={() => requestAction({ kind: "profile", targetId: profile.id, label: `профиль «${profile.name}»` })}>Удалить профиль</Button></div></div></section>;
+    return <section aria-labelledby="settings-storage-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-storage-title">Данные и хранилище</h2></div><Button variant="outline" size="sm" onClick={refreshStorage}><Icon name="rotate_left" className="size-4" />Обновить</Button></div><div className="settings-card"><h3>Состояние хранилища</h3><div className="settings-detail-grid mt-3"><DetailRow label="Используется" value={formatBytes(storageEstimate?.usage)} /><DetailRow label="Лимит" value={formatBytes(storageEstimate?.quota)} /><DetailRow label="Кэш сообщений" value={`${messageCount} сообщений`} /><DetailRow label="Очередь исходящих" value={`${outboxCount} сообщений`} /></div></div><div className="settings-card settings-danger-card"><h3>Очистка</h3><div className="mt-4 flex flex-wrap gap-2"><Button variant="outline" onClick={clearCache}>Очистить кэш сообщений</Button><Button variant="outline" className="border-destructive/50 text-destructive hover:bg-destructive/10" disabled={outboxCount === 0 || actionBusy === "outbox"} onClick={() => requestAction({ kind: "outbox", targetId: "outbox", label: "очередь исходящих сообщений" })}>Очистить очередь</Button></div></div><div className="settings-card settings-danger-card"><h3>Удалить локальный профиль</h3><div className="mt-4 flex justify-end"><Button variant="outline" className="border-destructive/50 text-destructive hover:bg-destructive/10" onClick={() => requestAction({ kind: "profile", targetId: profile.id, label: `профиль «${profile.name}»` })}>Удалить профиль</Button></div></div></section>;
   }
 
   function renderAbout() {
-    return <section aria-labelledby="settings-about-title" className="settings-section-content"><div className="settings-section-heading"><div><p className="settings-eyebrow">Enter Messenger</p><h2 id="settings-about-title">О приложении</h2></div></div><div className="settings-card settings-about-card"><div className="settings-about-mark"><img src="/enter_logo.png" alt="Enter" /></div><div><h3>Enter Messenger</h3><p className="mt-1 text-sm text-muted-foreground">Desktop · версия 0.2.0</p></div></div></section>;
+    return <section aria-labelledby="settings-about-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-about-title">О приложении</h2></div></div><div className="settings-card settings-about-card"><div className="settings-about-mark"><img src="/enter_logo.png" alt="Enter" /></div><div><h3>Enter Messenger</h3></div></div></section>;
   }
 
   function renderSection() {
-    if (section === "account") return renderAccount();
+    if (section === "password") return renderPassword();
     if (section === "security") return renderSecurity();
     if (section === "notifications") return renderNotifications();
     if (section === "appearance") return renderAppearance();
@@ -296,7 +309,7 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
   }
 
   return <div className="settings-workspace" role="region" aria-labelledby="settings-title">
-      <header className="settings-panel-header"><h1 id="settings-title" className="text-lg font-semibold tracking-tight">Настройки</h1><button type="button" className="icon-button" title="Закрыть настройки" aria-label="Закрыть настройки" onClick={onClose}><Icon name="close" className="size-4" /></button></header>
+      <header className="settings-panel-header"><h1 id="settings-title" className="font-heading text-[1.1875rem] font-semibold tracking-tight">Настройки</h1><button type="button" className="icon-button" title="Закрыть настройки" aria-label="Закрыть настройки" onClick={onClose}><Icon name="close" className="size-4" /></button></header>
       <div className="settings-panel-body"><nav className="settings-nav" aria-label="Разделы настроек">{sections.map((item) => <button key={item.id} type="button" className={`settings-nav-item settings-nav-item-${item.id}${item.id === section ? " settings-nav-item-active" : ""}`} aria-current={item.id === section ? "page" : undefined} onClick={() => setSection(item.id)}><span className="settings-nav-icon"><Icon name={item.icon} className="size-4 shrink-0" /></span><span>{item.label}</span></button>)}</nav><div className="settings-main">{feedback && <div className={feedback.kind === "error" ? "settings-error settings-feedback" : "settings-success settings-feedback"} role={feedback.kind === "error" ? "alert" : "status"} aria-live="polite"><Icon name={feedback.kind === "error" ? "error" : "check_circle"} className="size-4 shrink-0" /><span>{feedback.text}</span></div>}{renderSection()}</div></div>
       {pendingAction && <div className="settings-confirm" role="alertdialog" aria-modal="true" aria-labelledby="settings-confirm-title"><div><h2 id="settings-confirm-title">Подтвердите действие</h2><p className="mt-1 text-sm text-muted-foreground">Вы действительно хотите: {pendingAction.label}? Это действие нельзя отменить.</p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setPendingAction(null)} disabled={Boolean(actionBusy)}>Отмена</Button><Button className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void executePendingAction()} disabled={Boolean(actionBusy)}>{actionBusy ? "Выполнение…" : "Подтвердить"}</Button></div></div>}
   </div>;

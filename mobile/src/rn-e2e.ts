@@ -8,7 +8,8 @@ import { fromByteArray, toByteArray } from "base64-js";
 import { getRandomBytesAsync } from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ENTER_PROTOCOL_VERSION, type EncryptedEnvelope } from "./protocol";
+import { Platform } from "react-native";
+import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./protocol";
 import type { Message, MessageAttachment, Profile } from "./types";
 
 const DEVICE_KEY_PREFIX = "enter-native-device-";
@@ -49,6 +50,8 @@ export type PublicEncryptionKey = Pick<PublicDeviceKey, "keyId" | "encryptionPub
 
 const EDIT_PAYLOAD_PREFIX = "ENTER_EDIT_V1:";
 const MESSAGE_PAYLOAD_PREFIX = "ENTER_MESSAGE_V2:";
+const MAX_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024;
 
 export function encodeMessagePayload(message: Message) {
   if (!message.editOf && !message.attachments?.length) return message.text;
@@ -58,7 +61,23 @@ export function encodeMessagePayload(message: Message) {
 function isAttachment(value: unknown): value is MessageAttachment {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<MessageAttachment>;
-  return typeof item.id === "string" && typeof item.kind === "string" && typeof item.name === "string" && typeof item.mimeType === "string" && typeof item.size === "number" && typeof item.sha256 === "string" && typeof item.key === "string" && typeof item.nonce === "string";
+  return typeof item.id === "string"
+    && item.id.length <= 128
+    && (item.kind === "image" || item.kind === "video" || item.kind === "audio" || item.kind === "file")
+    && typeof item.name === "string"
+    && item.name.length <= 255
+    && typeof item.mimeType === "string"
+    && item.mimeType.length <= 128
+    && typeof item.size === "number"
+    && Number.isSafeInteger(item.size)
+    && item.size >= 0
+    && item.size <= MAX_ATTACHMENT_BYTES
+    && typeof item.sha256 === "string"
+    && item.sha256.length <= 128
+    && typeof item.key === "string"
+    && item.key.length <= 128
+    && typeof item.nonce === "string"
+    && item.nonce.length <= 128;
 }
 
 export function decodeMessagePayload(value: string): { text: string; editOf?: string; attachments?: MessageAttachment[] } {
@@ -69,7 +88,11 @@ export function decodeMessagePayload(value: string): { text: string; editOf?: st
       if (typeof payload.targetId === "string" && typeof payload.text === "string") return { text: payload.text, editOf: payload.targetId };
     } else {
       const payload = JSON.parse(value.slice(MESSAGE_PAYLOAD_PREFIX.length)) as { text?: unknown; editOf?: unknown; attachments?: unknown };
-      if (typeof payload.text === "string") return { text: payload.text, editOf: typeof payload.editOf === "string" ? payload.editOf : undefined, attachments: Array.isArray(payload.attachments) ? payload.attachments.filter(isAttachment) : undefined };
+      if (typeof payload.text === "string") {
+        const rawAttachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+        const attachments = rawAttachments.filter(isAttachment);
+        return { text: payload.text, editOf: typeof payload.editOf === "string" ? payload.editOf : undefined, attachments: rawAttachments.length <= MAX_ATTACHMENTS && attachments.length === rawAttachments.length ? attachments : undefined };
+      }
     }
   } catch {
     // Keep malformed or legacy payloads as regular message text.
@@ -99,6 +122,37 @@ function safeProfileKey(profileId: string) {
 
 async function secureStoreAvailable() {
   try { return await SecureStore.isAvailableAsync(); } catch { return false; }
+}
+
+const webKeyStorage = Platform.OS === "web";
+
+async function readPrivateValue(primaryKey: string, fallbackKey: string, unavailableMessage: string, readErrorMessage: string) {
+  const secure = await secureStoreAvailable();
+  if (!secure && !webKeyStorage) throw new Error(unavailableMessage);
+  let raw: string | null;
+  try { raw = secure ? await SecureStore.getItemAsync(primaryKey) : await AsyncStorage.getItem(fallbackKey); } catch { throw new Error(readErrorMessage); }
+  if (!raw && secure) {
+    const legacy = await AsyncStorage.getItem(fallbackKey);
+    if (legacy) {
+      await SecureStore.setItemAsync(primaryKey, legacy);
+      await AsyncStorage.removeItem(fallbackKey);
+      raw = legacy;
+    }
+  }
+  return raw;
+}
+
+async function writePrivateValue(primaryKey: string, fallbackKey: string, value: string, unavailableMessage: string, writeErrorMessage: string) {
+  const secure = await secureStoreAvailable();
+  if (!secure && !webKeyStorage) throw new Error(unavailableMessage);
+  try {
+    if (secure) {
+      await SecureStore.setItemAsync(primaryKey, value);
+      await AsyncStorage.removeItem(fallbackKey).catch(() => undefined);
+    } else {
+      await AsyncStorage.setItem(fallbackKey, value);
+    }
+  } catch { throw new Error(writeErrorMessage); }
 }
 
 function isStoredDevice(value: unknown): value is StoredDevice {
@@ -170,17 +224,7 @@ function idFromBytes(bytes: Uint8Array) {
 }
 
 async function readDevice(profileId: string) {
-  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
-  let raw: string | null;
-  try { raw = await SecureStore.getItemAsync(cacheKey(profileId)); } catch { throw new Error("Не удалось прочитать ключи устройства"); }
-  if (!raw) {
-    const legacy = await AsyncStorage.getItem(fallbackCacheKey(profileId));
-    if (legacy) {
-      await SecureStore.setItemAsync(cacheKey(profileId), legacy);
-      await AsyncStorage.removeItem(fallbackCacheKey(profileId));
-      raw = legacy;
-    }
-  }
+  const raw = await readPrivateValue(cacheKey(profileId), fallbackCacheKey(profileId), "Безопасное хранилище недоступно на этом устройстве", "Не удалось прочитать ключи устройства");
   if (!raw) return undefined;
   try {
     const value: unknown = JSON.parse(raw);
@@ -190,22 +234,11 @@ async function readDevice(profileId: string) {
 
 async function writeDevice(device: StoredDevice) {
   const value = JSON.stringify(device);
-  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
-  try { await SecureStore.setItemAsync(cacheKey(device.profileId), value); } catch { throw new Error("Не удалось сохранить ключи устройства"); }
+  await writePrivateValue(cacheKey(device.profileId), fallbackCacheKey(device.profileId), value, "Безопасное хранилище недоступно на этом устройстве", "Не удалось сохранить ключи устройства");
 }
 
 async function readAccount(profileId: string) {
-  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
-  let raw: string | null;
-  try { raw = await SecureStore.getItemAsync(accountCacheKey(profileId)); } catch { throw new Error("Не удалось прочитать ключи аккаунта"); }
-  if (!raw) {
-    const legacy = await AsyncStorage.getItem(fallbackAccountCacheKey(profileId));
-    if (legacy) {
-      await SecureStore.setItemAsync(accountCacheKey(profileId), legacy);
-      await AsyncStorage.removeItem(fallbackAccountCacheKey(profileId));
-      raw = legacy;
-    }
-  }
+  const raw = await readPrivateValue(accountCacheKey(profileId), fallbackAccountCacheKey(profileId), "Безопасное хранилище недоступно на этом устройстве", "Не удалось прочитать ключи аккаунта");
   if (!raw) return undefined;
   try {
     const value: unknown = JSON.parse(raw);
@@ -215,8 +248,7 @@ async function readAccount(profileId: string) {
 
 async function writeAccount(account: StoredAccount) {
   const value = JSON.stringify(account);
-  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
-  try { await SecureStore.setItemAsync(accountCacheKey(account.profileId), value); } catch { throw new Error("Не удалось сохранить ключ аккаунта"); }
+  await writePrivateValue(accountCacheKey(account.profileId), fallbackAccountCacheKey(account.profileId), value, "Безопасное хранилище недоступно на этом устройстве", "Не удалось сохранить ключ аккаунта");
 }
 
 async function generateDevice(profileId: string): Promise<StoredDevice> {
@@ -292,8 +324,9 @@ export function deleteDeviceKeys(profileId: string) {
 
 /** Explicit destructive cleanup; never call this from startup or migration paths. */
 export async function deletePrivateE2EKeys(profileId: string) {
-  if (!await secureStoreAvailable()) throw new Error("Безопасное хранилище недоступно на этом устройстве");
-  await Promise.all([
+  const secure = await secureStoreAvailable();
+  if (!secure && !webKeyStorage) throw new Error("Безопасное хранилище недоступно на этом устройстве");
+  if (secure) await Promise.all([
     SecureStore.deleteItemAsync(cacheKey(profileId)),
     SecureStore.deleteItemAsync(accountCacheKey(profileId)),
   ]);
@@ -304,12 +337,12 @@ export function deviceKeyBundle(device: StoredDevice): DeviceKeyBundle {
   return { deviceId: device.deviceId, keyId: device.keyId, encryptionPublicKey: device.encryptionPublicKey, signingPublicKey: device.signingPublicKey, createdAt: device.createdAt };
 }
 
-function envelopeData(envelope: Omit<EncryptedEnvelope, "signature">) {
-  return JSON.stringify({ protocol: envelope.protocol, message_id: envelope.message_id, conversation_id: envelope.conversation_id, sender: envelope.sender, recipient: envelope.recipient, sender_device: envelope.sender_device, key_id: envelope.key_id, created_at: envelope.created_at, nonce: envelope.nonce, ephemeral_public_key: envelope.ephemeral_public_key, associated_data: envelope.associated_data, ciphertext: envelope.ciphertext });
+function encryptedMessageData(encryptedMessage: Omit<EncryptedMessage, "signature">) {
+  return JSON.stringify({ protocol: encryptedMessage.protocol, message_id: encryptedMessage.message_id, conversation_id: encryptedMessage.conversation_id, sender: encryptedMessage.sender, recipient: encryptedMessage.recipient, sender_device: encryptedMessage.sender_device, key_id: encryptedMessage.key_id, created_at: encryptedMessage.created_at, nonce: encryptedMessage.nonce, ephemeral_public_key: encryptedMessage.ephemeral_public_key, associated_data: encryptedMessage.associated_data, ciphertext: encryptedMessage.ciphertext });
 }
 
-function associatedData(envelope: Pick<EncryptedEnvelope, "protocol" | "message_id" | "conversation_id" | "sender" | "recipient" | "sender_device" | "key_id" | "created_at" | "nonce" | "ephemeral_public_key">) {
-  return bytesToBase64(utf8ToBytes(JSON.stringify(envelope)));
+function associatedData(encryptedMessage: Pick<EncryptedMessage, "protocol" | "message_id" | "conversation_id" | "sender" | "recipient" | "sender_device" | "key_id" | "created_at" | "nonce" | "ephemeral_public_key">) {
+  return bytesToBase64(utf8ToBytes(JSON.stringify(encryptedMessage)));
 }
 
 function deriveMessageKey(privateKey: Uint8Array, publicKey: Uint8Array, nonce: Uint8Array, conversationId: string) {
@@ -324,7 +357,7 @@ export async function encryptMessage(profile: Profile, conversationId: string, m
   const ephemeralPublicKey = publicJwk(p256.getPublicKey(ephemeralPrivateKey, false));
   const nonce = await randomBytes(12);
   const sender = `${profile.handle}@${profile.server.replace(/^https?:\/\//, "")}`;
-  const clearEnvelope: Omit<EncryptedEnvelope, "signature"> = {
+  const clearMessage: Omit<EncryptedMessage, "signature"> = {
     protocol: ENTER_PROTOCOL_VERSION,
     message_id: message.id,
     conversation_id: conversationId,
@@ -338,27 +371,27 @@ export async function encryptMessage(profile: Profile, conversationId: string, m
     associated_data: "",
     ciphertext: "",
   };
-  clearEnvelope.associated_data = associatedData(clearEnvelope);
+  clearMessage.associated_data = associatedData(clearMessage);
   const key = deriveMessageKey(ephemeralPrivateKey, publicKeyFromJwk(decodeJwk(recipient.encryptionPublicKey)), nonce, conversationId);
-  clearEnvelope.ciphertext = bytesToBase64(gcm(key, nonce, base64ToBytes(clearEnvelope.associated_data)).encrypt(utf8ToBytes(encodeMessagePayload(message))));
-  const signature = p256.sign(utf8ToBytes(envelopeData(clearEnvelope)), hexToBytes(device.signingPrivateKey), { lowS: false, prehash: true }).toCompactRawBytes();
-  return { ...clearEnvelope, signature: bytesToBase64(signature) } satisfies EncryptedEnvelope;
+  clearMessage.ciphertext = bytesToBase64(gcm(key, nonce, base64ToBytes(clearMessage.associated_data)).encrypt(utf8ToBytes(encodeMessagePayload(message))));
+  const signature = p256.sign(utf8ToBytes(encryptedMessageData(clearMessage)), hexToBytes(device.signingPrivateKey), { lowS: false, prehash: true }).toCompactRawBytes();
+  return { ...clearMessage, signature: bytesToBase64(signature) } satisfies EncryptedMessage;
 }
 
-export async function decryptMessage(profile: Profile, envelope: EncryptedEnvelope, sender: PublicDeviceKey) {
+export async function decryptMessage(profile: Profile, encryptedMessage: EncryptedMessage, sender: PublicDeviceKey) {
   const device = await ensureDeviceKeys(profile.id);
   const account = await readAccount(profile.id);
-  const privateKey = envelope.key_id === account?.keyId
+  const privateKey = encryptedMessage.key_id === account?.keyId
     ? hexToBytes(account.encryptionPrivateKey)
-    : envelope.key_id === device.keyId
+    : encryptedMessage.key_id === device.keyId
       ? hexToBytes(device.encryptionPrivateKey)
       : undefined;
   if (!privateKey) throw new Error("Ключ получателя не найден");
   const signingKey = publicKeyFromJwk(decodeJwk(sender.signingPublicKey));
-  if (!p256.verify(base64ToBytes(envelope.signature), sha256(utf8ToBytes(envelopeData(envelope))), signingKey, { lowS: false, prehash: false })) throw new Error("Подпись сообщения недействительна");
-  const nonce = base64ToBytes(envelope.nonce);
-  const key = deriveMessageKey(privateKey, publicKeyFromJwk(decodeJwk(envelope.ephemeral_public_key)), nonce, envelope.conversation_id);
-  return bytesToUtf8(gcm(key, nonce, base64ToBytes(envelope.associated_data)).decrypt(base64ToBytes(envelope.ciphertext)));
+  if (!p256.verify(base64ToBytes(encryptedMessage.signature), sha256(utf8ToBytes(encryptedMessageData(encryptedMessage))), signingKey, { lowS: false, prehash: false })) throw new Error("Подпись сообщения недействительна");
+  const nonce = base64ToBytes(encryptedMessage.nonce);
+  const key = deriveMessageKey(privateKey, publicKeyFromJwk(decodeJwk(encryptedMessage.ephemeral_public_key)), nonce, encryptedMessage.conversation_id);
+  return bytesToUtf8(gcm(key, nonce, base64ToBytes(encryptedMessage.associated_data)).decrypt(base64ToBytes(encryptedMessage.ciphertext)));
 }
 
 export type { StoredDevice };

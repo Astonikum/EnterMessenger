@@ -9,6 +9,7 @@ import { downloadMedia } from "../rn-api";
 import { decryptMedia } from "../media";
 import type { MessageAttachment, Profile } from "../types";
 import { colors, fonts, radii } from "../theme";
+import { friendlyError } from "../client-errors";
 import { Icon } from "./Icon";
 
 function formatFileSize(size: number) {
@@ -68,7 +69,7 @@ async function saveNativeFile(uri: string, attachment: MessageAttachment) {
 
 function saveWithFeedback(uri: string, attachment: MessageAttachment) {
   void saveNativeFile(uri, attachment).catch((reason) => {
-    Alert.alert("Не удалось сохранить файл", reason instanceof Error ? reason.message : "Попробуйте ещё раз");
+    Alert.alert("Не удалось сохранить файл", friendlyError(reason, "Попробуйте ещё раз"));
   });
 }
 

@@ -1,4 +1,4 @@
-import type { EncryptedEnvelope } from "./protocol";
+import type { EncryptedMessage } from "./protocol";
 import type { Message, MessageAttachment, OutboxEntry } from "./types";
 
 export const MAX_CACHED_MESSAGES_PER_CONVERSATION = 500;
@@ -14,7 +14,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isEnvelope(value: unknown): value is EncryptedEnvelope {
+function isEncryptedMessage(value: unknown): value is EncryptedMessage {
   if (!isRecord(value)) return false;
   return ["protocol", "message_id", "conversation_id", "sender", "recipient", "sender_device", "key_id", "created_at", "nonce", "ephemeral_public_key", "ciphertext", "associated_data", "signature"]
     .every((key) => typeof value[key] === "string");
@@ -40,7 +40,7 @@ function isCachedMessage(value: unknown): value is Message {
     && (value.author === "me" || value.author === "them")
     && typeof value.text === "string"
     && typeof value.time === "string"
-    && (value.envelope === undefined || isEnvelope(value.envelope))
+    && (value.encryptedMessage === undefined || isEncryptedMessage(value.encryptedMessage))
     && (value.attachments === undefined || (Array.isArray(value.attachments) && value.attachments.every(isAttachment)));
 }
 

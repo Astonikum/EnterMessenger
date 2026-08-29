@@ -10,14 +10,18 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
+};
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -258,7 +262,7 @@ struct MessageResponse {
     author: String,
     created_at: i64,
     stack_id: String,
-    envelope: protocol::EncryptedEnvelope,
+    encrypted_message: protocol::EncryptedMessage,
 }
 
 #[derive(Clone, Serialize)]
@@ -266,6 +270,7 @@ struct MessageResponse {
 struct SyncResponse {
     next_cursor: i64,
     conversations: Vec<ConversationResponse>,
+    folders: Vec<storage::StoredFolder>,
     messages: Vec<MessageResponse>,
     read_receipts: Vec<ReadReceiptResponse>,
     delivery_receipts: Vec<DeliveryReceiptResponse>,
@@ -313,6 +318,9 @@ enum RealtimeEvent {
         #[serde(rename = "lastSeenAt")]
         last_seen_at: i64,
     },
+    Folders {
+        folders: Vec<storage::StoredFolder>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -358,9 +366,9 @@ struct SearchQuery {
 struct SendMessageRequest {
     conversation_id: String,
     client_message_id: String,
-    envelope: Option<protocol::EncryptedEnvelope>,
+    encrypted_message: Option<protocol::EncryptedMessage>,
     #[serde(default)]
-    envelopes: Vec<protocol::EncryptedEnvelope>,
+    encrypted_messages: Vec<protocol::EncryptedMessage>,
 }
 
 #[derive(Serialize)]
@@ -387,7 +395,7 @@ struct DeviceHistoryEntry {
     conversation_id: String,
     message_id: String,
     source_key_id: Option<String>,
-    envelope: protocol::EncryptedEnvelope,
+    encrypted_message: protocol::EncryptedMessage,
 }
 
 #[derive(Deserialize)]
@@ -412,6 +420,17 @@ struct RegisterDeviceKeyRequest {
     created_at: i64,
     account_key_id: Option<String>,
     account_encryption_public_key: Option<String>,
+    platform: Option<String>,
+    device_name: Option<String>,
+    app_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionMetadataRequest {
+    platform: Option<String>,
+    device_name: Option<String>,
+    app_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -449,8 +468,10 @@ const REALTIME_MAX_CONNECTIONS_PER_ACCOUNT: usize = 4;
 const REALTIME_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const REALTIME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_ENVELOPES_PER_MESSAGE: usize = 64;
-const MAX_ENVELOPE_BATCH_BYTES: usize = 3 * 1024 * 1024;
+const MAX_ACCOUNT_FOLDERS: usize = 100;
+const MAX_FOLDER_CHAT_IDS: usize = 4_096;
+const MAX_ENCRYPTED_MESSAGES_PER_MESSAGE: usize = 64;
+const MAX_ENCRYPTED_MESSAGE_BATCH_BYTES: usize = 3 * 1024 * 1024;
 const MAX_LOGO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -558,6 +579,26 @@ fn valid_display_text(value: &str, max_len: usize) -> bool {
     !value.is_empty() && value.len() <= max_len && !value.chars().any(char::is_control)
 }
 
+fn valid_account_folders(folders: &[storage::StoredFolder]) -> bool {
+    if folders.len() > MAX_ACCOUNT_FOLDERS {
+        return false;
+    }
+    let mut folder_ids = HashSet::with_capacity(folders.len());
+    folders.iter().all(|folder| {
+        let mut chat_ids = HashSet::with_capacity(folder.chat_ids.len());
+        protocol::valid_identifier(&folder.id)
+            && folder_ids.insert(folder.id.as_str())
+            && valid_display_text(folder.name.trim(), 160)
+            && matches!(folder.template.as_str(), "custom" | "personal" | "all")
+            && matches!(folder.icon.as_str(), "folder" | "chat" | "person" | "star" | "bookmark")
+            && folder.chat_ids.len() <= MAX_FOLDER_CHAT_IDS
+            && folder
+                .chat_ids
+                .iter()
+                .all(|chat_id| protocol::valid_identifier(chat_id) && chat_ids.insert(chat_id.as_str()))
+    })
+}
+
 fn valid_password(value: &str) -> bool {
     value.len() >= 8 && value.len() <= MAX_PASSWORD_BYTES && !value.chars().any(char::is_control)
 }
@@ -584,24 +625,58 @@ fn valid_key_material(value: &str) -> bool {
         })
 }
 
-fn valid_envelope_batch(envelopes: &[protocol::EncryptedEnvelope]) -> bool {
-    envelopes.len() <= MAX_ENVELOPES_PER_MESSAGE
-        && envelopes
+fn decode_key_json(value: &str) -> Option<serde_json::Value> {
+    [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD]
+        .into_iter()
+        .find_map(|engine| engine.decode(value).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn valid_public_jwk_material(value: &str) -> bool {
+    if !valid_key_material(value) {
+        return false;
+    }
+    let Some(jwk) = decode_key_json(value) else {
+        return false;
+    };
+    let coordinate = |name: &str| {
+        jwk.get(name)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|coordinate| {
+                [
+                    URL_SAFE_NO_PAD.decode(coordinate),
+                    URL_SAFE.decode(coordinate),
+                ]
+                .into_iter()
+                .find_map(Result::ok)
+            })
+            .is_some_and(|coordinate| coordinate.len() == 32)
+    };
+    jwk.get("kty").and_then(serde_json::Value::as_str) == Some("EC")
+        && jwk.get("crv").and_then(serde_json::Value::as_str) == Some("P-256")
+        && coordinate("x")
+        && coordinate("y")
+        && jwk.get("d").is_none()
+}
+
+fn valid_encrypted_message_batch(encrypted_messages: &[protocol::EncryptedMessage]) -> bool {
+    encrypted_messages.len() <= MAX_ENCRYPTED_MESSAGES_PER_MESSAGE
+        && encrypted_messages
             .iter()
-            .try_fold(0usize, |size, envelope| {
-                serde_json::to_vec(envelope)
+            .try_fold(0usize, |size, encrypted_message| {
+                serde_json::to_vec(encrypted_message)
                     .ok()
                     .and_then(|value| size.checked_add(value.len()))
             })
-            .is_some_and(|size| size <= MAX_ENVELOPE_BATCH_BYTES)
+            .is_some_and(|size| size <= MAX_ENCRYPTED_MESSAGE_BATCH_BYTES)
 }
 
-fn envelope_belongs_to_account(
-    envelope: &protocol::EncryptedEnvelope,
+fn encrypted_message_belongs_to_account(
+    encrypted_message: &protocol::EncryptedMessage,
     account: &storage::StoredAccount,
     public_url: &str,
 ) -> bool {
-    enter_address_parts(&envelope.sender)
+    enter_address_parts(&encrypted_message.sender)
         .is_some_and(|(handle, server)| handle == account.handle && same_server(public_url, server))
 }
 
@@ -682,17 +757,17 @@ fn federation_delivery_error(
     if !protocol::is_supported_delivery(delivery) {
         return Some("invalid_federation_delivery");
     }
-    let envelope = &delivery.message.envelope;
-    let Some((_, envelope_sender_server)) = enter_address_parts(&envelope.sender) else {
+    let encrypted_message = &delivery.message.encrypted_message;
+    let Some((_, encrypted_message_sender_server)) = enter_address_parts(&encrypted_message.sender) else {
         return Some("invalid_federation_delivery");
     };
-    if !same_server(&delivery.sender_server, envelope_sender_server) {
+    if !same_server(&delivery.sender_server, encrypted_message_sender_server) {
         return Some("sender_server_mismatch");
     }
-    if same_server(local_server, envelope_sender_server) {
+    if same_server(local_server, encrypted_message_sender_server) {
         return Some("federation_loop");
     }
-    let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+    let Some((_, recipient_server)) = enter_address_parts(&encrypted_message.recipient) else {
         return Some("invalid_federation_delivery");
     };
     if !same_server(local_server, recipient_server) {
@@ -704,13 +779,13 @@ fn federation_delivery_error(
 async fn forward_federation_message(
     state: &AppState,
     sender: &storage::StoredAccount,
-    envelope: &protocol::EncryptedEnvelope,
+    encrypted_message: &protocol::EncryptedMessage,
     created_at: i64,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let Some(secret) = state.config.federation_secret.as_deref() else {
         return Err(error(StatusCode::BAD_REQUEST, "federation_not_configured"));
     };
-    let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+    let Some((_, recipient_server)) = enter_address_parts(&encrypted_message.recipient) else {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
     };
     let delivery = protocol::FederationDelivery {
@@ -718,17 +793,17 @@ async fn forward_federation_message(
         delivery_id: format!(
             "{}:{}:{}",
             normalize_server(&state.config.public_url),
-            envelope.message_id,
-            envelope.key_id
+            encrypted_message.message_id,
+            encrypted_message.key_id
         ),
         sender_server: state.config.public_url.clone(),
         sender_name: sender.name.clone(),
         sender_avatar: sender.handle.clone(),
         message: protocol::FederationMessage {
-            id: envelope.message_id.clone(),
-            conversation_id: envelope.conversation_id.clone(),
+            id: encrypted_message.message_id.clone(),
+            conversation_id: encrypted_message.conversation_id.clone(),
             created_at,
-            envelope: envelope.clone(),
+            encrypted_message: encrypted_message.clone(),
         },
     };
     let client = reqwest::Client::builder()
@@ -764,12 +839,12 @@ async fn forward_federation_message(
 async fn deliver_local_message(
     state: &AppState,
     sender: &storage::StoredAccount,
-    envelope: &protocol::EncryptedEnvelope,
-    envelope_json: &str,
+    encrypted_message: &protocol::EncryptedMessage,
+    message_json: &str,
     created_at: i64,
     notify: bool,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some((recipient_handle, recipient_server)) = enter_address_parts(&envelope.recipient)
+    let Some((recipient_handle, recipient_server)) = enter_address_parts(&encrypted_message.recipient)
     else {
         return Ok(());
     };
@@ -790,17 +865,17 @@ async fn deliver_local_message(
     }
 
     let sender_address = canonical_address(&state.config.public_url, &sender.handle);
-    let delivery_id = format!("{}:{}", envelope.message_id, envelope.key_id);
+    let delivery_id = format!("{}:{}", encrypted_message.message_id, encrypted_message.key_id);
     let delivered = state
         .db
         .deliver_message(
             &recipient.id,
-            &envelope.conversation_id,
+            &encrypted_message.conversation_id,
             &sender_address,
             &sender.name,
             &sender.handle,
             &delivery_id,
-            envelope_json,
+            message_json,
             created_at,
         )
         .await
@@ -819,7 +894,7 @@ async fn deliver_local_message(
                 state.clone(),
                 recipient.id.clone(),
                 sender.name.clone(),
-                envelope.conversation_id.clone(),
+                encrypted_message.conversation_id.clone(),
                 message.id.clone(),
             ));
         }
@@ -844,8 +919,8 @@ async fn federation_delivery(
     if let Some(reason) = federation_delivery_error(&delivery, &state.config.public_url) {
         return Err(error(StatusCode::BAD_REQUEST, reason));
     }
-    let envelope = &delivery.message.envelope;
-    let Some((recipient_handle, _)) = enter_address_parts(&envelope.recipient) else {
+    let encrypted_message = &delivery.message.encrypted_message;
+    let Some((recipient_handle, _)) = enter_address_parts(&encrypted_message.recipient) else {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid_federation_delivery",
@@ -859,18 +934,31 @@ async fn federation_delivery(
     else {
         return Err(error(StatusCode::NOT_FOUND, "recipient_not_found"));
     };
-    let envelope_json = serde_json::to_string(envelope)
+    let registered_recipient_key = state
+        .db
+        .has_device_key_id(&recipient.id, &encrypted_message.key_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        || state
+            .db
+            .has_account_key_id(&recipient.id, &encrypted_message.key_id)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if !registered_recipient_key {
+        return Err(error(StatusCode::BAD_REQUEST, "recipient_key_not_registered"));
+    }
+    let message_json = serde_json::to_string(encrypted_message)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_federation_delivery"))?;
     let delivered = state
         .db
         .deliver_message(
             &recipient.id,
-            &envelope.conversation_id,
-            &envelope.sender,
+            &encrypted_message.conversation_id,
+            &encrypted_message.sender,
             &delivery.sender_name,
             &delivery.sender_avatar,
             &delivery.delivery_id,
-            &envelope_json,
+            &message_json,
             storage::now_ms(),
         )
         .await
@@ -888,7 +976,7 @@ async fn federation_delivery(
             state.clone(),
             recipient.id.clone(),
             delivery.sender_name.clone(),
-            envelope.conversation_id.clone(),
+            encrypted_message.conversation_id.clone(),
             message.id,
         ));
     }
@@ -1290,6 +1378,39 @@ async fn list_sessions(
     ))
 }
 
+async fn update_current_session_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SessionMetadataRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if !valid_optional_metadata(request.platform.as_ref(), 32)
+        || !valid_optional_metadata(request.device_name.as_ref(), 128)
+        || !valid_optional_metadata(request.app_version.as_ref(), 64)
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_session_metadata"));
+    }
+    let token = bearer_token(&headers)?.to_owned();
+    let account_id = state
+        .db
+        .account_id_for_session(&token, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    state
+        .db
+        .update_session_metadata(
+            &account_id,
+            &token,
+            request.platform.as_deref(),
+            request.device_name.as_deref(),
+            request.app_version.as_deref(),
+            storage::now_ms(),
+        )
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
 async fn revoke_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1469,7 +1590,7 @@ fn message_response(value: storage::StoredMessage) -> Result<MessageResponse, se
         author: value.author,
         created_at: value.created_at,
         stack_id: value.stack_id,
-        envelope: serde_json::from_str(&value.envelope_json)?,
+        encrypted_message: serde_json::from_str(&value.message_json)?,
     })
 }
 
@@ -1564,7 +1685,7 @@ async fn sync_payload(
         .into_iter()
         .map(message_response)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "invalid_stored_envelope")?;
+        .map_err(|_| "invalid_stored_encrypted_message")?;
     Ok(SyncResponse {
         next_cursor: snapshot.cursor,
         conversations: snapshot
@@ -1572,6 +1693,7 @@ async fn sync_payload(
             .into_iter()
             .map(|conversation| conversation_response(conversation, &state.server_id, now))
             .collect(),
+        folders: snapshot.folders,
         messages,
         read_receipts: snapshot
             .read_receipts
@@ -1798,6 +1920,16 @@ async fn realtime_session(mut socket: WebSocket, state: AppState) {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                let session_account = state
+                    .db
+                    .account_id_for_session(&hello.token, storage::now_ms())
+                    .await
+                    .ok()
+                    .flatten();
+                if session_account.as_deref() != Some(account_id.as_str()) {
+                    fail_realtime(&mut socket, "unauthorized", 1008).await;
+                    break;
+                }
                 if state.db.touch_presence(&account_id, storage::now_ms()).await.is_err() {
                     break;
                 }
@@ -1816,6 +1948,16 @@ async fn realtime_session(mut socket: WebSocket, state: AppState) {
                     Some(Ok(WsMessage::Text(text))) => {
                         if text.len() > REALTIME_MAX_FRAME_BYTES {
                             fail_realtime(&mut socket, "frame_too_large", 1009).await;
+                            break;
+                        }
+                        let session_account = state
+                            .db
+                            .account_id_for_session(&hello.token, storage::now_ms())
+                            .await
+                            .ok()
+                            .flatten();
+                        if session_account.as_deref() != Some(account_id.as_str()) {
+                            fail_realtime(&mut socket, "unauthorized", 1008).await;
                             break;
                         }
                         let Ok(command) = serde_json::from_str::<RealtimeClientMessage>(&text) else {
@@ -1878,6 +2020,30 @@ async fn sync(
         .await
         .map(Json)
         .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))
+}
+
+async fn update_account_folders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut folders): Json<Vec<storage::StoredFolder>>,
+) -> Result<Json<Vec<storage::StoredFolder>>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    if !valid_account_folders(&folders) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_folders"));
+    }
+    for folder in &mut folders {
+        folder.name = folder.name.trim().to_owned();
+    }
+    state
+        .db
+        .update_account_folders(&account_id, &folders, storage::now_ms())
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    state
+        .realtime
+        .publish(&account_id, RealtimeEvent::Folders { folders: folders.clone() })
+        .await;
+    Ok(Json(folders))
 }
 
 async fn mark_conversation_read(
@@ -1985,28 +2151,28 @@ async fn send_message(
     };
     let conversation_id = request.conversation_id.trim();
     let client_message_id = request.client_message_id.trim();
-    let envelopes = if request.envelopes.is_empty() {
-        request.envelope.into_iter().collect::<Vec<_>>()
+    let encrypted_messages = if request.encrypted_messages.is_empty() {
+        request.encrypted_message.into_iter().collect::<Vec<_>>()
     } else {
-        request.envelopes
+        request.encrypted_messages
     };
-    let Some(primary) = envelopes.first() else {
+    let Some(primary) = encrypted_messages.first() else {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
     };
     if !protocol::valid_identifier(conversation_id)
         || !protocol::valid_identifier(client_message_id)
-        || !valid_envelope_batch(&envelopes)
+        || !valid_encrypted_message_batch(&encrypted_messages)
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
     }
-    for envelope in &envelopes {
-        if client_message_id != envelope.message_id
-            || envelope.conversation_id != conversation_id
-            || !protocol::is_supported_envelope(envelope)
+    for encrypted_message in &encrypted_messages {
+        if client_message_id != encrypted_message.message_id
+            || encrypted_message.conversation_id != conversation_id
+            || !protocol::is_supported_message(encrypted_message)
         {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
         }
-        let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+        let Some((_, recipient_server)) = enter_address_parts(&encrypted_message.recipient) else {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
         };
         if !same_server(&state.config.public_url, recipient_server)
@@ -2014,16 +2180,42 @@ async fn send_message(
         {
             return Err(error(StatusCode::BAD_REQUEST, "federation_not_configured"));
         }
-        if !envelope_belongs_to_account(envelope, &sender, &state.config.public_url) {
+        if !encrypted_message_belongs_to_account(encrypted_message, &sender, &state.config.public_url) {
             return Err(error(StatusCode::FORBIDDEN, "sender_identity_mismatch"));
         }
         let registered_device = state
             .db
-            .has_device_key(&account_id, &envelope.sender_device)
+            .has_device_key(&account_id, &encrypted_message.sender_device)
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
         if !registered_device {
             return Err(error(StatusCode::FORBIDDEN, "device_key_not_registered"));
+        }
+        if same_server(&state.config.public_url, recipient_server) {
+            let Some((recipient_handle, _)) = enter_address_parts(&encrypted_message.recipient) else {
+                return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
+            };
+            let Some(recipient) = state
+                .db
+                .account_by_handle(recipient_handle)
+                .await
+                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+            else {
+                return Err(error(StatusCode::NOT_FOUND, "recipient_not_found"));
+            };
+            let registered_recipient_key = state
+                .db
+                .has_device_key_id(&recipient.id, &encrypted_message.key_id)
+                .await
+                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+                || state
+                    .db
+                    .has_account_key_id(&recipient.id, &encrypted_message.key_id)
+                    .await
+                    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+            if !registered_recipient_key {
+                return Err(error(StatusCode::BAD_REQUEST, "recipient_key_not_registered"));
+            }
         }
     }
 
@@ -2038,7 +2230,7 @@ async fn send_message(
         Some(true) => {}
     }
     let primary_json = serde_json::to_string(primary)
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_encrypted_message"))?;
     let created_at = storage::now_ms();
     let message = state
         .db
@@ -2052,12 +2244,12 @@ async fn send_message(
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "conversation_not_found"))?;
-    for envelope in envelopes.iter().skip(1) {
-        let envelope_json = serde_json::to_string(envelope)
-            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
+    for encrypted_message in encrypted_messages.iter().skip(1) {
+        let message_json = serde_json::to_string(encrypted_message)
+            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_encrypted_message"))?;
         let copy_id = format!(
             "copy:{account_id}:{}:{}",
-            client_message_id, envelope.key_id
+            client_message_id, encrypted_message.key_id
         );
         state
             .db
@@ -2065,7 +2257,7 @@ async fn send_message(
                 &account_id,
                 conversation_id,
                 &copy_id,
-                &envelope_json,
+                &message_json,
                 created_at,
             )
             .await
@@ -2080,24 +2272,24 @@ async fn send_message(
     {
         publish_stored_event(&state, event).await;
     }
-    for (index, envelope) in envelopes.iter().enumerate() {
-        let envelope_json = serde_json::to_string(envelope)
-            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_envelope"))?;
-        let Some((_, recipient_server)) = enter_address_parts(&envelope.recipient) else {
+    for (index, encrypted_message) in encrypted_messages.iter().enumerate() {
+        let message_json = serde_json::to_string(encrypted_message)
+            .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_encrypted_message"))?;
+        let Some((_, recipient_server)) = enter_address_parts(&encrypted_message.recipient) else {
             return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
         };
         if same_server(&state.config.public_url, recipient_server) {
             deliver_local_message(
                 &state,
                 &sender,
-                envelope,
-                &envelope_json,
+                encrypted_message,
+                &message_json,
                 created_at,
                 index == 0,
             )
             .await?;
         } else {
-            forward_federation_message(&state, &sender, envelope, created_at).await?;
+            forward_federation_message(&state, &sender, encrypted_message, created_at).await?;
         }
     }
     let cursor = state
@@ -2106,7 +2298,7 @@ async fn send_message(
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     let message = message_response(message)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_envelope"))?;
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_encrypted_message"))?;
     Ok(Json(SendMessageResponse {
         next_cursor: cursor,
         message,
@@ -2128,7 +2320,10 @@ async fn upload_media(
 ) -> Result<Json<MediaUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let account_id = bearer_account_id(&state, &headers).await?;
     let max_media_body = state.config.media_max_bytes.saturating_add(16);
-    if body.is_empty() || body.len() > max_media_body {
+    if body.len() < 16 {
+        return Err(error(StatusCode::BAD_REQUEST, "media_too_small"));
+    }
+    if body.len() > max_media_body {
         return Err(error(StatusCode::PAYLOAD_TOO_LARGE, "media_too_large"));
     }
     let media_id = headers
@@ -2234,24 +2429,24 @@ async fn device_history(
         return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
     };
     let history_size = request.entries.iter().try_fold(0usize, |size, entry| {
-        serde_json::to_vec(&entry.envelope)
+        serde_json::to_vec(&entry.encrypted_message)
             .ok()
             .and_then(|value| size.checked_add(value.len()))
     });
-    if request.entries.len() > 50 || history_size.is_none_or(|size| size > MAX_ENVELOPE_BATCH_BYTES)
+    if request.entries.len() > 50 || history_size.is_none_or(|size| size > MAX_ENCRYPTED_MESSAGE_BATCH_BYTES)
     {
         return Err(error(StatusCode::BAD_REQUEST, "too_many_history_entries"));
     }
 
     let mut accepted = 0;
     for entry in request.entries {
-        let envelope = &entry.envelope;
+        let encrypted_message = &entry.encrypted_message;
         if !protocol::valid_identifier(&entry.message_id)
             || !protocol::valid_identifier(&entry.conversation_id)
-            || entry.message_id != envelope.message_id
-            || entry.conversation_id != envelope.conversation_id
-            || !protocol::is_supported_envelope(envelope)
-            || !envelope_belongs_to_account(envelope, &sender, &state.config.public_url)
+            || entry.message_id != encrypted_message.message_id
+            || entry.conversation_id != encrypted_message.conversation_id
+            || !protocol::is_supported_message(encrypted_message)
+            || !encrypted_message_belongs_to_account(encrypted_message, &sender, &state.config.public_url)
             || entry
                 .source_key_id
                 .as_deref()
@@ -2261,23 +2456,23 @@ async fn device_history(
         }
         let sender_registered = state
             .db
-            .has_device_key(&account_id, &envelope.sender_device)
+            .has_device_key(&account_id, &encrypted_message.sender_device)
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
         let target_registered = state
             .db
-            .has_device_key_id(&account_id, &envelope.key_id)
+            .has_device_key_id(&account_id, &encrypted_message.key_id)
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
             || state
                 .db
-                .has_account_key_id(&account_id, &envelope.key_id)
+                .has_account_key_id(&account_id, &encrypted_message.key_id)
                 .await
                 .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
         if !sender_registered || !target_registered {
             return Err(error(StatusCode::FORBIDDEN, "device_key_not_registered"));
         }
-        let envelope_json = serde_json::to_string(envelope)
+        let message_json = serde_json::to_string(encrypted_message)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_history_entry"))?;
         if state
             .db
@@ -2286,8 +2481,8 @@ async fn device_history(
                 &entry.conversation_id,
                 &entry.message_id,
                 entry.source_key_id.as_deref(),
-                &envelope.key_id,
-                &envelope_json,
+                &encrypted_message.key_id,
+                &message_json,
             )
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
@@ -2311,13 +2506,14 @@ async fn device_history(
 mod tests {
     use super::{
         constant_time_equal, conversation_response, enter_address_parts,
-        envelope_belongs_to_account, federation_authorized, federation_delivery_error,
+        encrypted_message_belongs_to_account, federation_authorized, federation_delivery_error,
         federation_urls, is_embedded_app_origin, is_local_dev_origin, normalize_server, origin,
         realtime_error_payload, realtime_hello_error, realtime_origin_allowed, same_server,
-        valid_envelope_batch, RealtimeEvent, RealtimeHello, RealtimeHub, MAX_ENVELOPES_PER_MESSAGE,
-        REALTIME_PROTOCOL_VERSION,
+        valid_encrypted_message_batch, valid_public_jwk_material, RealtimeEvent, RealtimeHello, RealtimeHub,
+        MAX_ENCRYPTED_MESSAGES_PER_MESSAGE, REALTIME_PROTOCOL_VERSION,
     };
     use axum::http::{HeaderMap, HeaderValue};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     #[test]
     fn local_server_aliases_match() {
@@ -2342,14 +2538,14 @@ mod tests {
     }
 
     #[test]
-    fn envelope_sender_must_match_authenticated_account() {
+    fn encrypted_message_sender_must_match_authenticated_account() {
         let account = super::storage::StoredAccount {
             id: "account-1".to_owned(),
             name: "Alice".to_owned(),
             handle: "alice".to_owned(),
             password_hash: "hash".to_owned(),
         };
-        let envelope = super::protocol::EncryptedEnvelope {
+        let encrypted_message = super::protocol::EncryptedMessage {
             protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
             message_id: "message-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
@@ -2364,20 +2560,20 @@ mod tests {
             associated_data: "aad".to_owned(),
             signature: "signature".to_owned(),
         };
-        assert!(envelope_belongs_to_account(
-            &envelope,
+        assert!(encrypted_message_belongs_to_account(
+            &encrypted_message,
             &account,
             "https://example.test"
         ));
-        let mut forged = envelope.clone();
+        let mut forged = encrypted_message.clone();
         forged.sender = "mallory@example.test".to_owned();
-        assert!(!envelope_belongs_to_account(
+        assert!(!encrypted_message_belongs_to_account(
             &forged,
             &account,
             "https://example.test"
         ));
         forged.sender = "alice@evil.example".to_owned();
-        assert!(!envelope_belongs_to_account(
+        assert!(!encrypted_message_belongs_to_account(
             &forged,
             &account,
             "https://example.test"
@@ -2385,8 +2581,8 @@ mod tests {
     }
 
     #[test]
-    fn envelope_fanout_is_bounded() {
-        let envelope = super::protocol::EncryptedEnvelope {
+    fn encrypted_message_fanout_is_bounded() {
+        let encrypted_message = super::protocol::EncryptedMessage {
             protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
             message_id: "message-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
@@ -2401,11 +2597,39 @@ mod tests {
             associated_data: "aad".to_owned(),
             signature: "signature".to_owned(),
         };
-        assert!(valid_envelope_batch(std::slice::from_ref(&envelope)));
-        assert!(!valid_envelope_batch(&vec![
-            envelope;
-            MAX_ENVELOPES_PER_MESSAGE + 1
+        assert!(valid_encrypted_message_batch(std::slice::from_ref(&encrypted_message)));
+        assert!(!valid_encrypted_message_batch(&vec![
+            encrypted_message;
+            MAX_ENCRYPTED_MESSAGES_PER_MESSAGE + 1
         ]));
+    }
+
+    #[test]
+    fn key_material_must_be_a_public_p256_jwk() {
+        let coordinate = "A".repeat(43);
+        let public = STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": coordinate,
+                "y": "A".repeat(43),
+            }))
+            .expect("serialize public JWK"),
+        );
+        assert!(valid_public_jwk_material(&public));
+
+        let private = STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": "A".repeat(43),
+                "y": "A".repeat(43),
+                "d": "A".repeat(43),
+            }))
+            .expect("serialize private JWK"),
+        );
+        assert!(!valid_public_jwk_material(&private));
+        assert!(!valid_public_jwk_material("encryption"));
     }
 
     #[test]
@@ -2432,7 +2656,7 @@ mod tests {
 
     #[test]
     fn federation_delivery_is_bound_to_both_servers() {
-        let envelope = super::protocol::EncryptedEnvelope {
+        let encrypted_message = super::protocol::EncryptedMessage {
             protocol: super::protocol::PROTOCOL_VERSION.to_owned(),
             message_id: "message-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
@@ -2454,10 +2678,10 @@ mod tests {
             sender_name: "Alice".to_owned(),
             sender_avatar: "alice".to_owned(),
             message: super::protocol::FederationMessage {
-                id: envelope.message_id.clone(),
-                conversation_id: envelope.conversation_id.clone(),
+                id: encrypted_message.message_id.clone(),
+                conversation_id: encrypted_message.conversation_id.clone(),
                 created_at: 1,
-                envelope,
+                encrypted_message,
             },
         };
         assert_eq!(
@@ -2471,7 +2695,7 @@ mod tests {
             Some("sender_server_mismatch")
         );
         let mut misrouted = delivery;
-        misrouted.message.envelope.recipient = "bob@other.example".to_owned();
+        misrouted.message.encrypted_message.recipient = "bob@other.example".to_owned();
         assert_eq!(
             federation_delivery_error(&misrouted, "https://target.example"),
             Some("wrong_recipient_server")
@@ -2664,9 +2888,12 @@ async fn register_device_key(
     let key_id = request.key_id.trim();
     if !protocol::valid_identifier(device_id)
         || !protocol::valid_identifier(key_id)
-        || !valid_key_material(request.encryption_public_key.trim())
-        || !valid_key_material(request.signing_public_key.trim())
+        || !valid_public_jwk_material(request.encryption_public_key.trim())
+        || !valid_public_jwk_material(request.signing_public_key.trim())
         || request.created_at <= 0
+        || !valid_optional_metadata(request.platform.as_ref(), 32)
+        || !valid_optional_metadata(request.device_name.as_ref(), 128)
+        || !valid_optional_metadata(request.app_version.as_ref(), 64)
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_device_key"));
     }
@@ -2676,7 +2903,7 @@ async fn register_device_key(
     ) {
         (Some(key_id), Some(public_key))
             if protocol::valid_identifier(key_id.trim())
-                && valid_key_material(public_key.trim()) =>
+                && valid_public_jwk_material(public_key.trim()) =>
         {
             Some((key_id.trim().to_owned(), public_key.trim().to_owned()))
         }
@@ -2703,18 +2930,33 @@ async fn register_device_key(
         .upsert_device(
             &account_id,
             device_id,
-            "unknown",
-            None,
-            None,
+            request.platform.as_deref().unwrap_or("unknown"),
+            request.device_name.as_deref(),
+            request.app_version.as_deref(),
             storage::now_ms(),
         )
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
-    state
+    let token = bearer_token(&headers)?.to_owned();
+    let bound = state
         .db
-        .bind_session_device(&account_id, bearer_token(&headers)?, device_id)
+        .bind_session_device(&account_id, &token, device_id)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    if bound {
+        state
+            .db
+            .update_session_metadata(
+                &account_id,
+                &token,
+                request.platform.as_deref(),
+                request.device_name.as_deref(),
+                request.app_version.as_deref(),
+                storage::now_ms(),
+            )
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    }
     if let Some((key_id, public_key)) = account_key {
         state
             .db
@@ -2822,6 +3064,10 @@ async fn main() {
             get(get_account_settings).patch(patch_account_settings),
         )
         .route("/api/v1/sessions", get(list_sessions))
+        .route(
+            "/api/v1/sessions/current",
+            patch(update_current_session_metadata),
+        )
         .route("/api/v1/sessions/:session_id", delete(revoke_session))
         .route(
             "/api/v1/sessions/revoke-others",
@@ -2830,6 +3076,7 @@ async fn main() {
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/:device_id", delete(revoke_device))
         .route("/api/v1/sync", get(sync))
+        .route("/api/v1/account/folders", put(update_account_folders))
         .route("/api/v1/realtime", get(realtime))
         .route("/api/v1/messages", post(send_message))
         .route(

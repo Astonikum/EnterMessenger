@@ -1,14 +1,18 @@
-import { ENTER_PROTOCOL_VERSION, type EncryptedEnvelope } from "./protocol";
+import { Platform } from "react-native";
+import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./protocol";
 import { formatEnterAddress, parseEnterAddress } from "./rn-address";
 import { messageTime as formatMessageTime } from "./data";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./rn-e2e";
 import type { Conversation, Message, Profile, SearchUser } from "./types";
+import { isChatFolder, type ChatFolder } from "./folders";
 import { MAX_MEDIA_BYTES } from "./media";
+import { logEvent } from "./logs";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_MEDIA_CIPHERTEXT_BYTES = MAX_MEDIA_BYTES + 16;
-const MAX_ENVELOPE_CIPHERTEXT_LENGTH = 2_000_000;
+const MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH = 2_000_000;
 const MAX_SYNC_ITEMS = 1_000;
+const MAX_FOLDERS = 100;
 
 function isLoopbackServer(server: string) {
   try {
@@ -48,12 +52,12 @@ export type RemoteMessage = {
   author: "me" | "them";
   createdAt: number;
   stackId: string;
-  envelope: EncryptedEnvelope;
+  encryptedMessage: EncryptedMessage;
 };
 
 export type RemoteReadReceipt = { messageId: string; readAt: number };
 export type RemoteDeliveryReceipt = { messageId: string; deliveredAt: number };
-export type SyncResponse = { nextCursor: number; conversations: RemoteConversation[]; messages: RemoteMessage[]; readReceipts: RemoteReadReceipt[]; deliveryReceipts: RemoteDeliveryReceipt[] };
+export type SyncResponse = { nextCursor: number; conversations: RemoteConversation[]; folders?: ChatFolder[]; messages: RemoteMessage[]; readReceipts: RemoteReadReceipt[]; deliveryReceipts: RemoteDeliveryReceipt[] };
 
 export type RealtimeEvent =
   | { type: "ready"; version: number }
@@ -62,9 +66,10 @@ export type RealtimeEvent =
   | { type: "readReceipt"; cursor: number; messageId: string; readAt: number }
   | { type: "deliveryReceipt"; cursor: number; messageId: string; deliveredAt: number }
   | { type: "presence"; conversationId: string; online: boolean; lastSeenAt: number }
+  | { type: "folders"; folders: ChatFolder[] }
   | { type: "pong" }
   | { type: "error"; code: string };
-export type DeviceHistoryEntry = { conversationId: string; messageId: string; sourceKeyId?: string; envelope: EncryptedEnvelope };
+export type DeviceHistoryEntry = { conversationId: string; messageId: string; sourceKeyId?: string; encryptedMessage: EncryptedMessage };
 
 export type AccountSettings = {
   id: string;
@@ -105,6 +110,23 @@ export type AccountSession = {
   current: boolean;
 };
 
+export type ClientDeviceMetadata = {
+  platform: string;
+  deviceName: string;
+  appVersion: string;
+};
+
+export function clientDeviceMetadata(): ClientDeviceMetadata {
+  const version = Platform.Version === undefined ? "" : ` ${String(Platform.Version)}`;
+  const platform = Platform.OS === "ios"
+    ? `iOS${version}`
+    : Platform.OS === "android"
+      ? `Android${version}`
+      : `${Platform.OS}${version}`;
+  const deviceName = Platform.OS === "ios" ? "iOS device" : Platform.OS === "android" ? "Android device" : "Mobile device";
+  return { platform: platform.slice(0, 32), deviceName, appVersion: "0.2.0" };
+}
+
 type PublicKeyDirectoryResponse = { id: string; handle: string; name: string; server: string; serverId?: string; devices: DeviceKeyBundle[]; accountKey?: { keyId: string; encryptionPublicKey: string } | null };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -131,10 +153,10 @@ function isNonNegativeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-function isEnvelope(value: unknown): value is EncryptedEnvelope {
+function isEncryptedMessage(value: unknown): value is EncryptedMessage {
   if (!isRecord(value) || value.protocol !== ENTER_PROTOCOL_VERSION) return false;
   return ["message_id", "conversation_id", "sender", "recipient", "sender_device", "key_id", "created_at", "nonce", "ephemeral_public_key", "ciphertext", "associated_data", "signature"]
-    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENVELOPE_CIPHERTEXT_LENGTH : 4096));
+    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH : 4096));
 }
 
 function isDeviceBundle(value: unknown): value is DeviceKeyBundle {
@@ -177,11 +199,15 @@ function isRemoteMessage(value: unknown): value is RemoteMessage {
     && (value.author === "me" || value.author === "them")
     && isNumber(value.createdAt)
     && isString(value.stackId, 256)
-    && isEnvelope(value.envelope);
+    && isEncryptedMessage(value.encryptedMessage);
 }
 
 function isReceipt(value: unknown, field: "readAt" | "deliveredAt"): boolean {
   return isRecord(value) && isString(value.messageId, 256) && isNumber(value[field]);
+}
+
+function isFolderList(value: unknown): value is ChatFolder[] {
+  return Array.isArray(value) && value.length <= MAX_FOLDERS && value.every(isChatFolder);
 }
 
 function isSyncResponse(value: unknown): value is SyncResponse {
@@ -199,7 +225,8 @@ function isSyncResponse(value: unknown): value is SyncResponse {
     && value.readReceipts.every((item) => isReceipt(item, "readAt"))
     && Array.isArray(value.deliveryReceipts)
     && value.deliveryReceipts.length <= MAX_SYNC_ITEMS
-    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"));
+    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"))
+    && (value.folders === undefined || isFolderList(value.folders));
 }
 
 export function isRealtimeEvent(value: unknown): value is RealtimeEvent {
@@ -210,6 +237,7 @@ export function isRealtimeEvent(value: unknown): value is RealtimeEvent {
   if (value.type === "readReceipt") return isNumber(value.cursor) && value.cursor >= 0 && isReceipt(value, "readAt");
   if (value.type === "deliveryReceipt") return isNumber(value.cursor) && value.cursor >= 0 && isReceipt(value, "deliveredAt");
   if (value.type === "presence") return isString(value.conversationId, 256) && typeof value.online === "boolean" && isNumber(value.lastSeenAt);
+  if (value.type === "folders") return isFolderList(value.folders);
   if (value.type === "pong") return true;
   return value.type === "error" && isString(value.code, 128);
 }
@@ -297,8 +325,16 @@ function headers(profile: Profile) {
 async function request(input: RequestInfo | URL, init?: RequestInit) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  const path = (() => { try { return new URL(requestUrl).pathname; } catch { return "request"; } })();
+  const method = init?.method ?? "GET";
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    logEvent("network", `${method} ${path}`, `HTTP ${response.status}`, response.ok ? "info" : "warn");
+    return response;
+  } catch (reason) {
+    logEvent("network", `${method} ${path}`, reason instanceof Error ? reason.message : "Network request failed", "error");
+    throw reason;
   } finally {
     clearTimeout(timeout);
   }
@@ -356,6 +392,16 @@ export async function fetchSessions(profile: Profile) {
   return readJson<AccountSession[]>(response, isAccountSessionList);
 }
 
+export async function refreshSessionMetadata(profile: Profile) {
+  const metadata = clientDeviceMetadata();
+  const response = await request(apiUrl(profile, "/api/v1/sessions/current"), {
+    method: "PATCH",
+    headers: headers(profile),
+    body: JSON.stringify(metadata),
+  });
+  await readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
 export async function deleteSession(profile: Profile, sessionId: string) {
   const response = await request(apiUrl(profile, `/api/v1/sessions/${resourceId(sessionId, "сессии")}`), {
     method: "DELETE",
@@ -373,8 +419,16 @@ export async function revokeOtherSessions(profile: Profile) {
 }
 
 export async function syncProfile(profile: Profile, since: number) {
+  logEvent("sync", "Sync request", `cursor ${Math.max(0, since)}`);
   const response = await request(`${apiUrl(profile, "/api/v1/sync")}?since=${Math.max(0, since)}`, { headers: headers(profile) });
-  return readJson<SyncResponse>(response, isSyncResponse);
+  const result = await readJson<SyncResponse>(response, isSyncResponse);
+  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}`, "success");
+  return result;
+}
+
+export async function updateAccountFolders(profile: Profile, folders: ChatFolder[]) {
+  const response = await request(apiUrl(profile, "/api/v1/account/folders"), { method: "PUT", headers: headers(profile), body: JSON.stringify(folders) });
+  return readJson<ChatFolder[]>(response, isFolderList);
 }
 
 export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
@@ -412,7 +466,7 @@ export async function registerPushToken(profile: Profile, token: string, deviceI
 }
 
 export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundle, accountKey?: { keyId: string; encryptionPublicKey: string }) {
-  const response = await request(apiUrl(profile, "/enter/v1/keys"), { method: "POST", headers: headers(profile), body: JSON.stringify({ ...bundle, accountKeyId: accountKey?.keyId, accountEncryptionPublicKey: accountKey?.encryptionPublicKey }) });
+  const response = await request(apiUrl(profile, "/enter/v1/keys"), { method: "POST", headers: headers(profile), body: JSON.stringify({ ...bundle, ...clientDeviceMetadata(), accountKeyId: accountKey?.keyId, accountEncryptionPublicKey: accountKey?.encryptionPublicKey }) });
   await readJson<{ accepted: boolean }>(response, isAcceptedResponse);
 }
 
@@ -456,15 +510,19 @@ export async function createConversation(profile: Profile, user: SearchUser) {
   return readJson<RemoteConversation>(response, isRemoteConversation);
 }
 
-export async function sendMessage(profile: Profile, conversationId: string, message: Message, envelopes: EncryptedEnvelope[]) {
-  const response = await request(apiUrl(profile, "/api/v1/messages"), { method: "POST", headers: headers(profile), body: JSON.stringify({ conversationId, clientMessageId: message.id, envelopes }) });
-  return readJson<{ nextCursor: number; message: RemoteMessage }>(response, (value): value is { nextCursor: number; message: RemoteMessage } => isRecord(value) && isNumber(value.nextCursor) && value.nextCursor >= 0 && isRemoteMessage(value.message));
+export async function sendMessage(profile: Profile, conversationId: string, message: Message, encryptedMessages: EncryptedMessage[]) {
+  logEvent("send", "Sending message", `recipients ${encryptedMessages.length}${message.attachments?.length ? `, attachments ${message.attachments.length}` : ""}`);
+  const response = await request(apiUrl(profile, "/api/v1/messages"), { method: "POST", headers: headers(profile), body: JSON.stringify({ conversationId, clientMessageId: message.id, encryptedMessages }) });
+  const result = await readJson<{ nextCursor: number; message: RemoteMessage }>(response, (value): value is { nextCursor: number; message: RemoteMessage } => isRecord(value) && isNumber(value.nextCursor) && value.nextCursor >= 0 && isRemoteMessage(value.message));
+  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}`, "success");
+  return result;
 }
 
 export function uploadMedia(profile: Profile, conversationId: string, mediaId: string, recipient: string, ciphertext: Uint8Array, onProgress?: (progress: number) => void) {
   if (ciphertext.byteLength === 0 || ciphertext.byteLength > MAX_MEDIA_CIPHERTEXT_BYTES) {
     return Promise.reject(new Error("Вложение превышает допустимый размер"));
   }
+  logEvent("media", "Attachment upload started", `size ${ciphertext.byteLength} bytes`);
   return new Promise<void>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", apiUrl(profile, "/api/v1/media"));
@@ -481,8 +539,8 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
       if (xhr.status >= 200 && xhr.status < 300) {
         let payload: unknown;
         try { payload = JSON.parse(xhr.responseText); } catch { payload = undefined; }
-        if (isAcceptedResponse(payload) && payload.accepted) resolve();
-        else reject(new Error("Enter API вернул некорректный ответ для вложения"));
+        if (isAcceptedResponse(payload) && payload.accepted) { logEvent("media", "Attachment uploaded", `size ${ciphertext.byteLength} bytes`, "success"); resolve(); }
+        else { logEvent("media", "Attachment upload failed", "Invalid server response", "error"); reject(new Error("Enter API вернул некорректный ответ для вложения")); }
       }
       else {
         let detail = "";
@@ -490,12 +548,14 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
           const payload = JSON.parse(xhr.responseText) as { error?: unknown };
           if (typeof payload.error === "string") detail = `: ${payload.error}`;
         } catch { /* Keep the HTTP status. */ }
-        reject(new Error(`Enter media request failed: ${xhr.status}${detail}`));
+        const error = new Error(`Enter media request failed: ${xhr.status}${detail}`);
+        logEvent("media", "Attachment upload failed", error.message, "error");
+        reject(error);
       }
     };
-    xhr.onerror = () => reject(new Error("Не удалось загрузить вложение"));
-    xhr.onabort = () => reject(new Error("Загрузка вложения отменена"));
-    xhr.ontimeout = () => reject(new Error("Загрузка вложения превысила тайм-аут"));
+    xhr.onerror = () => { logEvent("media", "Attachment upload failed", "Network error", "error"); reject(new Error("Не удалось загрузить вложение")); };
+    xhr.onabort = () => { logEvent("media", "Attachment upload canceled", undefined, "warn"); reject(new Error("Загрузка вложения отменена")); };
+    xhr.ontimeout = () => { logEvent("media", "Attachment upload timed out", undefined, "error"); reject(new Error("Загрузка вложения превысила тайм-аут")); };
     xhr.send(ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength) as ArrayBuffer);
   });
 }
@@ -521,5 +581,5 @@ export function mapRemoteConversation(remote: RemoteConversation): Conversation 
 }
 
 export function mapRemoteMessage(remote: RemoteMessage): Message {
-  return { id: remote.envelope.message_id, author: remote.author, text: "", time: formatMessageTime(new Date(remote.createdAt)), stackId: remote.stackId, envelope: remote.envelope };
+  return { id: remote.encryptedMessage.message_id, author: remote.author, text: "", time: formatMessageTime(new Date(remote.createdAt)), stackId: remote.stackId, encryptedMessage: remote.encryptedMessage };
 }

@@ -8,11 +8,13 @@ import { Skeleton } from "./ui/skeleton";
 import { ContextMenu } from "./ui/context-menu";
 import { cn, formatLastSeen } from "../lib/utils";
 import { Icon } from "./ui/icon";
+import { folderContains, type ChatFolder } from "../lib/folders";
 
 type ConversationListProps = {
   conversations: Conversation[];
   activeId: string | null;
   activeFolder?: string;
+  folders?: ChatFolder[];
   onSelect?: (id: string) => void;
   className?: string;
   isLoading?: boolean;
@@ -26,7 +28,7 @@ type ConversationListProps = {
   onToggleMuted?: (id: string) => void;
   onMarkUnread?: (id: string) => void;
   onArchive?: (id: string) => void;
-  onAddToFolder?: (id: string) => void;
+  onManageFolders?: (id: string) => void;
   onDelete?: (id: string) => void;
   onReorder?: (sourceId: string, targetId: string) => void;
 };
@@ -37,20 +39,20 @@ function previewText(value: string) {
 }
 
 // #preview ConversationList {"conversations":[{"id":"maria","name":"Мария","avatar":"maria","lastMessage":"Привет!","time":"12:48","online":true,"unread":2,"pinned":true}],"activeId":"maria"}
-export function ConversationList({ conversations, activeId, activeFolder = "all", onSelect = () => undefined, className, isLoading = false, isConnected = false, searchUser = null, searchBusy = false, searchError = "", onSearchUser = () => undefined, onOpenSearchUser = () => undefined, onTogglePinned = () => undefined, onToggleMuted = () => undefined, onMarkUnread = () => undefined, onArchive = () => undefined, onAddToFolder = () => undefined, onDelete = () => undefined, onReorder = () => undefined }: ConversationListProps) {
+export function ConversationList({ conversations, activeId, activeFolder = "all", folders = [], onSelect = () => undefined, className, isLoading = false, isConnected = false, searchUser = null, searchBusy = false, searchError = "", onSearchUser = () => undefined, onOpenSearchUser = () => undefined, onTogglePinned = () => undefined, onToggleMuted = () => undefined, onMarkUnread = () => undefined, onArchive = () => undefined, onManageFolders = () => undefined, onDelete = () => undefined, onReorder = () => undefined }: ConversationListProps) {
   const [query, setQuery] = useState("");
   const searchTimer = useRef<number | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   useEffect(() => () => { if (searchTimer.current !== null) window.clearTimeout(searchTimer.current); }, []);
   const visibleConversations = conversations
-    .filter((conversation) => !conversation.archived && !conversation.deleted && (activeFolder === "all" || conversation.folder === activeFolder) && `${conversation.name} ${conversation.handle ?? ""} ${conversation.lastMessage}`.toLowerCase().includes(query.toLowerCase()))
+    .filter((conversation) => !conversation.archived && !conversation.deleted && (activeFolder === "all" || folders.some((folder) => folder.id === activeFolder && folderContains(folder, conversation))) && `${conversation.name} ${conversation.handle ?? ""} ${conversation.lastMessage}`.toLowerCase().includes(query.toLowerCase()))
     .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)));
 
   return (
     <section className={cn("app-conversations-panel flex min-h-0 shrink-0 flex-col border-r border-border/70 bg-surface/35", className)}>
-      <div className="flex items-center justify-between px-4 pb-4 pt-5">
-        <h1 className="text-lg font-semibold tracking-tight">{isConnected ? "Сообщения" : "Подключение…"}</h1>
+      <div className="flex h-[4.375rem] items-center justify-between px-4">
+        <h1 className="font-heading text-[1.1875rem] font-semibold tracking-tight">{isConnected ? "Сообщения" : "Подключение…"}</h1>
       </div>
       <div className="mx-4 mb-3">
         <label className="relative block"><Icon name="search" className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={query} onChange={(event) => { const nextQuery = event.target.value; setQuery(nextQuery); if (searchTimer.current !== null) window.clearTimeout(searchTimer.current); searchTimer.current = window.setTimeout(() => void onSearchUser(nextQuery.trim()), 360); }} className="h-9 pl-9" placeholder="Поиск" aria-label="Поиск по диалогам" /></label>
@@ -71,7 +73,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
               { label: conversation.pinned ? "Открепить" : "Закрепить", icon: <Icon name="push_pin" className="size-4" />, onSelect: () => onTogglePinned(conversation.id) },
               { label: conversation.muted ? "Включить уведомления" : "Выключить уведомления", icon: conversation.muted ? <Icon name="notifications" className="size-4" /> : <Icon name="notifications_off" className="size-4" />, onSelect: () => onToggleMuted(conversation.id) },
               { label: "Пометить как непрочитанное", icon: <Icon name="chat_bubble" className="size-4" />, onSelect: () => onMarkUnread(conversation.id) },
-              { label: conversation.folder ? "Убрать из папки" : "Добавить в папку", icon: <Icon name="folder" className="size-4" />, onSelect: () => onAddToFolder(conversation.id) },
+              { label: "Настроить папки", icon: <Icon name="folder" className="size-4" />, onSelect: () => onManageFolders(conversation.id) },
               { label: "Удалить чат", icon: <Icon name="delete" className="size-4" />, destructive: true, onSelect: () => onDelete(conversation.id) },
             ]}
           >
@@ -113,7 +115,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
                   <span className="truncate text-sm font-semibold">{conversation.name}</span>
                   {conversation.pinned && <Icon name="push_pin" className="size-3 text-muted-foreground" />}
                   {conversation.muted && <Icon name="notifications_off" className="size-3 text-muted-foreground" />}
-                  {conversation.folder && <Icon name="folder" className="size-3 text-muted-foreground" aria-label={`Папка: ${conversation.folder}`} />}
+                  {folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" className="size-3 text-muted-foreground" aria-label="Есть папка" /> : null}
                 </span>
                 <span className="mt-0.5 flex min-w-0 items-center gap-2">
                   <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{previewText(conversation.lastMessage)}</span>

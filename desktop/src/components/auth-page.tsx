@@ -2,9 +2,13 @@ import { useState, type FormEvent } from "react";
 import type { Profile } from "../types";
 import { normalizeServerAddress } from "../lib/server-address";
 import { ENTER_PROTOCOL_VERSION } from "../lib/enter-protocol";
+import { clientDeviceMetadata } from "../lib/enter-api";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Icon } from "./ui/icon";
+import { LogsPanel } from "./logs-panel";
+import { logEvent } from "../lib/logs";
+import { friendlyError } from "../lib/client-errors";
 
 type AuthPageProps = {
   onAuthenticated: (profile: Profile, password: string) => void | Promise<void>;
@@ -34,6 +38,7 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [showLogs, setShowLogs] = useState(false);
 
   async function checkServer(event: FormEvent) {
     event.preventDefault();
@@ -55,9 +60,11 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
       setServerUrl(url);
       setServerName(health.serverName || "Enter");
       setServerLogo(health.logo);
+      logEvent("auth", "Server is available", url, "success");
       setStepDirection("forward");
       setStep("auth");
     } catch (reason) {
+      logEvent("auth", "Server check failed", reason instanceof Error ? reason.message : "Server unavailable", "error");
       setError(reason instanceof Error && reason.message === "unsupported_protocol"
         ? `Сервер использует другую версию Enter API (нужна ${ENTER_PROTOCOL_VERSION})`
         : reason instanceof Error && reason.name === "AbortError"
@@ -77,10 +84,15 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
       const response = await fetch(`${serverUrl}/auth/${mode}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: mode === "register" ? name : undefined, handle, password }),
+        body: JSON.stringify({ name: mode === "register" ? name : undefined, handle, password, ...clientDeviceMetadata() }),
       });
-      const data = await response.json() as AuthResponse | { error?: string };
-      if (!response.ok || !("token" in data)) throw new Error("Не удалось войти");
+      const data = await response.json().catch(() => null) as AuthResponse | { error?: string } | null;
+      if (!response.ok) {
+        const serverError = data && typeof data === "object" && "error" in data && typeof data.error === "string" ? data.error : "auth_failed";
+        throw new Error(serverError);
+      }
+      if (!data || typeof data !== "object" || !("token" in data)) throw new Error("auth_failed");
+      logEvent("auth", mode === "login" ? "Signed in" : "Account registered", serverUrl, "success");
       await onAuthenticated({
         id: data.profile.id,
         serverId: data.profile.serverId,
@@ -93,7 +105,8 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
         serverLogo,
       }, password);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Не удалось выполнить запрос");
+      logEvent("auth", mode === "login" ? "Sign-in failed" : "Registration failed", reason instanceof Error ? reason.message : "Authorization request failed", "error");
+      setError(friendlyError(reason, mode === "login" ? "Не удалось войти. Проверьте данные и попробуйте снова." : "Не удалось зарегистрироваться. Проверьте данные и попробуйте снова."));
     } finally {
       setBusy(false);
     }
@@ -109,8 +122,10 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
     setError("");
   }
 
+  if (showLogs) return <main className="auth-page relative flex min-h-[100dvh] w-full min-w-0 items-center justify-center overflow-y-auto bg-background px-6 py-10 text-foreground"><div className="h-[min(80dvh,52rem)] w-full max-w-[56rem]"><LogsPanel onClose={() => setShowLogs(false)} /></div></main>;
+
   return (
-    <main className="auth-page relative flex min-h-[100dvh] w-full min-w-0 items-center justify-center overflow-y-auto bg-background px-6 py-10 text-foreground">
+    <main className="auth-page relative flex min-h-[100dvh] w-full min-w-0 items-center justify-center overflow-y-auto bg-background px-6 py-10 pb-16 text-foreground">
       {(onCancel || step === "auth") && <Button type="button" variant="ghost" size="sm" className="absolute left-6 top-6" onClick={goBack}><Icon name="arrow_back" className="size-4" />Назад</Button>}
       <div className="w-full max-w-[26.25rem]">
         <div className="mb-10 flex justify-center"><img src="/enter_logo.png" alt="Enter" className="h-8 w-32 object-contain brightness-0 invert" /></div>
@@ -136,6 +151,7 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
           )}
         </div>
       </div>
+      <button type="button" className="auth-logs-link" onClick={() => setShowLogs(true)}><Icon name="logs" className="size-3.5" />Логи диагностики</button>
     </main>
   );
 }

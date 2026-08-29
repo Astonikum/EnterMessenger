@@ -3,12 +3,15 @@ import { ChatHeader } from "../components/chat-header";
 import { ChatLoadingState } from "../components/chat-loading-state";
 import { ChatEmptyState } from "../components/chat-empty-state";
 import { ChatReadOnlyState } from "../components/chat-read-only-state";
-import { AppRail } from "../components/app-rail";
+import { AppRail, type AppPanel } from "../components/app-rail";
 import { ConversationList } from "../components/conversation-list";
 import { ForwardMessageDialog } from "../components/forward-message-dialog";
 import { MessageComposer, type PendingMedia } from "../components/message-composer";
 import { MessageList } from "../components/message-list";
 import { ProfilePanel } from "../components/profile-panel";
+import { FolderPickerDialog } from "../components/folder-dialog";
+import type { ChatFolder } from "../lib/folders";
+import { LogsPanel } from "../components/logs-panel";
 import type { SearchUser } from "../lib/enter-api";
 import type { Conversation, Message, Profile } from "../types";
 
@@ -43,7 +46,7 @@ function initialConversationsWidth() {
 type MessengerViewProps = {
   profiles?: Profile[];
   activeProfile?: Profile;
-  folders?: string[];
+  folders?: ChatFolder[];
   activeFolder?: string;
   conversations?: Conversation[];
   conversationsLoading?: boolean;
@@ -56,9 +59,9 @@ type MessengerViewProps = {
   replyTo?: Message | null;
   editingMessage?: Message | null;
   messagesLoading?: boolean;
-  showProfile?: boolean;
-  showSettings?: boolean;
+  activePanel?: AppPanel;
   settingsPanel?: ReactNode;
+  logsPanel?: ReactNode;
   messageError?: string;
   searchUser?: SearchUser | null;
   searchBusy?: boolean;
@@ -72,13 +75,16 @@ type MessengerViewProps = {
   onToggleMuted?: (id: string) => void;
   onMarkUnread?: (id: string) => void;
   onArchive?: (id: string) => void;
-  onAddToFolder?: (id: string) => void;
+  onManageFolders?: (id: string) => void;
+  folderPickerConversation?: Conversation;
+  onCloseFolderPicker?: () => void;
+  onToggleConversationFolder?: (conversationId: string, folderId: string, included: boolean) => void;
+  onCreateFolder?: () => void;
+  onEditFolder?: (folder: ChatFolder) => void;
+  onDeleteFolder?: (folder: ChatFolder) => void;
   onDelete?: (id: string) => void;
   onReorder?: (sourceId: string, targetId: string) => void;
-  onBack?: () => void;
-  onToggleProfile?: () => void;
-  onOpenSettings?: () => void;
-  onCloseProfile?: () => void;
+  onSelectPanel?: (panel: AppPanel) => void;
   onSearchUser?: (query: string) => void | Promise<void>;
   onOpenSearchUser?: (user: SearchUser) => void | Promise<void>;
   onSendMessage?: (message: Message, pendingMedia?: PendingMedia[]) => void;
@@ -112,9 +118,9 @@ export function MessengerView({
   replyTo = null,
   editingMessage = null,
   messagesLoading = false,
-  showProfile = false,
-  showSettings = false,
+  activePanel = "chats",
   settingsPanel,
+  logsPanel,
   messageError = "",
   mediaUploadProgress = null,
   searchUser = null,
@@ -129,13 +135,16 @@ export function MessengerView({
   onToggleMuted = () => undefined,
   onMarkUnread = () => undefined,
   onArchive = () => undefined,
-  onAddToFolder = () => undefined,
+  onManageFolders = () => undefined,
+  folderPickerConversation,
+  onCloseFolderPicker = () => undefined,
+  onToggleConversationFolder = () => undefined,
+  onCreateFolder = () => undefined,
+  onEditFolder = () => undefined,
+  onDeleteFolder = () => undefined,
   onDelete = () => undefined,
   onReorder = () => undefined,
-  onBack = () => undefined,
-  onToggleProfile = () => undefined,
-  onOpenSettings = () => undefined,
-  onCloseProfile = () => undefined,
+  onSelectPanel = () => undefined,
   onSearchUser = () => undefined,
   onOpenSearchUser = () => undefined,
   onSendMessage = () => undefined,
@@ -220,20 +229,20 @@ export function MessengerView({
   }
 
   return (
-    <main className="app-shell bg-background text-foreground" data-resizing={isResizing} data-settings={showSettings ? "true" : "false"} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
-      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} showProfile={showProfile} showSettings={showSettings} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onBack={onBack} onSelectFolder={onSelectFolder} onToggleProfile={onToggleProfile} onOpenSettings={onOpenSettings} />
+    <main className="app-shell bg-background text-foreground" data-resizing={isResizing} data-panel={activePanel} style={{ "--list-width": `${conversationsWidth * layoutScale}px` } as CSSProperties}>
+      <AppRail profiles={profiles} activeProfile={activeProfile} folders={folders} activeFolder={activeFolder} activePanel={activePanel} onSelectProfile={onSelectProfile} onRemoveProfile={onRemoveProfile} onAddProfile={onAddProfile} onSelectFolder={onSelectFolder} onCreateFolder={onCreateFolder} onEditFolder={onEditFolder} onDeleteFolder={onDeleteFolder} onSelectPanel={onSelectPanel} />
       <div className="app-conversations-shell">
-        <ConversationList className="app-conversations" conversations={conversations} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onAddToFolder={onAddToFolder} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
+        <ConversationList className="app-conversations" conversations={conversations} folders={folders} activeFolder={activeFolder} isLoading={conversationsLoading} isConnected={syncConnected} activeId={activeConversationId} onSelect={onSelectConversation} onTogglePinned={onTogglePinned} onToggleMuted={onToggleMuted} onMarkUnread={onMarkUnread} onArchive={onArchive} onManageFolders={onManageFolders} onDelete={onDelete} onReorder={onReorder} searchUser={searchUser} searchBusy={searchBusy} searchError={searchError} onSearchUser={onSearchUser} onOpenSearchUser={onOpenSearchUser} />
         <div className="app-conversations-resizer" role="separator" aria-label="Изменить ширину списка чатов" aria-orientation="vertical" aria-valuemin={MIN_CONVERSATIONS_WIDTH} aria-valuemax={maxConversationsWidth()} aria-valuenow={conversationsWidth} tabIndex={0} onPointerDown={beginConversationsResize} onKeyDown={handleConversationsResizeKeyDown} title="Изменить ширину списка чатов" />
       </div>
-      <section className={`app-chat chat-tab flex min-w-0 flex-col overflow-hidden${showSettings ? " chat-tab-settings" : ""}`}>
-        {showSettings && settingsPanel ? settingsPanel : <>
+      <section className="app-chat chat-tab flex min-w-0 flex-col overflow-hidden">
+        {activePanel === "settings" && settingsPanel ? settingsPanel : activePanel === "logs" ? logsPanel ?? <LogsPanel onClose={() => onSelectPanel("chats")} /> : activePanel === "profile" ? <ProfilePanel profile={activeProfile} onClose={() => onSelectPanel("chats")} onAddProfile={onAddProfile} /> : <>
           <ChatHeader conversation={activeConversation} searchOpen={searchOpen} searchQuery={searchQuery} searchResultsCount={visibleMessages.length} onSearchOpen={() => setSearchOpen(true)} onSearchClose={() => { setSearchOpen(false); setSearchQuery(""); }} onSearchQueryChange={setSearchQuery} />
           {activeConversation ? messagesLoading ? <ChatLoadingState /> : <><MessageList key={activeConversationId} messages={visibleMessages} profile={activeProfile} searching={Boolean(searchQuery.trim())} readOnly={activeConversation.canWrite === false} onReply={onReply} onEdit={onStartEditMessage} onTogglePinned={onToggleMessagePinned} onSave={onSaveMessage} onDelete={onDeleteMessage} onReact={onReactToMessage} onForward={onForwardMessage} />{activeConversation.canWrite !== false ? <MessageComposer error={messageError} uploadProgress={mediaUploadProgress} onSend={onSendMessage} replyTo={replyTo} editingMessage={editingMessage} onEdit={onEditMessage} onCancelContext={onCancelMessageContext} /> : <ChatReadOnlyState />}</> : <ChatEmptyState />}
         </>}
       </section>
-      {showProfile && <ProfilePanel profile={activeProfile} onClose={onCloseProfile} onAddProfile={onAddProfile} />}
-      {!showSettings && messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
+      {folderPickerConversation && <FolderPickerDialog open conversation={folderPickerConversation} folders={folders} onClose={onCloseFolderPicker} onToggle={(folderId, included) => onToggleConversationFolder(folderPickerConversation.id, folderId, included)} />}
+      {activePanel === "chats" && messageToForward && <ForwardMessageDialog message={messageToForward} conversations={conversations} currentConversationId={activeConversationId} onClose={onCloseForward} onForward={(conversationId) => onSendForwardedMessage(messageToForward, conversationId)} />}
     </main>
   );
 }

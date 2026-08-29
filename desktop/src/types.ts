@@ -11,6 +11,16 @@ export type Profile = {
   deviceId?: string;
 };
 
+export type FolderTemplate = "custom" | "personal" | "all";
+export type FolderIcon = "folder" | "chat" | "person" | "star" | "bookmark";
+export type ChatFolder = {
+  id: string;
+  name: string;
+  template: FolderTemplate;
+  icon: FolderIcon;
+  chatIds: string[];
+};
+
 export type Conversation = {
   id: string;
   serverId?: string;
@@ -28,7 +38,6 @@ export type Conversation = {
   muted?: boolean;
   archived?: boolean;
   deleted?: boolean;
-  folder?: string;
 };
 
 export type MessageAttachment = {
@@ -60,7 +69,7 @@ export type Message = {
   readAt?: number;
   deliveredAt?: number;
   deliveryStatus?: "pending" | "failed";
-  envelope?: import("./lib/enter-protocol").EncryptedEnvelope;
+  encryptedMessage?: import("./lib/enter-protocol").EncryptedMessage;
 };
 
 export type OutboxEntry = {

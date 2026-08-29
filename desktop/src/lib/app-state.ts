@@ -4,6 +4,7 @@ export type TabState = {
   activeProfileId?: string | null;
   activeConversationByProfile?: Record<string, string | null>;
   activeFolderByProfile?: Record<string, string>;
+  panel?: "chats" | "profile" | "settings" | "logs";
   showProfile?: boolean;
 };
 

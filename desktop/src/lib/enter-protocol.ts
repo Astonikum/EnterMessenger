@@ -6,7 +6,7 @@ export type EnterAddress = {
   server: string;
 };
 
-export type EncryptedEnvelope = {
+export type EncryptedMessage = {
   protocol: typeof ENTER_PROTOCOL_VERSION;
   message_id: string;
   conversation_id: string;

@@ -23,6 +23,13 @@ export async function encryptMedia(source: MobileMediaSource): Promise<Encrypted
   const response = await fetch(source.uri);
   if (!response.ok) throw new Error("Не удалось прочитать вложение");
   const plaintext = new Uint8Array(await response.arrayBuffer());
+  return encryptMediaBytes(plaintext, source);
+}
+
+export async function encryptMediaBytes(
+  plaintext: Uint8Array,
+  metadata: Pick<MobileMediaSource, "name" | "mimeType"> & Partial<Pick<MessageAttachment, "kind" | "width" | "height" | "durationMs">>,
+): Promise<EncryptedMedia> {
   if (plaintext.byteLength > MAX_MEDIA_BYTES) throw new Error("Файл слишком большой. Максимум — 200 МБ.");
   const key = await getRandomBytesAsync(32);
   const nonce = await getRandomBytesAsync(12);
@@ -30,13 +37,16 @@ export async function encryptMedia(source: MobileMediaSource): Promise<Encrypted
   return {
     attachment: {
       id: `${Date.now().toString(36)}-${Array.from(await getRandomBytesAsync(8), (value) => value.toString(16).padStart(2, "0")).join("")}`,
-      kind: kindForMime(source.mimeType || "application/octet-stream"),
-      name: source.name || "Вложение",
-      mimeType: source.mimeType || "application/octet-stream",
+      kind: metadata.kind ?? kindForMime(metadata.mimeType || "application/octet-stream"),
+      name: metadata.name || "Вложение",
+      mimeType: metadata.mimeType || "application/octet-stream",
       size: plaintext.byteLength,
       sha256: fromByteArray(sha256(plaintext)),
       key: fromByteArray(key),
       nonce: fromByteArray(nonce),
+      width: metadata.width,
+      height: metadata.height,
+      durationMs: metadata.durationMs,
     },
     ciphertext,
   };

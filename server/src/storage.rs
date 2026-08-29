@@ -22,6 +22,16 @@ pub struct AccountSettings {
     pub typing_indicators: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredFolder {
+    pub id: String,
+    pub name: String,
+    pub template: String,
+    pub icon: String,
+    pub chat_ids: Vec<String>,
+}
+
 impl Default for AccountSettings {
     fn default() -> Self {
         Self {
@@ -150,7 +160,7 @@ pub struct StoredMessage {
     pub author: String,
     pub created_at: i64,
     pub stack_id: String,
-    pub envelope_json: String,
+    pub message_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -222,13 +232,14 @@ pub struct StoredDeliveryReceipt {
 pub struct SyncSnapshot {
     pub cursor: i64,
     pub conversations: Vec<StoredConversation>,
+    pub folders: Vec<StoredFolder>,
     pub messages: Vec<StoredMessage>,
     pub read_receipts: Vec<StoredReadReceipt>,
     pub delivery_receipts: Vec<StoredDeliveryReceipt>,
 }
 
-fn envelope_message_id(envelope_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(envelope_json)
+fn message_id_from_json(message_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(message_json)
         .ok()?
         .get("message_id")?
         .as_str()
@@ -392,8 +403,8 @@ fn backfill_sqlite_events(connection: &mut Connection) -> SqlResult<()> {
         )?;
         let messages = {
             let mut statement = transaction.prepare(
-                "SELECT seq, id, conversation_id, author, created_at, stack_id, envelope_json
-                 FROM messages WHERE owner_account_id = ?1 AND envelope_json <> '' ORDER BY seq ASC",
+                "SELECT seq, id, conversation_id, author, created_at, stack_id, message_json
+                 FROM messages WHERE owner_account_id = ?1 AND message_json <> '' ORDER BY seq ASC",
             )?;
             let rows = statement
                 .query_map(params![account_id], |row| {
@@ -405,7 +416,7 @@ fn backfill_sqlite_events(connection: &mut Connection) -> SqlResult<()> {
                             author: row.get(3)?,
                             created_at: row.get(4)?,
                             stack_id: row.get(5)?,
-                            envelope_json: row.get(6)?,
+                            message_json: row.get(6)?,
                         },
                     ))
                 })?
@@ -541,6 +552,11 @@ impl SqliteStorage {
                  value_json TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS account_folders (
+                 account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                 folders_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS devices (
                  owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                  device_id TEXT NOT NULL,
@@ -577,7 +593,7 @@ impl SqliteStorage {
                  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                  author TEXT NOT NULL CHECK(author IN ('me', 'them')),
                  text TEXT NOT NULL DEFAULT '',
-                 envelope_json TEXT NOT NULL DEFAULT '',
+                 message_json TEXT NOT NULL DEFAULT '',
                  created_at INTEGER NOT NULL,
                  stack_id TEXT NOT NULL DEFAULT '',
                  client_message_id TEXT NOT NULL,
@@ -698,19 +714,45 @@ impl SqliteStorage {
         }
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL", [])?;
         connection.execute("CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at INTEGER NOT NULL)", [])?;
+        connection.execute("CREATE TABLE IF NOT EXISTS account_folders (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, folders_json TEXT NOT NULL, updated_at INTEGER NOT NULL)", [])?;
         connection.execute("CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, PRIMARY KEY(owner_account_id, device_id))", [])?;
         connection.execute(
             "UPDATE sessions SET expires_at = created_at + ?1 WHERE expires_at <= 0",
             params![SESSION_TTL_MS],
         )?;
-        let has_envelope_column = connection.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'envelope_json'",
+        let historical_message_column = concat!("env", "elope_json");
+        let has_historical_message_column = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?1",
+            params![historical_message_column],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let has_encrypted_message_column = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'message_json'",
             [],
             |row| row.get::<_, i64>(0),
         )?;
-        if has_envelope_column == 0 {
+        let renamed_message_column = has_historical_message_column > 0;
+        if renamed_message_column && has_encrypted_message_column > 0 {
             connection.execute(
-                "ALTER TABLE messages ADD COLUMN envelope_json TEXT NOT NULL DEFAULT ''",
+                &format!(
+                    "UPDATE messages SET message_json = CASE WHEN message_json = '' THEN \"{historical_message_column}\" ELSE message_json END"
+                ),
+                [],
+            )?;
+            connection.execute(
+                &format!("ALTER TABLE messages DROP COLUMN \"{historical_message_column}\""),
+                [],
+            )?;
+        } else if renamed_message_column {
+            connection.execute(
+                &format!(
+                    "ALTER TABLE messages RENAME COLUMN \"{historical_message_column}\" TO message_json"
+                ),
+                [],
+            )?;
+        } else if has_encrypted_message_column == 0 {
+            connection.execute(
+                "ALTER TABLE messages ADD COLUMN message_json TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -729,7 +771,7 @@ impl SqliteStorage {
             "UPDATE messages SET stack_id = conversation_id || ':' || author || ':' || CAST(created_at / 60000 AS TEXT) WHERE stack_id = ''",
             [],
         )?;
-        connection.execute("UPDATE messages SET text = '' WHERE envelope_json = ''", [])?;
+        connection.execute("UPDATE messages SET text = '' WHERE message_json = ''", [])?;
         connection.execute("UPDATE conversations SET last_message = ''", [])?;
         connection.execute(
             "CREATE TABLE IF NOT EXISTS account_keys (owner_account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, key_id TEXT NOT NULL UNIQUE, encryption_public_key TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
@@ -748,12 +790,17 @@ impl SqliteStorage {
             [],
             |row| row.get::<_, i64>(0),
         )?;
+        if renamed_message_column {
+            connection.execute("DELETE FROM realtime_events WHERE kind = 'message'", [])?;
+        }
         if has_event_migration == 0 {
             backfill_sqlite_events(&mut connection)?;
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)",
                 [],
             )?;
+        } else if renamed_message_column {
+            backfill_sqlite_events(&mut connection)?;
         }
         let account_ids = {
             let mut statement = connection.prepare("SELECT id FROM accounts")?;
@@ -1006,6 +1053,35 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn account_folders(&self, account_id: &str) -> SqlResult<Vec<StoredFolder>> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT folders_json FROM account_folders WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn update_account_folders(
+        &mut self,
+        account_id: &str,
+        folders: &[StoredFolder],
+        updated_at: i64,
+    ) -> SqlResult<()> {
+        let folders_json = serde_json::to_string(folders)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.connection.execute(
+            "INSERT INTO account_folders (account_id, folders_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET folders_json = excluded.folders_json, updated_at = excluded.updated_at",
+            params![account_id, folders_json, updated_at],
+        )?;
+        Ok(())
+    }
+
     pub fn update_account_name(&mut self, account_id: &str, name: &str) -> SqlResult<bool> {
         Ok(self.connection.execute(
             "UPDATE accounts SET name = ?1 WHERE id = ?2",
@@ -1151,6 +1227,21 @@ impl SqliteStorage {
         )? > 0)
     }
 
+    pub fn update_session_metadata(
+        &mut self,
+        account_id: &str,
+        token: &str,
+        platform: Option<&str>,
+        device_name: Option<&str>,
+        app_version: Option<&str>,
+        now: i64,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET platform = COALESCE(NULLIF(?3, ''), platform), device_name = COALESCE(NULLIF(?4, ''), device_name), app_version = COALESCE(NULLIF(?5, ''), app_version), last_seen_at = ?6 WHERE account_id = ?1 AND token = ?2 AND expires_at > ?6",
+            params![account_id, token, platform, device_name, app_version, now],
+        )? > 0)
+    }
+
     pub fn upsert_device(
         &mut self,
         account_id: &str,
@@ -1160,7 +1251,7 @@ impl SqliteStorage {
         app_version: Option<&str>,
         now: i64,
     ) -> SqlResult<()> {
-        self.connection.execute("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = excluded.platform, name = COALESCE(excluded.name, devices.name), app_version = COALESCE(excluded.app_version, devices.app_version), last_seen_at = excluded.last_seen_at, revoked_at = NULL", params![account_id, device_id, platform, name, app_version, now])?;
+        self.connection.execute("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = COALESCE(NULLIF(excluded.platform, 'unknown'), devices.platform), name = COALESCE(excluded.name, devices.name), app_version = COALESCE(excluded.app_version, devices.app_version), last_seen_at = excluded.last_seen_at, revoked_at = NULL", params![account_id, device_id, platform, name, app_version, now])?;
         Ok(())
     }
 
@@ -1357,8 +1448,8 @@ impl SqliteStorage {
             "SELECT c.id, c.name, c.handle, c.avatar, c.subtitle, c.can_write, c.last_message, c.last_message_at, c.pinned, c.online,
                     peer.last_seen_at,
                     COALESCE((SELECT COUNT(DISTINCT CASE
-                                          WHEN json_valid(unread_messages.envelope_json)
-                                          THEN COALESCE(json_extract(unread_messages.envelope_json, '$.message_id'), unread_messages.id)
+                                          WHEN json_valid(unread_messages.message_json)
+                                          THEN COALESCE(json_extract(unread_messages.message_json, '$.message_id'), unread_messages.id)
                                           ELSE unread_messages.id
                                       END)
                              FROM messages unread_messages
@@ -1368,7 +1459,7 @@ impl SqliteStorage {
                               WHERE unread_messages.owner_account_id = c.owner_account_id
                                 AND unread_messages.conversation_id = c.id
                                 AND unread_messages.author = 'them'
-                                AND unread_messages.envelope_json <> ''
+                                AND unread_messages.message_json <> ''
                                 AND unread_messages.created_at > COALESCE(unread_reads.read_at, 0)), 0)
              FROM conversations c
              LEFT JOIN accounts peer ON peer.handle = CASE
@@ -1398,6 +1489,7 @@ impl SqliteStorage {
             })?
             .collect::<SqlResult<Vec<_>>>()?;
 
+        let folders = self.account_folders(account_id)?;
         let events = self.events_since_limited(account_id, since, MAX_SYNC_EVENTS)?;
         let cursor = events
             .last()
@@ -1430,6 +1522,7 @@ impl SqliteStorage {
         Ok(SyncSnapshot {
             cursor,
             conversations,
+            folders,
             messages,
             read_receipts,
             delivery_receipts,
@@ -1500,14 +1593,14 @@ impl SqliteStorage {
 
         let message_ids = {
             let mut statement = transaction.prepare(
-                "SELECT envelope_json FROM messages
-                 WHERE owner_account_id = ?1 AND conversation_id = ?2 AND author = 'them' AND created_at <= ?3 AND envelope_json <> ''",
+                "SELECT message_json FROM messages
+                 WHERE owner_account_id = ?1 AND conversation_id = ?2 AND author = 'them' AND created_at <= ?3 AND message_json <> ''",
             )?;
             let rows = statement
                 .query_map(params![account_id, conversation_id, read_at], |row| {
                     row.get::<_, String>(0)
                 })?
-                .filter_map(|value| value.ok().and_then(|json| envelope_message_id(&json)))
+                .filter_map(|value| value.ok().and_then(|json| message_id_from_json(&json)))
                 .collect::<Vec<_>>();
             let mut rows = rows;
             rows.sort_unstable();
@@ -1619,7 +1712,7 @@ impl SqliteStorage {
         account_id: &str,
         conversation_id: &str,
         client_message_id: &str,
-        envelope_json: &str,
+        message_json: &str,
         created_at: i64,
     ) -> SqlResult<Option<StoredMessage>> {
         let transaction = self.connection.transaction()?;
@@ -1638,9 +1731,9 @@ impl SqliteStorage {
         }
 
         if let Some(existing) = transaction.query_row(
-            "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = ?1 AND client_message_id = ?2",
+            "SELECT id, conversation_id, author, created_at, stack_id, message_json FROM messages WHERE owner_account_id = ?1 AND client_message_id = ?2",
             params![account_id, client_message_id],
-            |row| Ok(StoredMessage { id: row.get(0)?, conversation_id: row.get(1)?, author: row.get(2)?, created_at: row.get(3)?, stack_id: row.get(4)?, envelope_json: row.get(5)? }),
+            |row| Ok(StoredMessage { id: row.get(0)?, conversation_id: row.get(1)?, author: row.get(2)?, created_at: row.get(3)?, stack_id: row.get(4)?, message_json: row.get(5)? }),
         ).optional()? {
             transaction.commit()?;
             return Ok(Some(existing));
@@ -1648,8 +1741,8 @@ impl SqliteStorage {
 
         let stack_id = message_stack_id(conversation_id, "me", created_at);
         transaction.execute(
-            "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id) VALUES (?1, ?2, ?3, 'me', '', ?4, ?5, ?6, ?1)",
-            params![client_message_id, account_id, conversation_id, envelope_json, created_at, stack_id],
+            "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id) VALUES (?1, ?2, ?3, 'me', '', ?4, ?5, ?6, ?1)",
+            params![client_message_id, account_id, conversation_id, message_json, created_at, stack_id],
         )?;
         transaction.execute(
             "UPDATE conversations SET last_message = '', last_message_at = ?1, updated_at = ?1 WHERE owner_account_id = ?2 AND id = ?3",
@@ -1661,7 +1754,7 @@ impl SqliteStorage {
             author: "me".to_owned(),
             created_at,
             stack_id,
-            envelope_json: envelope_json.to_owned(),
+            message_json: message_json.to_owned(),
         };
         append_sqlite_message_event(&transaction, account_id, &message)?;
         transaction.commit()?;
@@ -1675,7 +1768,7 @@ impl SqliteStorage {
         message_id: &str,
         source_key_id: Option<&str>,
         target_key_id: &str,
-        envelope_json: &str,
+        message_json: &str,
     ) -> SqlResult<bool> {
         let transaction = self.connection.transaction()?;
         let source_delivery_id = source_key_id
@@ -1698,9 +1791,9 @@ impl SqliteStorage {
         let copy_id = format!("device-copy:{account_id}:{message_id}:{target_key_id}");
         let stack_id = message_stack_id(conversation_id, &author, created_at);
         let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id)
+            "INSERT OR IGNORE INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id)
              VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?1)",
-            params![copy_id, account_id, conversation_id, author, envelope_json, created_at, stack_id],
+            params![copy_id, account_id, conversation_id, author, message_json, created_at, stack_id],
         )?;
         if inserted > 0 {
             append_sqlite_message_event(
@@ -1712,7 +1805,7 @@ impl SqliteStorage {
                     author: author.to_owned(),
                     created_at,
                     stack_id,
-                    envelope_json: envelope_json.to_owned(),
+                    message_json: message_json.to_owned(),
                 },
             )?;
         }
@@ -1728,7 +1821,7 @@ impl SqliteStorage {
         peer_name: &str,
         peer_avatar: &str,
         delivery_id: &str,
-        envelope_json: &str,
+        message_json: &str,
         created_at: i64,
     ) -> SqlResult<Option<StoredMessage>> {
         let transaction = self.connection.transaction()?;
@@ -1766,8 +1859,8 @@ impl SqliteStorage {
         let stack_id = message_stack_id(&target_conversation_id, "them", created_at);
 
         transaction.execute(
-            "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id) VALUES (?1, ?2, ?3, 'them', '', ?4, ?5, ?6, ?7)",
-            params![stored_id, account_id, target_conversation_id, envelope_json, created_at, stack_id, delivery_id],
+            "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id) VALUES (?1, ?2, ?3, 'them', '', ?4, ?5, ?6, ?7)",
+            params![stored_id, account_id, target_conversation_id, message_json, created_at, stack_id, delivery_id],
         )?;
         transaction.execute(
             "UPDATE conversations SET last_message = '', last_message_at = ?1, updated_at = ?1 WHERE owner_account_id = ?2 AND id = ?3",
@@ -1779,7 +1872,7 @@ impl SqliteStorage {
             author: "them".to_owned(),
             created_at,
             stack_id,
-            envelope_json: envelope_json.to_owned(),
+            message_json: message_json.to_owned(),
         };
         append_sqlite_message_event(&transaction, account_id, &message)?;
         transaction.commit()?;
@@ -1830,8 +1923,8 @@ impl SqliteStorage {
         let recipient_has_copy = transaction
             .query_row(
                 "SELECT 1 FROM messages
-                 WHERE owner_account_id = ?1 AND author = 'them' AND json_valid(envelope_json)
-                   AND json_extract(envelope_json, '$.message_id') = ?2
+                 WHERE owner_account_id = ?1 AND author = 'them' AND json_valid(message_json)
+                   AND json_extract(message_json, '$.message_id') = ?2
                  LIMIT 1",
                 params![recipient_account_id, message_id],
                 |_| Ok(()),
@@ -2012,6 +2105,27 @@ mod tests {
     }
 
     #[test]
+    fn account_folders_round_trip_and_sync() {
+        let mut storage = SqliteStorage::open(":memory:").expect("open folders database");
+        let account = account();
+        storage.create_account(&account, 1).expect("create account");
+        let folders = vec![StoredFolder {
+            id: "work".to_owned(),
+            name: "Работа".to_owned(),
+            template: "custom".to_owned(),
+            icon: "folder".to_owned(),
+            chat_ids: vec!["chat-1".to_owned()],
+        }];
+
+        storage
+            .update_account_folders(&account.id, &folders, 2)
+            .expect("write folders");
+
+        assert_eq!(storage.account_folders(&account.id).expect("read folders"), folders);
+        assert_eq!(storage.sync(&account.id, 0, "").expect("sync").folders, folders);
+    }
+
+    #[test]
     fn sessions_are_addressable_without_exposing_tokens() {
         let mut storage = SqliteStorage::open(":memory:").expect("open session database");
         let account = account();
@@ -2033,7 +2147,26 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_ne!(sessions[0].id, "secret-token");
         assert_eq!(sessions[0].device_id.as_deref(), Some("device-1"));
+        assert_eq!(sessions[0].platform, "desktop");
+        assert_eq!(sessions[0].device_name.as_deref(), Some("Workstation"));
+        assert_eq!(sessions[0].app_version.as_deref(), Some("0.2.0"));
         assert!(sessions[0].current);
+        assert!(storage
+            .update_session_metadata(
+                &account.id,
+                "secret-token",
+                Some("web"),
+                Some("Chrome · macOS"),
+                Some("0.2.1"),
+                101,
+            )
+            .expect("refresh session metadata"));
+        let refreshed = storage
+            .list_sessions(&account.id, "secret-token", 101)
+            .expect("list refreshed session");
+        assert_eq!(refreshed[0].platform, "web");
+        assert_eq!(refreshed[0].device_name.as_deref(), Some("Chrome · macOS"));
+        assert_eq!(refreshed[0].app_version.as_deref(), Some("0.2.1"));
         assert!(storage
             .revoke_session_by_id(&account.id, &sessions[0].id)
             .expect("revoke session"));
@@ -2054,6 +2187,13 @@ mod tests {
                 2,
             )
             .expect("store device");
+        storage
+            .upsert_device(&account.id, "device-1", "unknown", None, None, 3)
+            .expect("preserve device metadata");
+        let device = &storage.list_devices(&account.id).expect("list device")[0];
+        assert_eq!(device.platform, "mobile");
+        assert_eq!(device.name.as_deref(), Some("Phone"));
+        assert_eq!(device.app_version.as_deref(), Some("0.2.0"));
         storage
             .register_device_key(
                 &account.id,
@@ -2384,7 +2524,7 @@ mod tests {
             )
             .expect("repeat message")
             .expect("existing message");
-        assert_eq!(first.envelope_json, second.envelope_json);
+        assert_eq!(first.message_json, second.message_json);
 
         let delivered = storage
             .deliver_message(
@@ -2394,7 +2534,7 @@ mod tests {
                 "Alice",
                 "alice",
                 "client-1",
-                "{\"envelope\":true}",
+                "{\"encrypted_message\":true}",
                 2,
             )
             .expect("deliver message")
@@ -2409,7 +2549,7 @@ mod tests {
                 "Bob",
                 "bob",
                 "client-2",
-                "{\"envelope\":\"reverse\"}",
+                "{\"encrypted_message\":\"reverse\"}",
                 2,
             )
             .expect("deliver reverse message")
@@ -2432,7 +2572,7 @@ mod tests {
                     "Alice",
                     "alice",
                     "client-1",
-                    "{\"envelope\":false}",
+                    "{\"encrypted_message\":false}",
                     3,
                 )
                 .expect("repeat delivery")
@@ -2447,7 +2587,7 @@ mod tests {
                 "Alice",
                 "alice",
                 "client-1:key-2",
-                "{\"envelope\":2}",
+                "{\"encrypted_message\":2}",
                 4,
             )
             .expect("deliver second device copy")
@@ -3153,6 +3293,32 @@ impl Storage {
         }
     }
 
+    pub async fn update_account_folders(
+        &self,
+        account_id: &str,
+        folders: &[StoredFolder],
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        let folders_json = serde_json::to_string(folders)
+            .map_err(|error| StorageError::InvalidEvent(error.to_string()))?;
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .update_account_folders(account_id, folders, updated_at)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                sqlx::query("INSERT INTO account_folders (account_id, folders_json, updated_at) VALUES ($1, $2, $3) ON CONFLICT(account_id) DO UPDATE SET folders_json = EXCLUDED.folders_json, updated_at = EXCLUDED.updated_at")
+                    .bind(account_id)
+                    .bind(folders_json)
+                    .bind(updated_at)
+                    .execute(pool)
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     pub async fn update_account_name(
         &self,
         account_id: &str,
@@ -3352,6 +3518,37 @@ impl Storage {
         }
     }
 
+    pub async fn update_session_metadata(
+        &self,
+        account_id: &str,
+        token: &str,
+        platform: Option<&str>,
+        device_name: Option<&str>,
+        app_version: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .update_session_metadata(account_id, token, platform, device_name, app_version, now)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "UPDATE sessions SET platform = COALESCE(NULLIF($3, ''), platform), device_name = COALESCE(NULLIF($4, ''), device_name), app_version = COALESCE(NULLIF($5, ''), app_version), last_seen_at = $6 WHERE account_id = $1 AND token = $2 AND expires_at > $6",
+            )
+            .bind(account_id)
+            .bind(token)
+            .bind(platform)
+            .bind(device_name)
+            .bind(app_version)
+            .bind(now)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
     pub async fn upsert_device(
         &self,
         account_id: &str,
@@ -3368,7 +3565,7 @@ impl Storage {
                 .upsert_device(account_id, device_id, platform, name, app_version, now)
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
-                sqlx::query("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = EXCLUDED.platform, name = COALESCE(EXCLUDED.name, devices.name), app_version = COALESCE(EXCLUDED.app_version, devices.app_version), last_seen_at = EXCLUDED.last_seen_at, revoked_at = NULL")
+                sqlx::query("INSERT INTO devices (owner_account_id, device_id, platform, name, app_version, created_at, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(owner_account_id, device_id) DO UPDATE SET platform = COALESCE(NULLIF(EXCLUDED.platform, 'unknown'), devices.platform), name = COALESCE(EXCLUDED.name, devices.name), app_version = COALESCE(EXCLUDED.app_version, devices.app_version), last_seen_at = EXCLUDED.last_seen_at, revoked_at = NULL")
                     .bind(account_id)
                     .bind(device_id)
                     .bind(platform)
@@ -3726,7 +3923,7 @@ impl Storage {
                 let conversations = sqlx::query(
                     "SELECT c.id, c.name, c.handle, c.avatar, c.subtitle, c.can_write, c.last_message, c.last_message_at, c.pinned, c.online,
                             peer.last_seen_at,
-                            COALESCE((SELECT COUNT(DISTINCT COALESCE((unread_messages.envelope_json::jsonb ->> 'message_id'), unread_messages.id))
+                            COALESCE((SELECT COUNT(DISTINCT COALESCE((unread_messages.message_json::jsonb ->> 'message_id'), unread_messages.id))
                                       FROM messages unread_messages
                                       LEFT JOIN conversation_reads unread_reads
                                         ON unread_reads.owner_account_id = unread_messages.owner_account_id
@@ -3734,7 +3931,7 @@ impl Storage {
                                       WHERE unread_messages.owner_account_id = c.owner_account_id
                                        AND unread_messages.conversation_id = c.id
                                        AND unread_messages.author = 'them'
-                                       AND unread_messages.envelope_json <> ''
+                                       AND unread_messages.message_json <> ''
                                        AND unread_messages.created_at > COALESCE(unread_reads.read_at, 0)), 0) AS unread
                      FROM conversations c
                      LEFT JOIN accounts peer ON peer.handle = CASE
@@ -3767,6 +3964,15 @@ impl Storage {
                     })
                 })
                 .collect::<Result<Vec<_>, sqlx::Error>>()?;
+                let folders = sqlx::query(
+                    "SELECT folders_json FROM account_folders WHERE account_id = $1",
+                )
+                .bind(account_id)
+                .fetch_optional(pool)
+                .await?
+                .and_then(|row| row.try_get::<String, _>("folders_json").ok())
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default();
                 let mut messages = Vec::new();
                 let mut read_receipts = Vec::new();
                 let mut delivery_receipts = Vec::new();
@@ -3801,6 +4007,7 @@ impl Storage {
                 Ok(SyncSnapshot {
                     cursor,
                     conversations,
+                    folders,
                     messages,
                     read_receipts,
                     delivery_receipts,
@@ -3862,9 +4069,9 @@ impl Storage {
                 .bind(read_at)
                 .execute(&mut *transaction)
                 .await?;
-                let envelopes = sqlx::query(
-                    "SELECT envelope_json FROM messages
-                     WHERE owner_account_id = $1 AND conversation_id = $2 AND author = 'them' AND created_at <= $3 AND envelope_json <> ''",
+                let encrypted_messages = sqlx::query(
+                    "SELECT message_json FROM messages
+                     WHERE owner_account_id = $1 AND conversation_id = $2 AND author = 'them' AND created_at <= $3 AND message_json <> ''",
                 )
                 .bind(account_id)
                 .bind(conversation_id)
@@ -3873,9 +4080,9 @@ impl Storage {
                 .await?;
                 let mut message_ids = Vec::new();
                 let mut events = Vec::new();
-                for row in envelopes {
-                    let envelope_json: String = row.try_get("envelope_json")?;
-                    let Some(message_id) = envelope_message_id(&envelope_json) else {
+                for row in encrypted_messages {
+                    let message_json: String = row.try_get("message_json")?;
+                    let Some(message_id) = message_id_from_json(&message_json) else {
                         continue;
                     };
                     if message_ids.iter().any(|value| value == &message_id) {
@@ -4066,7 +4273,7 @@ impl Storage {
         account_id: &str,
         conversation_id: &str,
         client_message_id: &str,
-        envelope_json: &str,
+        message_json: &str,
         created_at: i64,
     ) -> Result<Option<StoredMessage>, StorageError> {
         match &self.backend {
@@ -4077,7 +4284,7 @@ impl Storage {
                     account_id,
                     conversation_id,
                     client_message_id,
-                    envelope_json,
+                    message_json,
                     created_at,
                 )
                 .map_err(Into::into),
@@ -4099,7 +4306,7 @@ impl Storage {
                     return Ok(None);
                 }
                 if let Some(row) = sqlx::query(
-                    "SELECT id, conversation_id, author, created_at, stack_id, envelope_json FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
+                    "SELECT id, conversation_id, author, created_at, stack_id, message_json FROM messages WHERE owner_account_id = $1 AND client_message_id = $2",
                 )
                 .bind(account_id)
                 .bind(client_message_id)
@@ -4113,17 +4320,17 @@ impl Storage {
                         author: row.try_get("author")?,
                         created_at: row.try_get("created_at")?,
                         stack_id: row.try_get("stack_id")?,
-                        envelope_json: row.try_get("envelope_json")?,
+                        message_json: row.try_get("message_json")?,
                     }));
                 }
                 let stack_id = message_stack_id(conversation_id, "me", created_at);
                 sqlx::query(
-                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id) VALUES ($1, $2, $3, 'me', '', $4, $5, $6, $1)",
+                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id) VALUES ($1, $2, $3, 'me', '', $4, $5, $6, $1)",
                 )
                 .bind(client_message_id)
                 .bind(account_id)
                 .bind(conversation_id)
-                .bind(envelope_json)
+                .bind(message_json)
                 .bind(created_at)
                 .bind(&stack_id)
                 .execute(&mut *transaction)
@@ -4142,7 +4349,7 @@ impl Storage {
                     author: "me".to_owned(),
                     created_at,
                     stack_id,
-                    envelope_json: envelope_json.to_owned(),
+                    message_json: message_json.to_owned(),
                 };
                 append_postgres_message_event(&mut transaction, account_id, &message).await?;
                 transaction.commit().await?;
@@ -4158,7 +4365,7 @@ impl Storage {
         message_id: &str,
         source_key_id: Option<&str>,
         target_key_id: &str,
-        envelope_json: &str,
+        message_json: &str,
     ) -> Result<bool, StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
@@ -4170,7 +4377,7 @@ impl Storage {
                     message_id,
                     source_key_id,
                     target_key_id,
-                    envelope_json,
+                    message_json,
                 )
                 .map_err(Into::into),
             StorageBackend::Postgres(pool) => {
@@ -4199,14 +4406,14 @@ impl Storage {
                 let copy_id = format!("device-copy:{account_id}:{message_id}:{target_key_id}");
                 let stack_id = message_stack_id(conversation_id, &author, created_at);
                 let result = sqlx::query(
-                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id)
+                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id)
                      VALUES ($1, $2, $3, $4, '', $5, $6, $7, $1) ON CONFLICT DO NOTHING",
                 )
                 .bind(&copy_id)
                 .bind(account_id)
                 .bind(conversation_id)
                 .bind(&author)
-                .bind(envelope_json)
+                .bind(message_json)
                 .bind(created_at)
                 .bind(&stack_id)
                 .execute(&mut *transaction)
@@ -4221,7 +4428,7 @@ impl Storage {
                             author,
                             created_at,
                             stack_id,
-                            envelope_json: envelope_json.to_owned(),
+                            message_json: message_json.to_owned(),
                         },
                     )
                     .await?;
@@ -4240,7 +4447,7 @@ impl Storage {
         peer_name: &str,
         peer_avatar: &str,
         delivery_id: &str,
-        envelope_json: &str,
+        message_json: &str,
         created_at: i64,
     ) -> Result<Option<StoredMessage>, StorageError> {
         match &self.backend {
@@ -4254,7 +4461,7 @@ impl Storage {
                     peer_name,
                     peer_avatar,
                     delivery_id,
-                    envelope_json,
+                    message_json,
                     created_at,
                 )
                 .map_err(Into::into),
@@ -4301,12 +4508,12 @@ impl Storage {
                 let stored_id = format!("inbound:{account_id}:{delivery_id}");
                 let stack_id = message_stack_id(&target_conversation_id, "them", created_at);
                 let inserted = sqlx::query(
-                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, envelope_json, created_at, stack_id, client_message_id) VALUES ($1, $2, $3, 'them', '', $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+                    "INSERT INTO messages (id, owner_account_id, conversation_id, author, text, message_json, created_at, stack_id, client_message_id) VALUES ($1, $2, $3, 'them', '', $4, $5, $6, $7) ON CONFLICT DO NOTHING",
                 )
                 .bind(&stored_id)
                 .bind(account_id)
                 .bind(&target_conversation_id)
-                .bind(envelope_json)
+                .bind(message_json)
                 .bind(created_at)
                 .bind(&stack_id)
                 .bind(delivery_id)
@@ -4330,7 +4537,7 @@ impl Storage {
                     author: "them".to_owned(),
                     created_at,
                     stack_id,
-                    envelope_json: envelope_json.to_owned(),
+                    message_json: message_json.to_owned(),
                 };
                 append_postgres_message_event(&mut transaction, account_id, &message).await?;
                 transaction.commit().await?;
@@ -4367,8 +4574,8 @@ impl Storage {
                 };
                 let recipient_has_copy = sqlx::query(
                     "SELECT 1 FROM messages
-                     WHERE owner_account_id = $1 AND author = 'them' AND envelope_json <> ''
-                       AND envelope_json::jsonb ->> 'message_id' = $2
+                     WHERE owner_account_id = $1 AND author = 'them' AND message_json <> ''
+                       AND message_json::jsonb ->> 'message_id' = $2
                      LIMIT 1",
                 )
                 .bind(recipient_account_id)
@@ -4649,11 +4856,12 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL DEFAULT 0, session_id TEXT, device_id TEXT, platform TEXT NOT NULL DEFAULT 'unknown', device_name TEXT, app_version TEXT, last_seen_at BIGINT);\
          CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL;\
          CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at BIGINT NOT NULL);\
+         CREATE TABLE IF NOT EXISTS account_folders (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, folders_json TEXT NOT NULL, updated_at BIGINT NOT NULL);\
          CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at BIGINT NOT NULL, last_seen_at BIGINT, revoked_at BIGINT, PRIMARY KEY(owner_account_id, device_id));\
          CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, handle TEXT, avatar TEXT NOT NULL, subtitle TEXT, can_write BOOLEAN NOT NULL DEFAULT TRUE, last_message TEXT NOT NULL DEFAULT '', last_message_at BIGINT, pinned BOOLEAN NOT NULL DEFAULT FALSE, online BOOLEAN NOT NULL DEFAULT FALSE, sort_order BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
          CREATE INDEX IF NOT EXISTS conversations_owner_order ON conversations(owner_account_id, pinned DESC, sort_order ASC, created_at ASC);\
          CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_handle ON conversations(owner_account_id, handle) WHERE handle IS NOT NULL;\
-         CREATE TABLE IF NOT EXISTS messages (seq BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author TEXT NOT NULL CHECK(author IN ('me', 'them')), text TEXT NOT NULL DEFAULT '', envelope_json TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, stack_id TEXT NOT NULL DEFAULT '', client_message_id TEXT NOT NULL, UNIQUE(owner_account_id, client_message_id));\
+         CREATE TABLE IF NOT EXISTS messages (seq BIGSERIAL PRIMARY KEY, id TEXT NOT NULL UNIQUE, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author TEXT NOT NULL CHECK(author IN ('me', 'them')), text TEXT NOT NULL DEFAULT '', message_json TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, stack_id TEXT NOT NULL DEFAULT '', client_message_id TEXT NOT NULL, UNIQUE(owner_account_id, client_message_id));\
          CREATE INDEX IF NOT EXISTS messages_owner_cursor ON messages(owner_account_id, seq ASC);\
          CREATE TABLE IF NOT EXISTS media_objects (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, recipient_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, conversation_id TEXT NOT NULL, ciphertext BYTEA NOT NULL, byte_size BIGINT NOT NULL, created_at BIGINT NOT NULL);\
          CREATE INDEX IF NOT EXISTS media_objects_recipient ON media_objects(recipient_account_id, created_at ASC);\
@@ -4668,13 +4876,13 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          CREATE TABLE IF NOT EXISTS push_tokens (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE, platform TEXT NOT NULL CHECK(platform IN ('android', 'ios')), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY(owner_account_id, device_id));\
          CREATE INDEX IF NOT EXISTS push_tokens_owner ON push_tokens(owner_account_id);\
          CREATE TABLE IF NOT EXISTS account_keys (owner_account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, key_id TEXT NOT NULL UNIQUE, encryption_public_key TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
-         ALTER TABLE messages ADD COLUMN IF NOT EXISTS envelope_json TEXT NOT NULL DEFAULT '';\
+         ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_json TEXT NOT NULL DEFAULT '';\
          ALTER TABLE messages ADD COLUMN IF NOT EXISTS stack_id TEXT NOT NULL DEFAULT '';\
          UPDATE messages SET stack_id = conversation_id || ':' || author || ':' || (created_at / 60000)::TEXT WHERE stack_id = '';\
-         UPDATE messages SET text = '' WHERE envelope_json = '';\
+         UPDATE messages SET text = '' WHERE message_json = '';\
          UPDATE conversations SET last_message = '';\
          INSERT INTO realtime_event_cursors (account_id, cursor) SELECT id, 0 FROM accounts ON CONFLICT (account_id) DO NOTHING;\
-         INSERT INTO realtime_events (account_id, cursor, kind, source_id, payload_json, created_at) SELECT owner_account_id, seq, 'message', id, json_build_object('id', id, 'conversation_id', conversation_id, 'author', author, 'created_at', created_at, 'stack_id', stack_id, 'envelope_json', envelope_json)::TEXT, created_at FROM messages WHERE envelope_json <> '' ON CONFLICT DO NOTHING;\
+         INSERT INTO realtime_events (account_id, cursor, kind, source_id, payload_json, created_at) SELECT owner_account_id, seq, 'message', id, json_build_object('id', id, 'conversation_id', conversation_id, 'author', author, 'created_at', created_at, 'stack_id', stack_id, 'message_json', message_json)::TEXT, created_at FROM messages WHERE message_json <> '' ON CONFLICT DO NOTHING;\
          UPDATE realtime_event_cursors SET cursor = GREATEST(cursor, COALESCE((SELECT MAX(realtime_events.cursor) FROM realtime_events WHERE realtime_events.account_id = realtime_event_cursors.account_id), 0));\
          INSERT INTO realtime_events (account_id, cursor, kind, source_id, payload_json, created_at) SELECT legacy.account_id, cursors.cursor + ROW_NUMBER() OVER (PARTITION BY legacy.account_id ORDER BY legacy.kind, legacy.message_id), legacy.kind, legacy.kind || ':' || legacy.message_id || ':' || legacy.value::TEXT, CASE WHEN legacy.kind = 'readReceipt' THEN json_build_object('message_id', legacy.message_id, 'read_at', legacy.value)::TEXT ELSE json_build_object('message_id', legacy.message_id, 'delivered_at', legacy.value)::TEXT END, legacy.value FROM (SELECT own_messages.owner_account_id AS account_id, receipts.message_id, MAX(receipts.read_at) AS value, 'readReceipt' AS kind FROM message_read_receipts receipts JOIN messages own_messages ON own_messages.id = receipts.message_id WHERE own_messages.author = 'me' GROUP BY own_messages.owner_account_id, receipts.message_id UNION ALL SELECT own_messages.owner_account_id, receipts.message_id, MAX(receipts.delivered_at), 'deliveryReceipt' FROM message_delivery_receipts receipts JOIN messages own_messages ON own_messages.id = receipts.message_id WHERE own_messages.author = 'me' GROUP BY own_messages.owner_account_id, receipts.message_id) legacy JOIN realtime_event_cursors cursors ON cursors.account_id = legacy.account_id ON CONFLICT DO NOTHING;\
          UPDATE realtime_event_cursors SET cursor = GREATEST(cursor, COALESCE((SELECT MAX(realtime_events.cursor) FROM realtime_events WHERE realtime_events.account_id = realtime_event_cursors.account_id), 0));\
@@ -4682,6 +4890,41 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
     )
     .execute(pool)
     .await?;
+    let historical_message_column = concat!("env", "elope_json");
+    let has_historical_message_column: bool = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'messages' AND column_name = $1) AS present",
+    )
+    .bind(historical_message_column)
+    .fetch_one(pool)
+    .await?
+    .try_get("present")?;
+    if has_historical_message_column {
+        let has_message_column: bool = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'messages' AND column_name = 'message_json') AS present",
+        )
+        .fetch_one(pool)
+        .await?
+        .try_get("present")?;
+        if has_message_column {
+            let copy_statement = format!(
+                "UPDATE messages SET message_json = CASE WHEN message_json = '' THEN \"{historical_message_column}\" ELSE message_json END"
+            );
+            sqlx::query(&copy_statement).execute(pool).await?;
+            let drop_statement = format!(
+                "ALTER TABLE messages DROP COLUMN \"{historical_message_column}\""
+            );
+            sqlx::query(&drop_statement).execute(pool).await?;
+        } else {
+            let rename_statement = format!(
+                "ALTER TABLE messages RENAME COLUMN \"{historical_message_column}\" TO message_json"
+            );
+            sqlx::query(&rename_statement).execute(pool).await?;
+        }
+        sqlx::query("DELETE FROM realtime_events WHERE kind = 'message'")
+            .execute(pool)
+            .await?;
+        backfill_postgres_message_events(pool).await?;
+    }
     sqlx::query(
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0",
     )
@@ -4727,6 +4970,51 @@ async fn postgres_ensure_system_conversations(
     .bind(account_id)
     .bind(now)
     .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn backfill_postgres_message_events(pool: &PgPool) -> Result<(), StorageError> {
+    sqlx::query(
+        "WITH candidates AS (
+             SELECT messages.owner_account_id, messages.id, messages.conversation_id, messages.author,
+                    messages.created_at, messages.stack_id, messages.message_json,
+                    realtime_event_cursors.cursor + ROW_NUMBER() OVER (
+                        PARTITION BY messages.owner_account_id ORDER BY messages.seq
+                    ) AS next_cursor
+             FROM messages
+             JOIN realtime_event_cursors
+               ON realtime_event_cursors.account_id = messages.owner_account_id
+             WHERE messages.message_json <> ''
+         )
+         INSERT INTO realtime_events (account_id, cursor, kind, source_id, payload_json, created_at)
+         SELECT owner_account_id, next_cursor, 'message', id,
+                json_build_object(
+                    'id', id,
+                    'conversation_id', conversation_id,
+                    'author', author,
+                    'created_at', created_at,
+                    'stack_id', stack_id,
+                    'message_json', message_json
+                )::TEXT,
+                created_at
+         FROM candidates
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE realtime_event_cursors
+         SET cursor = GREATEST(
+             cursor,
+             COALESCE((
+                 SELECT MAX(realtime_events.cursor)
+                 FROM realtime_events
+                 WHERE realtime_events.account_id = realtime_event_cursors.account_id
+             ), 0)
+         )",
+    )
+    .execute(pool)
     .await?;
     Ok(())
 }

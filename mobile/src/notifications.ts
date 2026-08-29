@@ -47,7 +47,7 @@ export async function notifyIncomingMessage(input: {
 }) {
   try {
     const settings = await readSettings();
-    if (!settings.notifications.enabled) return;
+    if (!settings.notifications.desktop) return;
     await Notifications.scheduleNotificationAsync({
       content: {
         title: input.title,

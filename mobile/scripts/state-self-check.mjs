@@ -66,12 +66,14 @@ assert.equal(retryDelay(MAX_OUTBOX_ATTEMPTS + 10), 60_000);
 assert.deepEqual(normalizeSettings(), DEFAULT_SETTINGS);
 assert.deepEqual(normalizeSettings(JSON.parse("{\"theme\":\"neon\",\"textSize\":\"large\",\"language\":\"en\",\"notifications\":{\"enabled\":\"yes\",\"preview\":false,\"sound\":true,\"unknown\":true},\"privacy\":{\"online\":false},\"cache\":{\"retentionDays\":999.4,\"autoloadMedia\":true},\"unknown\":true}")), {
   theme: "system",
-  textSize: "large",
-  language: "en",
-  notifications: { enabled: true, preview: false, sound: true },
-  cache: { retentionDays: 365, autoloadMedia: true },
+  fontScale: 1.1,
+  density: "comfortable",
+  accent: "violet",
+  locale: "en",
+  notifications: { desktop: true, preview: false, sound: true },
+  cachePolicy: "standard",
 });
-assert.deepEqual(normalizeSettings({ cache: { retentionDays: -4.6 } }), { ...DEFAULT_SETTINGS, cache: { ...DEFAULT_SETTINGS.cache, retentionDays: 0 } });
+assert.deepEqual(normalizeSettings({ cache: { retentionDays: -4.6 } }), { ...DEFAULT_SETTINGS, cachePolicy: "disabled" });
 assert.deepEqual(normalizeSettings(null), DEFAULT_SETTINGS);
 assert.equal(getSuggestedServerAddress("192.168.0.160"), "192.168.0.160:50121");
 assert.equal(getSuggestedServerAddress("0.0.0.0"), "");
@@ -91,10 +93,12 @@ const writtenSettings = await writeSettings(requestedSettings);
 const persistedSettings = await readSettings();
 assert.deepEqual(persistedSettings, {
   theme: "dark",
-  textSize: "small",
-  language: "system",
-  notifications: { enabled: false, preview: false, sound: true },
-  cache: { retentionDays: 7, autoloadMedia: true },
+  fontScale: 0.9,
+  density: "comfortable",
+  accent: "violet",
+  locale: "ru",
+  notifications: { desktop: false, preview: false, sound: true },
+  cachePolicy: "minimal",
 });
 assert.deepEqual(writtenSettings, persistedSettings);
 assert.deepEqual(JSON.parse(await storage.getItem(SETTINGS_STORAGE_KEY)), persistedSettings);

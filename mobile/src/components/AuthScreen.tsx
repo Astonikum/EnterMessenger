@@ -7,6 +7,10 @@ import { colors, fonts, radii } from "../theme";
 import { Icon } from "./Icon";
 import { getSuggestedServerAddress, normalizeServerAddress } from "../rn-address";
 import { ENTER_PROTOCOL_VERSION } from "../protocol";
+import { clientDeviceMetadata } from "../rn-api";
+import { LogsScreen } from "./LogsScreen";
+import { logEvent } from "../logs";
+import { friendlyError } from "../client-errors";
 
 type Props = { onAuthenticated: (profile: Profile, password: string) => void | Promise<void>; onCancel?: () => void };
 type Mode = "login" | "register";
@@ -16,12 +20,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isHealthResponse(value: unknown): value is { status: string; protocol: string; serverName?: string; logo?: string } {
+function isHealthResponse(value: unknown): value is { status: string; protocol: string; serverName?: string; logo?: string | null } {
   return isRecord(value)
     && value.status === "ok"
     && typeof value.protocol === "string"
     && (value.serverName === undefined || typeof value.serverName === "string")
-    && (value.logo === undefined || typeof value.logo === "string");
+    && (value.logo === undefined || value.logo === null || typeof value.logo === "string");
 }
 
 function isAuthResponse(value: unknown): value is { token: string; profile: { id: string; name: string; handle: string; serverId: string }; error?: string } {
@@ -49,6 +53,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [showLogs, setShowLogs] = useState(false);
   const handleInput = useRef<TextInput | null>(null);
   const passwordInput = useRef<TextInput | null>(null);
   const stepOffset = useRef(new Animated.Value(0)).current;
@@ -78,8 +83,9 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
       const health: unknown = await response.json();
       if (!isHealthResponse(health)) throw new Error("unavailable");
       if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
-      setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? new URL(health.logo, `${url}/`).toString() : undefined); transitionToStep("auth", "forward");
+      setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? new URL(health.logo, `${url}/`).toString() : undefined); logEvent("auth", "Server is available", url, "success"); transitionToStep("auth", "forward");
     } catch (reason) {
+      logEvent("auth", "Server check failed", reason instanceof Error ? reason.message : "Server unavailable", "error");
       setError(reason instanceof Error && reason.message === "unsupported_protocol"
         ? `Сервер использует другую версию Enter API (нужна ${ENTER_PROTOCOL_VERSION})`
         : reason instanceof Error && reason.name === "AbortError"
@@ -94,11 +100,12 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     }
     setBusy(true); setError("");
     try {
-      const response = await fetch(`${serverUrl}/auth/${mode}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: mode === "register" ? name.trim() : undefined, handle: handle.trim(), password }) });
+      const response = await fetch(`${serverUrl}/auth/${mode}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: mode === "register" ? name.trim() : undefined, handle: handle.trim(), password, ...clientDeviceMetadata() }) });
       const data: unknown = await response.json();
       if (!response.ok || !isAuthResponse(data)) throw new Error(isRecord(data) && typeof data.error === "string" ? data.error : "Не удалось войти");
+      logEvent("auth", mode === "login" ? "Signed in" : "Account registered", serverUrl, "success");
       await onAuthenticated({ id: data.profile.id, serverId: data.profile.serverId, name: data.profile.name, handle: data.profile.handle, server: serverUrl, color: colors.primary, token: data.token, serverName, serverLogo }, password);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось выполнить запрос"); }
+    } catch (reason) { logEvent("auth", mode === "login" ? "Sign-in failed" : "Registration failed", reason instanceof Error ? reason.message : "Authorization request failed", "error"); setError(friendlyError(reason, mode === "login" ? "Не удалось войти. Проверьте данные и попробуйте снова." : "Не удалось зарегистрироваться. Проверьте данные и попробуйте снова.")); }
     finally { setBusy(false); }
   }
 
@@ -107,6 +114,8 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     transitionToStep("server", "backward");
     setError("");
   }
+
+  if (showLogs) return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><StatusBar style="light" /><LogsScreen onClose={() => setShowLogs(false)} /></SafeAreaView>;
 
   return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><KeyboardAvoidingView style={styles.page} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}><StatusBar style="light" /><ScrollView bounces={false} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
     {(onCancel || step === "auth") && <Pressable style={styles.back} onPress={goBack}><Icon name="arrowBack" size={20} color={colors.foreground} /><Text style={styles.backText}>Назад</Text></Pressable>}
@@ -128,7 +137,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
       <PrimaryButton label={mode === "login" ? "Войти" : "Зарегистрироваться"} icon={mode === "login" ? "login" : "plus"} busy={busy} onPress={submitAuth} />
     </View>}
     </Animated.View>
-  </ScrollView></KeyboardAvoidingView></SafeAreaView>;
+  </ScrollView><Pressable style={styles.logsLink} onPress={() => setShowLogs(true)} accessibilityRole="button" accessibilityLabel="Логи диагностики"><Icon name="logs" size={14} color="#686474" /><Text style={styles.logsLinkText}>Логи диагностики</Text></Pressable></KeyboardAvoidingView></SafeAreaView>;
 }
 
 function StepIndicator({ step }: { step: "server" | "auth" }) {
@@ -151,6 +160,8 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.background },
   page: { flex: 1, backgroundColor: colors.background },
   scroll: { flexGrow: 1, paddingHorizontal: 20, paddingTop: 54, paddingBottom: 32, justifyContent: "flex-start" },
+  logsLink: { position: "absolute", right: 0, bottom: 8, left: 0, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 5, padding: 8 },
+  logsLinkText: { color: "#686474", fontFamily: fonts.body, fontSize: 11 },
   back: { position: "absolute", top: 20, left: 20, zIndex: 1, flexDirection: "row", alignItems: "center", gap: 6, padding: 8 },
   backText: { color: colors.foreground, fontFamily: fonts.body, fontSize: 14 },
   brand: { alignItems: "center", justifyContent: "center", marginBottom: 30 },

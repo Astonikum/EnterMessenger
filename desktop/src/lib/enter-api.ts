@@ -1,13 +1,17 @@
 import { formatMessageTime } from "./utils";
-import { ENTER_PROTOCOL_VERSION, formatEnterAddress, parseEnterAddress, type EncryptedEnvelope } from "./enter-protocol";
+import { ENTER_PROTOCOL_VERSION, formatEnterAddress, parseEnterAddress, type EncryptedMessage } from "./enter-protocol";
 import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
 import { normalizeServerAddress } from "./server-address";
+import { logEvent } from "./logs";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
+import { isChatFolder, type ChatFolder } from "./folders";
 import type { Conversation, Message, Profile } from "../types";
 
 const REQUEST_TIMEOUT_MS = 10_000;
-const MAX_ENVELOPE_CIPHERTEXT_LENGTH = 2_000_000;
+const MAX_MEDIA_CIPHERTEXT_BYTES = 200 * 1024 * 1024 + 16;
+const MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH = 2_000_000;
 const MAX_SYNC_ITEMS = 1_000;
+const MAX_FOLDERS = 100;
 
 export type RemoteConversation = {
   id: string;
@@ -31,7 +35,7 @@ export type RemoteMessage = {
   author: "me" | "them";
   createdAt: number;
   stackId: string;
-  envelope: EncryptedEnvelope;
+  encryptedMessage: EncryptedMessage;
 };
 
 export type RemoteReadReceipt = {
@@ -47,6 +51,7 @@ export type RemoteDeliveryReceipt = {
 export type SyncResponse = {
   nextCursor: number;
   conversations: RemoteConversation[];
+  folders?: ChatFolder[];
   messages: RemoteMessage[];
   readReceipts: RemoteReadReceipt[];
   deliveryReceipts: RemoteDeliveryReceipt[];
@@ -59,6 +64,7 @@ export type RealtimeEvent =
   | { type: "readReceipt"; cursor: number; messageId: string; readAt: number }
   | { type: "deliveryReceipt"; cursor: number; messageId: string; deliveredAt: number }
   | { type: "presence"; conversationId: string; online: boolean; lastSeenAt: number }
+  | { type: "folders"; folders: ChatFolder[] }
   | { type: "pong" }
   | { type: "error"; code: string };
 
@@ -71,7 +77,7 @@ export type DeviceHistoryEntry = {
   conversationId: string;
   messageId: string;
   sourceKeyId?: string;
-  envelope: EncryptedEnvelope;
+  encryptedMessage: EncryptedMessage;
 };
 
 export type AccountSettings = {
@@ -102,6 +108,19 @@ export type ManagedSession = {
   current: boolean;
 };
 
+export type ClientDeviceMetadata = {
+  platform: string;
+  deviceName: string;
+  appVersion: string;
+};
+
+export function clientDeviceMetadata(): ClientDeviceMetadata {
+  const userAgent = navigator.userAgent;
+  const browser = userAgent.includes("Edg/") ? "Edge" : userAgent.includes("Chrome/") ? "Chrome" : userAgent.includes("Firefox/") ? "Firefox" : userAgent.includes("Safari/") ? "Safari" : "Browser";
+  const platform = navigator.platform || "desktop";
+  return { platform: "web", deviceName: `${browser} · ${platform}`.slice(0, 128), appVersion: "0.2.0" };
+}
+
 type PublicKeyDirectoryResponse = {
   id: string;
   handle: string;
@@ -130,10 +149,10 @@ function isDeviceKeyBundle(value: unknown): value is DeviceKeyBundle {
     && Number.isFinite(value.createdAt);
 }
 
-function isEnvelope(value: unknown): value is EncryptedEnvelope {
+function isEncryptedMessage(value: unknown): value is EncryptedMessage {
   if (!isRecord(value) || value.protocol !== ENTER_PROTOCOL_VERSION) return false;
   return ["message_id", "conversation_id", "sender", "recipient", "sender_device", "key_id", "created_at", "nonce", "ephemeral_public_key", "ciphertext", "associated_data", "signature"]
-    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENVELOPE_CIPHERTEXT_LENGTH : 4096));
+    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH : 4096));
 }
 
 function isRemoteConversation(value: unknown): value is RemoteConversation {
@@ -163,7 +182,7 @@ function isRemoteMessage(value: unknown): value is RemoteMessage {
     && typeof value.createdAt === "number"
     && Number.isFinite(value.createdAt)
     && isString(value.stackId, 256)
-    && isEnvelope(value.envelope);
+    && isEncryptedMessage(value.encryptedMessage);
 }
 
 function isReceipt(value: unknown, field: "readAt" | "deliveredAt") {
@@ -171,6 +190,10 @@ function isReceipt(value: unknown, field: "readAt" | "deliveredAt") {
     && isString(value.messageId, 256)
     && typeof value[field] === "number"
     && Number.isFinite(value[field]);
+}
+
+function isFolderList(value: unknown): value is ChatFolder[] {
+  return Array.isArray(value) && value.length <= MAX_FOLDERS && value.every(isChatFolder);
 }
 
 function isSyncResponse(value: unknown): value is SyncResponse {
@@ -189,7 +212,8 @@ function isSyncResponse(value: unknown): value is SyncResponse {
     && value.readReceipts.every((item) => isReceipt(item, "readAt"))
     && Array.isArray(value.deliveryReceipts)
     && value.deliveryReceipts.length <= MAX_SYNC_ITEMS
-    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"));
+    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"))
+    && (value.folders === undefined || isFolderList(value.folders));
 }
 
 function isRealtimeEvent(value: unknown): value is RealtimeEvent {
@@ -200,6 +224,7 @@ function isRealtimeEvent(value: unknown): value is RealtimeEvent {
   if (value.type === "readReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "readAt");
   if (value.type === "deliveryReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "deliveredAt");
   if (value.type === "presence") return isString(value.conversationId, 256) && typeof value.online === "boolean" && typeof value.lastSeenAt === "number" && Number.isFinite(value.lastSeenAt);
+  if (value.type === "folders") return isFolderList(value.folders);
   if (value.type === "pong") return true;
   return value.type === "error" && isString(value.code, 128);
 }
@@ -322,10 +347,18 @@ async function request(input: RequestInfo | URL, init?: RequestInit) {
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const externalSignal = init?.signal;
   const abort = () => controller.abort(externalSignal?.reason);
+  const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  const path = (() => { try { return new URL(requestUrl, window.location.origin).pathname; } catch { return "request"; } })();
+  const method = init?.method ?? "GET";
   if (externalSignal?.aborted) abort();
   else externalSignal?.addEventListener("abort", abort, { once: true });
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    logEvent("network", `${method} ${path}`, `HTTP ${response.status}`, response.ok ? "info" : "warn");
+    return response;
+  } catch (reason) {
+    logEvent("network", `${method} ${path}`, reason instanceof Error ? reason.message : "Network request failed", "error");
+    throw reason;
   } finally {
     window.clearTimeout(timeout);
     externalSignal?.removeEventListener("abort", abort);
@@ -352,10 +385,22 @@ async function fetchDirectory(profile: Profile, rawAddress: string) {
 }
 
 export async function syncProfile(profile: Profile, since: number): Promise<SyncResponse> {
+  logEvent("sync", "Sync request", `cursor ${Math.max(0, since)}`);
   const response = await request(`${apiUrl(profile, "/api/v1/sync")}?since=${Math.max(0, since)}`, {
     headers: headers(profile),
   });
-  return readJson<SyncResponse>(response, isSyncResponse);
+  const result = await readJson<SyncResponse>(response, isSyncResponse);
+  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}`, "success");
+  return result;
+}
+
+export async function updateAccountFolders(profile: Profile, folders: ChatFolder[]): Promise<ChatFolder[]> {
+  const response = await request(apiUrl(profile, "/api/v1/account/folders"), {
+    method: "PUT",
+    headers: headers(profile),
+    body: JSON.stringify(folders),
+  });
+  return readJson<ChatFolder[]>(response, isFolderList);
 }
 
 export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
@@ -414,6 +459,15 @@ export async function getSessions(profile: Profile): Promise<ManagedSession[]> {
   return readJson<ManagedSession[]>(response, isSessionsResponse);
 }
 
+export async function refreshSessionMetadata(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/sessions/current"), {
+    method: "PATCH",
+    headers: headers(profile),
+    body: JSON.stringify(clientDeviceMetadata()),
+  });
+  await readJson<{ accepted: true }>(response, isAcceptedTrueResponse);
+}
+
 export async function revokeSession(profile: Profile, sessionId: string) {
   const response = await request(apiUrl(profile, `/api/v1/sessions/${encodeURIComponent(sessionId)}`), {
     method: "DELETE",
@@ -450,7 +504,7 @@ export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundl
   const response = await request(apiUrl(profile, "/enter/v1/keys"), {
     method: "POST",
     headers: headers(profile),
-    body: JSON.stringify({ ...bundle, accountKeyId: accountKey?.keyId, accountEncryptionPublicKey: accountKey?.encryptionPublicKey }),
+    body: JSON.stringify({ ...bundle, ...clientDeviceMetadata(), accountKeyId: accountKey?.keyId, accountEncryptionPublicKey: accountKey?.encryptionPublicKey }),
   });
   await readJson<{ accepted: boolean }>(response, isAcceptedResponse);
 }
@@ -506,24 +560,31 @@ export async function createConversation(profile: Profile, user: SearchUser): Pr
   return readJson<RemoteConversation>(response, isRemoteConversation);
 }
 
-export async function sendMessage(profile: Profile, conversationId: string, message: Message, envelopes: EncryptedEnvelope[]): Promise<SendMessageResponse> {
+export async function sendMessage(profile: Profile, conversationId: string, message: Message, encryptedMessages: EncryptedMessage[]): Promise<SendMessageResponse> {
+  logEvent("send", "Sending message", `recipients ${encryptedMessages.length}${message.attachments?.length ? `, attachments ${message.attachments.length}` : ""}`);
   const response = await request(apiUrl(profile, "/api/v1/messages"), {
     method: "POST",
     headers: headers(profile),
     body: JSON.stringify({
       conversationId,
       clientMessageId: message.id,
-      envelopes,
+      encryptedMessages,
     }),
   });
-  return readJson<SendMessageResponse>(response, (value): value is SendMessageResponse => isRecord(value)
+  const result = await readJson<SendMessageResponse>(response, (value): value is SendMessageResponse => isRecord(value)
     && typeof value.nextCursor === "number"
     && Number.isFinite(value.nextCursor)
     && value.nextCursor >= 0
     && isRemoteMessage(value.message));
+  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}`, "success");
+  return result;
 }
 
 export function uploadMedia(profile: Profile, conversationId: string, mediaId: string, recipient: string, ciphertext: Uint8Array, onProgress?: (progress: number) => void, signal?: AbortSignal) {
+  if (ciphertext.byteLength === 0 || ciphertext.byteLength > MAX_MEDIA_CIPHERTEXT_BYTES) {
+    return Promise.reject(new Error("Вложение превышает допустимый размер"));
+  }
+  logEvent("media", "Attachment upload started", `size ${ciphertext.byteLength} bytes`);
   return new Promise<void>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const abort = () => xhr.abort();
@@ -544,7 +605,7 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
       if (event.lengthComputable) onProgress?.(Math.round((event.loaded / event.total) * 100));
     };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) { cleanup(); resolve(); }
+      if (xhr.status >= 200 && xhr.status < 300) { cleanup(); logEvent("media", "Attachment uploaded", `size ${ciphertext.byteLength} bytes`, "success"); resolve(); }
       else {
         let detail = "";
         try {
@@ -552,12 +613,14 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
           if (typeof payload.error === "string") detail = `: ${payload.error}`;
         } catch { /* Keep the HTTP status. */ }
         cleanup();
-        reject(new Error(`Enter media request failed: ${xhr.status}${detail}`));
+        const error = new Error(`Enter media request failed: ${xhr.status}${detail}`);
+        logEvent("media", "Attachment upload failed", error.message, "error");
+        reject(error);
       }
     };
-    xhr.onerror = () => { cleanup(); reject(new Error("Не удалось загрузить вложение")); };
-    xhr.onabort = () => { cleanup(); reject(new DOMException("Загрузка вложения отменена", "AbortError")); };
-    xhr.ontimeout = () => { cleanup(); reject(new Error("Загрузка вложения превысила тайм-аут")); };
+    xhr.onerror = () => { cleanup(); logEvent("media", "Attachment upload failed", "Network error", "error"); reject(new Error("Не удалось загрузить вложение")); };
+    xhr.onabort = () => { cleanup(); logEvent("media", "Attachment upload canceled", undefined, "warn"); reject(new DOMException("Загрузка вложения отменена", "AbortError")); };
+    xhr.ontimeout = () => { cleanup(); logEvent("media", "Attachment upload timed out", undefined, "error"); reject(new Error("Загрузка вложения превысила тайм-аут")); };
     xhr.send(ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength) as ArrayBuffer);
   });
 }
@@ -565,7 +628,11 @@ export function uploadMedia(profile: Profile, conversationId: string, mediaId: s
 export async function downloadMedia(profile: Profile, mediaId: string, signal?: AbortSignal) {
   const response = await request(apiUrl(profile, `/api/v1/media/${encodeURIComponent(mediaId)}`), { headers: { authorization: `Bearer ${profile.token}` }, signal });
   if (!response.ok) throw new Error(`Enter media request failed: ${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_MEDIA_CIPHERTEXT_BYTES) throw new Error("Вложение превышает допустимый размер");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_MEDIA_CIPHERTEXT_BYTES) throw new Error("Вложение имеет некорректный размер");
+  return bytes;
 }
 
 export async function syncDeviceHistory(profile: Profile, entries: DeviceHistoryEntry[]) {
@@ -598,11 +665,11 @@ export function mapRemoteConversation(remote: RemoteConversation): Conversation 
 
 export function mapRemoteMessage(remote: RemoteMessage): Message {
   return {
-    id: remote.envelope.message_id,
+    id: remote.encryptedMessage.message_id,
     author: remote.author,
     text: "",
     time: formatMessageTime(new Date(remote.createdAt)),
     stackId: remote.stackId,
-    envelope: remote.envelope,
+    encryptedMessage: remote.encryptedMessage,
   };
 }

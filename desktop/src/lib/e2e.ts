@@ -2,7 +2,7 @@ import { p256 } from "@noble/curves/p256";
 import { pbkdf2 } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha2";
 import { concatBytes, utf8ToBytes } from "@noble/hashes/utils";
-import { ENTER_PROTOCOL_VERSION, type EncryptedEnvelope } from "./enter-protocol";
+import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./enter-protocol";
 import type { Message, MessageAttachment, Profile } from "../types";
 
 const DATABASE_NAME = "enter-e2e";
@@ -44,6 +44,8 @@ export type PublicEncryptionKey = Pick<PublicDeviceKey, "keyId" | "encryptionPub
 
 const EDIT_PAYLOAD_PREFIX = "ENTER_EDIT_V1:";
 const MESSAGE_PAYLOAD_PREFIX = "ENTER_MESSAGE_V2:";
+const MAX_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024;
 
 export function encodeMessagePayload(message: Message) {
   if (!message.editOf && !message.attachments?.length) return message.text;
@@ -53,7 +55,23 @@ export function encodeMessagePayload(message: Message) {
 function isAttachment(value: unknown): value is MessageAttachment {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<MessageAttachment>;
-  return typeof item.id === "string" && typeof item.kind === "string" && typeof item.name === "string" && typeof item.mimeType === "string" && typeof item.size === "number" && typeof item.sha256 === "string" && typeof item.key === "string" && typeof item.nonce === "string";
+  return typeof item.id === "string"
+    && item.id.length <= 128
+    && (item.kind === "image" || item.kind === "video" || item.kind === "audio" || item.kind === "file")
+    && typeof item.name === "string"
+    && item.name.length <= 255
+    && typeof item.mimeType === "string"
+    && item.mimeType.length <= 128
+    && typeof item.size === "number"
+    && Number.isSafeInteger(item.size)
+    && item.size >= 0
+    && item.size <= MAX_ATTACHMENT_BYTES
+    && typeof item.sha256 === "string"
+    && item.sha256.length <= 128
+    && typeof item.key === "string"
+    && item.key.length <= 128
+    && typeof item.nonce === "string"
+    && item.nonce.length <= 128;
 }
 
 export function decodeMessagePayload(value: string): { text: string; editOf?: string; attachments?: MessageAttachment[] } {
@@ -64,7 +82,11 @@ export function decodeMessagePayload(value: string): { text: string; editOf?: st
       if (typeof payload.targetId === "string" && typeof payload.text === "string") return { text: payload.text, editOf: payload.targetId };
     } else {
       const payload = JSON.parse(value.slice(MESSAGE_PAYLOAD_PREFIX.length)) as { text?: unknown; editOf?: unknown; attachments?: unknown };
-      if (typeof payload.text === "string") return { text: payload.text, editOf: typeof payload.editOf === "string" ? payload.editOf : undefined, attachments: Array.isArray(payload.attachments) ? payload.attachments.filter(isAttachment) : undefined };
+      if (typeof payload.text === "string") {
+        const rawAttachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+        const attachments = rawAttachments.filter(isAttachment);
+        return { text: payload.text, editOf: typeof payload.editOf === "string" ? payload.editOf : undefined, attachments: rawAttachments.length <= MAX_ATTACHMENTS && attachments.length === rawAttachments.length ? attachments : undefined };
+      }
     }
   } catch {
     // Keep malformed or legacy payloads as regular message text.
@@ -152,6 +174,20 @@ async function exportPublicKey(key: CryptoKey) {
   return crypto.subtle.exportKey("jwk", key);
 }
 
+async function makePrivateKeyNonExtractable(key: CryptoKey, algorithm: EcKeyImportParams, usages: KeyUsage[]) {
+  if (!key.extractable) return key;
+  const jwk = await crypto.subtle.exportKey("jwk", key);
+  return crypto.subtle.importKey("jwk", jwk, algorithm, false, usages);
+}
+
+async function hardenStoredDevice(device: StoredDevice) {
+  const encryptionPrivateKey = await makePrivateKeyNonExtractable(device.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
+  const signingPrivateKey = await makePrivateKeyNonExtractable(device.signingPrivateKey, SIGNATURE, ["sign"]);
+  return encryptionPrivateKey === device.encryptionPrivateKey && signingPrivateKey === device.signingPrivateKey
+    ? device
+    : { ...device, encryptionPrivateKey, signingPrivateKey };
+}
+
 async function generateDevice(profileId: string): Promise<StoredDevice> {
   const encryption = await crypto.subtle.generateKey(KEY_AGREEMENT, true, ["deriveBits"]);
   const signing = await crypto.subtle.generateKey(SIGNATURE, true, ["sign", "verify"]);
@@ -159,9 +195,9 @@ async function generateDevice(profileId: string): Promise<StoredDevice> {
     profileId,
     deviceId: crypto.randomUUID(),
     keyId: crypto.randomUUID(),
-    encryptionPrivateKey: encryption.privateKey,
+    encryptionPrivateKey: await makePrivateKeyNonExtractable(encryption.privateKey, KEY_AGREEMENT, ["deriveBits"]),
     encryptionPublicKey: await exportPublicKey(encryption.publicKey),
-    signingPrivateKey: signing.privateKey,
+    signingPrivateKey: await makePrivateKeyNonExtractable(signing.privateKey, SIGNATURE, ["sign"]),
     signingPublicKey: await exportPublicKey(signing.publicKey),
     createdAt: Date.now(),
   };
@@ -169,7 +205,11 @@ async function generateDevice(profileId: string): Promise<StoredDevice> {
 
 export async function ensureDeviceKeys(profileId: string) {
   const existing = await readStoredDevice(profileId);
-  if (existing) return existing;
+  if (existing) {
+    const hardened = await hardenStoredDevice(existing);
+    if (hardened !== existing) await writeStoredDevice(hardened);
+    return hardened;
+  }
   const created = await generateDevice(profileId);
   await writeStoredDevice(created);
   return created;
@@ -195,20 +235,34 @@ function accountJwks(privateBytes: Uint8Array) {
 
 export async function ensureAccountKey(profileId: string, password: string) {
   const existing = await readStoredAccount(profileId);
-  if (existing) return existing;
+  if (existing) {
+    const hardened = await makePrivateKeyNonExtractable(existing.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
+    if (hardened !== existing.encryptionPrivateKey) {
+      const migrated = { ...existing, encryptionPrivateKey: hardened };
+      await writeStoredAccount(migrated);
+      return migrated;
+    }
+    return existing;
+  }
   const jwks = accountJwks(accountPrivateBytes(profileId, password));
   const account: StoredAccount = {
     profileId,
     keyId: `account:${profileId}`,
-    encryptionPrivateKey: await crypto.subtle.importKey("jwk", jwks.privateKey, KEY_AGREEMENT, true, ["deriveBits"]),
+    encryptionPrivateKey: await crypto.subtle.importKey("jwk", jwks.privateKey, KEY_AGREEMENT, false, ["deriveBits"]),
     encryptionPublicKey: jwks.publicKey,
   };
   await writeStoredAccount(account);
   return account;
 }
 
-export function readAccountKey(profileId: string) {
-  return readStoredAccount(profileId);
+export async function readAccountKey(profileId: string) {
+  const existing = await readStoredAccount(profileId);
+  if (!existing) return undefined;
+  const hardened = await makePrivateKeyNonExtractable(existing.encryptionPrivateKey, KEY_AGREEMENT, ["deriveBits"]);
+  if (hardened === existing.encryptionPrivateKey) return existing;
+  const migrated = { ...existing, encryptionPrivateKey: hardened };
+  await writeStoredAccount(migrated);
+  return migrated;
 }
 
 export function accountKeyBundle(account: StoredAccount, address: string): PublicAccountKey {
@@ -235,25 +289,25 @@ export function deviceKeyBundle(device: StoredDevice): DeviceKeyBundle {
   };
 }
 
-function envelopeData(envelope: Omit<EncryptedEnvelope, "signature">) {
+function encryptedMessageData(encryptedMessage: Omit<EncryptedMessage, "signature">) {
   return JSON.stringify({
-    protocol: envelope.protocol,
-    message_id: envelope.message_id,
-    conversation_id: envelope.conversation_id,
-    sender: envelope.sender,
-    recipient: envelope.recipient,
-    sender_device: envelope.sender_device,
-    key_id: envelope.key_id,
-    created_at: envelope.created_at,
-    nonce: envelope.nonce,
-    ephemeral_public_key: envelope.ephemeral_public_key,
-    associated_data: envelope.associated_data,
-    ciphertext: envelope.ciphertext,
+    protocol: encryptedMessage.protocol,
+    message_id: encryptedMessage.message_id,
+    conversation_id: encryptedMessage.conversation_id,
+    sender: encryptedMessage.sender,
+    recipient: encryptedMessage.recipient,
+    sender_device: encryptedMessage.sender_device,
+    key_id: encryptedMessage.key_id,
+    created_at: encryptedMessage.created_at,
+    nonce: encryptedMessage.nonce,
+    ephemeral_public_key: encryptedMessage.ephemeral_public_key,
+    associated_data: encryptedMessage.associated_data,
+    ciphertext: encryptedMessage.ciphertext,
   });
 }
 
-function associatedData(envelope: Pick<EncryptedEnvelope, "protocol" | "message_id" | "conversation_id" | "sender" | "recipient" | "sender_device" | "key_id" | "created_at" | "nonce" | "ephemeral_public_key">) {
-  return bytesToBase64(encodeText(JSON.stringify(envelope)));
+function associatedData(encryptedMessage: Pick<EncryptedMessage, "protocol" | "message_id" | "conversation_id" | "sender" | "recipient" | "sender_device" | "key_id" | "created_at" | "nonce" | "ephemeral_public_key">) {
+  return bytesToBase64(encodeText(JSON.stringify(encryptedMessage)));
 }
 
 async function importEncryptionPublicKey(encoded: string) {
@@ -283,7 +337,7 @@ export async function encryptMessage(profile: Profile, conversationId: string, m
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const sender = `${profile.handle}@${profile.server.replace(/^https?:\/\//, "")}`;
   const recipientAddress = recipient.address;
-  const clearEnvelope: Omit<EncryptedEnvelope, "signature"> = {
+  const clearMessage: Omit<EncryptedMessage, "signature"> = {
     protocol: ENTER_PROTOCOL_VERSION,
     message_id: message.id,
     conversation_id: conversationId,
@@ -297,28 +351,28 @@ export async function encryptMessage(profile: Profile, conversationId: string, m
     associated_data: "",
     ciphertext: "",
   };
-  clearEnvelope.associated_data = associatedData(clearEnvelope);
+  clearMessage.associated_data = associatedData(clearMessage);
   const key = await deriveMessageKey(ephemeral.privateKey, await importEncryptionPublicKey(recipient.encryptionPublicKey), nonce, conversationId);
   const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce, additionalData: base64ToBytes(clearEnvelope.associated_data) },
+    { name: "AES-GCM", iv: nonce, additionalData: base64ToBytes(clearMessage.associated_data) },
     key,
     encodeText(encodeMessagePayload(message)),
   );
-  clearEnvelope.ciphertext = bytesToBase64(new Uint8Array(ciphertext));
+  clearMessage.ciphertext = bytesToBase64(new Uint8Array(ciphertext));
   const signature = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
     device.signingPrivateKey,
-    encodeText(envelopeData(clearEnvelope)),
+    encodeText(encryptedMessageData(clearMessage)),
   );
-  return { ...clearEnvelope, signature: bytesToBase64(new Uint8Array(signature)) } satisfies EncryptedEnvelope;
+  return { ...clearMessage, signature: bytesToBase64(new Uint8Array(signature)) } satisfies EncryptedMessage;
 }
 
-export async function decryptMessage(profile: Profile, envelope: EncryptedEnvelope, sender: PublicDeviceKey) {
+export async function decryptMessage(profile: Profile, encryptedMessage: EncryptedMessage, sender: PublicDeviceKey) {
   const device = await ensureDeviceKeys(profile.id);
   const account = await readStoredAccount(profile.id);
-  const privateKey = envelope.key_id === account?.keyId
+  const privateKey = encryptedMessage.key_id === account?.keyId
     ? account.encryptionPrivateKey
-    : envelope.key_id === device.keyId
+    : encryptedMessage.key_id === device.keyId
       ? device.encryptionPrivateKey
       : undefined;
   if (!privateKey) throw new Error("Ключ получателя не найден");
@@ -326,18 +380,18 @@ export async function decryptMessage(profile: Profile, envelope: EncryptedEnvelo
   const validSignature = await crypto.subtle.verify(
     { name: "ECDSA", hash: "SHA-256" },
     signingKey,
-    base64ToBytes(envelope.signature),
-    encodeText(envelopeData(envelope)),
+    base64ToBytes(encryptedMessage.signature),
+    encodeText(encryptedMessageData(encryptedMessage)),
   );
   if (!validSignature) throw new Error("Подпись сообщения недействительна");
 
-  const nonce = base64ToBytes(envelope.nonce);
-  const ephemeralPublicKey = await importEncryptionPublicKey(envelope.ephemeral_public_key);
-  const key = await deriveMessageKey(privateKey, ephemeralPublicKey, nonce, envelope.conversation_id);
+  const nonce = base64ToBytes(encryptedMessage.nonce);
+  const ephemeralPublicKey = await importEncryptionPublicKey(encryptedMessage.ephemeral_public_key);
+  const key = await deriveMessageKey(privateKey, ephemeralPublicKey, nonce, encryptedMessage.conversation_id);
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: nonce, additionalData: base64ToBytes(envelope.associated_data) },
+    { name: "AES-GCM", iv: nonce, additionalData: base64ToBytes(encryptedMessage.associated_data) },
     key,
-    base64ToBytes(envelope.ciphertext),
+    base64ToBytes(encryptedMessage.ciphertext),
   );
   return new TextDecoder().decode(plaintext);
 }
