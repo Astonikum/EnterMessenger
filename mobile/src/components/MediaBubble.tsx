@@ -4,10 +4,13 @@ import type { ReactNode } from "react";
 import { Alert, Image, Modal, PanResponder, Platform, Pressable, Share, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { ResizeMode, Video, type AVPlaybackStatus } from "expo-av";
 import * as FileSystem from "expo-file-system";
+import * as MediaLibrary from "expo-media-library";
+import * as Network from "expo-network";
 import { fromByteArray } from "base64-js";
 import { downloadMedia } from "../rn-api";
 import { decryptMedia } from "../media";
 import type { MessageAttachment, Profile } from "../types";
+import type { MobileSettings } from "../settings";
 import { colors, fonts, radii } from "../theme";
 import { friendlyError } from "../client-errors";
 import { Icon } from "./Icon";
@@ -38,12 +41,18 @@ function extensionFor(attachment: MessageAttachment) {
 
 const DOWNLOAD_DIRECTORY_KEY = "enter-download-directory";
 
-async function saveNativeFile(uri: string, attachment: MessageAttachment) {
+async function saveNativeFile(uri: string, attachment: MessageAttachment, toGallery = false) {
   if (Platform.OS === "web") {
     const link = document.createElement("a");
     link.href = uri;
     link.download = attachment.name;
     link.click();
+    return;
+  }
+  if (toGallery && (attachment.kind === "image" || attachment.kind === "video")) {
+    const permission = await MediaLibrary.requestPermissionsAsync(true);
+    if (!permission.granted) throw new Error("Доступ к галерее не предоставлен");
+    await MediaLibrary.createAssetAsync(uri);
     return;
   }
   if (Platform.OS === "android") {
@@ -71,6 +80,19 @@ function saveWithFeedback(uri: string, attachment: MessageAttachment) {
   void saveNativeFile(uri, attachment).catch((reason) => {
     Alert.alert("Не удалось сохранить файл", friendlyError(reason, "Попробуйте ещё раз"));
   });
+}
+
+type MediaSettings = MobileSettings["media"];
+
+function mediaLimitBytes(attachment: MessageAttachment, settings: MediaSettings) {
+  const limitMb = attachment.kind === "image" ? settings.autoDownload.photoLimitMb : attachment.kind === "video" ? settings.autoDownload.videoLimitMb : settings.autoDownload.fileLimitMb;
+  return limitMb * 1024 * 1024;
+}
+
+function autoDownloadAllowed(attachment: MessageAttachment, settings: MediaSettings | undefined, network: "wifi" | "cellular" | "other") {
+  if (!settings) return true;
+  const networkAllowed = network === "cellular" ? settings.autoDownload.cellular : network === "wifi" ? settings.autoDownload.wifi : true;
+  return networkAllowed && attachment.size <= mediaLimitBytes(attachment, settings);
 }
 
 function touchDistance(touches: readonly { pageX: number; pageY: number }[]) {
@@ -210,10 +232,32 @@ function MediaViewer({ uri, attachment, onClose }: { uri: string; attachment: Me
   </View></Modal>;
 }
 
-export function MediaBubble({ profile, attachment, grouped = false, captioned = false, outgoing = false, onAttachmentLongPress }: { profile: Profile; attachment: MessageAttachment; grouped?: boolean; captioned?: boolean; outgoing?: boolean; onAttachmentLongPress?: (attachment: MessageAttachment, save: () => void) => void }) {
+export function MediaBubble({ profile, attachment, grouped = false, captioned = false, outgoing = false, mediaSettings, energySavingActive = false, onAttachmentLongPress }: { profile: Profile; attachment: MessageAttachment; grouped?: boolean; captioned?: boolean; outgoing?: boolean; mediaSettings?: MediaSettings; energySavingActive?: boolean; onAttachmentLongPress?: (attachment: MessageAttachment, save: () => void) => void }) {
   const [uri, setUri] = useState<string>();
   const [error, setError] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [manualDownload, setManualDownload] = useState(false);
+  const [network, setNetwork] = useState<"wifi" | "cellular" | "other">("other");
+  const gallerySaved = useRef(false);
+
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    let mounted = true;
+    const applyNetwork = (state: Network.NetworkState) => {
+      if (!mounted) return;
+      setNetwork(state.type === Network.NetworkStateType.WIFI ? "wifi" : state.type === Network.NetworkStateType.CELLULAR ? "cellular" : "other");
+    };
+    void Network.getNetworkStateAsync().then(applyNetwork).catch(() => undefined);
+    const subscription = Network.addNetworkStateListener(applyNetwork);
+    return () => { mounted = false; subscription.remove(); };
+  }, []);
+
+  const shouldDownload = manualDownload || autoDownloadAllowed(attachment, mediaSettings, network);
+
+  useEffect(() => {
+    setManualDownload(false);
+    gallerySaved.current = false;
+  }, [attachment.id]);
 
   function openActions(event: { stopPropagation?: () => void }) {
     event.stopPropagation?.();
@@ -225,6 +269,7 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
     let objectUrl: string | undefined;
     setUri(undefined);
     setError(false);
+    if (!shouldDownload) return () => { disposed = true; };
     void downloadMedia(profile, attachment.id)
       .then((ciphertext) => decryptMedia(ciphertext, attachment))
       .then(async (plaintext) => {
@@ -238,27 +283,32 @@ export function MediaBubble({ profile, attachment, grouped = false, captioned = 
         if (!directory) throw new Error("Кэш файлов недоступен");
         const path = `${directory}enter-${attachment.id}.${extensionFor(attachment)}`;
         await FileSystem.writeAsStringAsync(path, fromByteArray(plaintext), { encoding: FileSystem.EncodingType.Base64 });
+        if (!gallerySaved.current && mediaSettings?.saveToGallery.privateChats && (attachment.kind === "image" || attachment.kind === "video")) {
+          gallerySaved.current = true;
+          await saveNativeFile(path, attachment, true).catch(() => undefined);
+        }
         if (!disposed) setUri(path);
       })
       .catch(() => { if (!disposed) setError(true); });
     return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [attachment.id, attachment.kind, attachment.key, attachment.mimeType, attachment.name, attachment.nonce, attachment.sha256, attachment.size, profile.id, profile.server, profile.token]);
+  }, [attachment.id, attachment.kind, attachment.key, attachment.mimeType, attachment.name, attachment.nonce, attachment.sha256, attachment.size, mediaSettings?.autoDownload.cellular, mediaSettings?.autoDownload.fileLimitMb, mediaSettings?.autoDownload.photoLimitMb, mediaSettings?.autoDownload.roaming, mediaSettings?.autoDownload.videoLimitMb, mediaSettings?.saveToGallery.privateChats, network, profile.id, profile.server, profile.token, shouldDownload]);
 
   if (error) return <View style={grouped ? styles.groupError : styles.error}><Icon name="error" size={16} color={colors.danger} />{!grouped && <Text style={styles.errorText}>Не удалось загрузить вложение</Text>}</View>;
+  if (!uri && !shouldDownload) return <Pressable onPress={() => setManualDownload(true)} style={grouped ? styles.groupLoading : styles.loading}><Icon name="download" size={17} color={colors.primary} />{!grouped && <Text style={styles.loadingText}>Загрузить медиа</Text>}</Pressable>;
   if (!uri) return <View style={grouped ? styles.groupLoading : styles.loading}><Icon name="attach" size={17} color={colors.primary} />{!grouped && <Text style={styles.loadingText}>Загрузка вложения…</Text>}</View>;
   const longPress = onAttachmentLongPress ? openActions : undefined;
   if (attachment.kind === "image") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupImageButton : styles.imageButton, captioned && styles.captionedMedia]}><Image source={{ uri }} onError={() => setError(true)} style={grouped ? styles.groupImage : styles.image} resizeMode="cover" /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} onError={() => setError(true)} resizeMode={ResizeMode.CONTAIN} style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (attachment.kind === "video") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[grouped ? styles.groupVideoButton : styles.videoButton, captioned && styles.captionedMedia]}><Video source={{ uri }} onError={() => setError(true)} resizeMode={ResizeMode.CONTAIN} shouldPlay={Boolean(mediaSettings?.autoplayVideo && !energySavingActive)} style={grouped ? styles.groupVideo : styles.video} /></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   if (attachment.kind === "audio") return <><Pressable onPress={() => setViewerOpen(true)} onLongPress={longPress} style={[styles.audioButton, grouped && styles.groupAudioButton, outgoing && styles.outgoingMedia]}><Icon name="mic" size={20} color={outgoing ? colors.primaryText : colors.primary} /><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>Аудио · {formatFileSize(attachment.size)}</Text></View></Pressable>{viewerOpen && <MediaViewer uri={uri} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
   return <Pressable style={({ pressed }) => [styles.file, grouped && styles.groupFile, outgoing && styles.outgoingMedia, pressed && styles.pressed]} onPress={() => saveWithFeedback(uri, attachment)} onLongPress={longPress}><View style={[styles.fileIcon, outgoing && styles.outgoingFileIcon]}><Icon name="attach" size={19} color={outgoing ? colors.primaryText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, outgoing && styles.outgoingFileName]} numberOfLines={1}>{attachment.name}</Text><Text style={[styles.fileMeta, outgoing && styles.outgoingFileMeta]}>{formatFileSize(attachment.size)} · сохранить</Text></View><Icon name="share" size={18} color={outgoing ? colors.primaryText : colors.muted} /></Pressable>;
 }
 
-export function MediaGroup({ profile, attachments, overlay, captioned = false, outgoing = false, onAttachmentLongPress }: { profile: Profile; attachments: MessageAttachment[]; overlay?: ReactNode; captioned?: boolean; outgoing?: boolean; onAttachmentLongPress?: (attachment: MessageAttachment, save: () => void) => void }) {
+export function MediaGroup({ profile, attachments, overlay, captioned = false, outgoing = false, mediaSettings, energySavingActive = false, onAttachmentLongPress }: { profile: Profile; attachments: MessageAttachment[]; overlay?: ReactNode; captioned?: boolean; outgoing?: boolean; mediaSettings?: MediaSettings; energySavingActive?: boolean; onAttachmentLongPress?: (attachment: MessageAttachment, save: () => void) => void }) {
   const content = attachments.length === 1
-    ? <MediaBubble profile={profile} attachment={attachments[0]} captioned={captioned} outgoing={outgoing} onAttachmentLongPress={onAttachmentLongPress} />
+    ? <MediaBubble profile={profile} attachment={attachments[0]} captioned={captioned} outgoing={outgoing} mediaSettings={mediaSettings} energySavingActive={energySavingActive} onAttachmentLongPress={onAttachmentLongPress} />
     : attachments.length === 3
-      ? <View style={[styles.mediaGridThree, captioned && styles.mediaGridCaptioned]}><View style={[styles.mediaGridTall, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[0]} grouped outgoing={outgoing} onAttachmentLongPress={onAttachmentLongPress} /></View><View style={styles.mediaGridSide}><View style={[styles.mediaGridSideCell, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[1]} grouped outgoing={outgoing} onAttachmentLongPress={onAttachmentLongPress} /></View><View style={[styles.mediaGridSideCell, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[2]} grouped outgoing={outgoing} onAttachmentLongPress={onAttachmentLongPress} /></View></View></View>
-      : <View style={[styles.mediaGrid, captioned && styles.mediaGridCaptioned]}>{attachments.map((attachment) => <View key={attachment.id} style={[styles.mediaGridCell, captioned && styles.mediaGridFlatCell, { width: attachments.length >= 6 ? "32%" : "49%" }]}><MediaBubble profile={profile} attachment={attachment} grouped outgoing={outgoing} onAttachmentLongPress={onAttachmentLongPress} /></View>)}</View>;
+      ? <View style={[styles.mediaGridThree, captioned && styles.mediaGridCaptioned]}><View style={[styles.mediaGridTall, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[0]} grouped outgoing={outgoing} mediaSettings={mediaSettings} energySavingActive={energySavingActive} onAttachmentLongPress={onAttachmentLongPress} /></View><View style={styles.mediaGridSide}><View style={[styles.mediaGridSideCell, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[1]} grouped outgoing={outgoing} mediaSettings={mediaSettings} energySavingActive={energySavingActive} onAttachmentLongPress={onAttachmentLongPress} /></View><View style={[styles.mediaGridSideCell, captioned && styles.mediaGridFlatCell]}><MediaBubble profile={profile} attachment={attachments[2]} grouped outgoing={outgoing} mediaSettings={mediaSettings} energySavingActive={energySavingActive} onAttachmentLongPress={onAttachmentLongPress} /></View></View></View>
+      : <View style={[styles.mediaGrid, captioned && styles.mediaGridCaptioned]}>{attachments.map((attachment) => <View key={attachment.id} style={[styles.mediaGridCell, captioned && styles.mediaGridFlatCell, { width: attachments.length >= 6 ? "32%" : "49%" }]}><MediaBubble profile={profile} attachment={attachment} grouped outgoing={outgoing} mediaSettings={mediaSettings} energySavingActive={energySavingActive} onAttachmentLongPress={onAttachmentLongPress} /></View>)}</View>;
   return <View style={styles.mediaGroupWrap}>{content}{overlay}</View>;
 }
 

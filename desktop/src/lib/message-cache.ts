@@ -1,12 +1,16 @@
 import type { Conversation, Message } from "../types";
+import type { CachePolicy } from "./local-settings";
 
 const CACHE_VERSION = 2;
 export const MESSAGE_CACHE_KEY_PREFIX = "enter-message-cache:";
 const CACHE_DATABASE_NAME = "enter-cache";
 const CACHE_DATABASE_VERSION = 1;
 const CACHE_STORE = "profiles";
-const MAX_MESSAGES_PER_CONVERSATION = 200;
-const MAX_MESSAGES_TOTAL = 1000;
+const CACHE_LIMITS: Record<CachePolicy, { perConversation: number; total: number }> = {
+  standard: { perConversation: 200, total: 1000 },
+  minimal: { perConversation: 50, total: 250 },
+  disabled: { perConversation: 0, total: 0 },
+};
 
 type MessageCachePayload = {
   version: typeof CACHE_VERSION;
@@ -47,12 +51,12 @@ function isConversation(value: unknown): value is Conversation {
     && typeof conversation.time === "string";
 }
 
-function limitMessages(messages: Record<string, Message[]>) {
+function limitMessages(messages: Record<string, Message[]>, policy: CachePolicy) {
   const limited: Record<string, Message[]> = {};
-  let remaining = MAX_MESSAGES_TOTAL;
+  let remaining = CACHE_LIMITS[policy].total;
 
   for (const [conversationId, conversationMessages] of Object.entries(messages)) {
-    const recent = conversationMessages.slice(-MAX_MESSAGES_PER_CONVERSATION);
+    const recent = conversationMessages.slice(-CACHE_LIMITS[policy].perConversation);
     const allowed = Math.min(remaining, recent.length);
     limited[conversationId] = allowed > 0 ? recent.slice(-allowed) : [];
     remaining -= allowed;
@@ -62,27 +66,28 @@ function limitMessages(messages: Record<string, Message[]>) {
   return limited;
 }
 
-function exceedsCacheLimits(messages: Record<string, Message[]>) {
+function exceedsCacheLimits(messages: Record<string, Message[]>, policy: CachePolicy) {
+  const limits = CACHE_LIMITS[policy];
   let total = 0;
   for (const conversationMessages of Object.values(messages)) {
-    if (conversationMessages.length > MAX_MESSAGES_PER_CONVERSATION) return true;
+    if (conversationMessages.length > limits.perConversation) return true;
     total += conversationMessages.length;
-    if (total > MAX_MESSAGES_TOTAL) return true;
+    if (total > limits.total) return true;
   }
   return false;
 }
 
-function parseCache(value: unknown, limit = true): MessageCache | null {
+function parseCache(value: unknown, policy: CachePolicy, limit = true): MessageCache | null {
   if (!value || typeof value !== "object") return null;
   const payload = value as Partial<MessageCachePayload>;
   if (![1, CACHE_VERSION].includes(payload.version as number) || !payload.messages || typeof payload.messages !== "object") return null;
 
   const messages = Object.fromEntries(Object.entries(payload.messages).map(([conversationId, conversationMessages]) => [conversationId, Array.isArray(conversationMessages) ? conversationMessages.filter(isMessage) : []]));
   const conversations = Array.isArray(payload.conversations) ? payload.conversations.filter(isConversation).map((conversation) => ({ ...conversation, online: conversation.handle === "official" ? true : conversation.online })) : undefined;
-  const overLimit = exceedsCacheLimits(messages);
+  const overLimit = exceedsCacheLimits(messages, policy);
   return {
     cursor: overLimit ? 0 : typeof payload.cursor === "number" && payload.cursor >= 0 ? payload.cursor : 0,
-    messages: limit ? limitMessages(messages) : messages,
+    messages: limit ? limitMessages(messages, policy) : messages,
     conversations,
     updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : undefined,
   };
@@ -147,24 +152,26 @@ function deleteIndexedCache(profileId: string) {
   });
 }
 
-export function readMessageCache(profileId: string | null | undefined): MessageCache | null {
+export function readMessageCache(profileId: string | null | undefined, policy: CachePolicy = "standard"): MessageCache | null {
   if (!profileId) return null;
+  if (policy === "disabled") return null;
 
   try {
     const raw = localStorage.getItem(cacheKey(profileId));
     if (!raw) return null;
-    return parseCache(JSON.parse(raw));
+    return parseCache(JSON.parse(raw), policy);
   } catch {
     return null;
   }
 }
 
-export async function readMessageCacheAsync(profileId: string | null | undefined): Promise<MessageCache | null> {
+export async function readMessageCacheAsync(profileId: string | null | undefined, policy: CachePolicy = "standard"): Promise<MessageCache | null> {
   if (!profileId) return null;
-  const local = readMessageCache(profileId);
+  if (policy === "disabled") return null;
+  const local = readMessageCache(profileId, policy);
   try {
     const stored = await readIndexedCache(profileId);
-    const indexed = stored ? parseCache(stored) : null;
+    const indexed = stored ? parseCache(stored, policy) : null;
     if ((indexed?.updatedAt ?? 0) >= (local?.updatedAt ?? 0)) return indexed ?? local;
   } catch {
     // IndexedDB is an enhancement; the synchronous local cache remains the fallback.
@@ -172,13 +179,17 @@ export async function readMessageCacheAsync(profileId: string | null | undefined
   return local;
 }
 
-export function writeMessageCache(profileId: string, messages: Record<string, Message[]>, cursor = 0, conversations?: Conversation[]) {
-  const truncated = exceedsCacheLimits(messages);
+export function writeMessageCache(profileId: string, messages: Record<string, Message[]>, cursor = 0, conversations?: Conversation[], policy: CachePolicy = "standard") {
+  if (policy === "disabled") {
+    clearMessageCache(profileId);
+    return Date.now();
+  }
+  const truncated = exceedsCacheLimits(messages, policy);
   const payload: MessageCachePayload = {
     version: CACHE_VERSION,
     updatedAt: Date.now(),
     cursor: truncated ? 0 : cursor,
-    messages: limitMessages(messages),
+    messages: limitMessages(messages, policy),
     conversations,
   };
 

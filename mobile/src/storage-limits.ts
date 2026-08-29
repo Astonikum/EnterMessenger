@@ -1,8 +1,14 @@
 import type { EncryptedMessage } from "./protocol";
 import type { Message, MessageAttachment, OutboxEntry } from "./types";
+import type { CachePolicy } from "./settings";
 
-export const MAX_CACHED_MESSAGES_PER_CONVERSATION = 500;
-export const MAX_CACHED_MESSAGES_PER_PROFILE = 5_000;
+const CACHE_LIMITS: Record<CachePolicy, { perConversation: number; perProfile: number }> = {
+  standard: { perConversation: 500, perProfile: 5_000 },
+  minimal: { perConversation: 50, perProfile: 500 },
+  disabled: { perConversation: 0, perProfile: 0 },
+};
+export const MAX_CACHED_MESSAGES_PER_CONVERSATION = CACHE_LIMITS.standard.perConversation;
+export const MAX_CACHED_MESSAGES_PER_PROFILE = CACHE_LIMITS.standard.perProfile;
 export const MAX_OUTBOX_ENTRIES = 100;
 export const MAX_OUTBOX_ATTEMPTS = 8;
 
@@ -44,18 +50,20 @@ function isCachedMessage(value: unknown): value is Message {
     && (value.attachments === undefined || (Array.isArray(value.attachments) && value.attachments.every(isAttachment)));
 }
 
-export function limitMessageList(messages: Message[]) {
-  return messages.length > MAX_CACHED_MESSAGES_PER_CONVERSATION
-    ? messages.slice(-MAX_CACHED_MESSAGES_PER_CONVERSATION)
+export function limitMessageList(messages: Message[], policy: CachePolicy = "standard") {
+  const limit = CACHE_LIMITS[policy].perConversation;
+  return messages.length > limit
+    ? messages.slice(-limit)
     : messages;
 }
 
-export function limitMessagesByProfile(value: Record<string, Record<string, Message[]>>) {
+export function limitMessagesByProfile(value: Record<string, Record<string, Message[]>>, policy: CachePolicy = "standard") {
+  if (policy === "disabled") return {};
   return Object.fromEntries(Object.entries(value).map(([profileId, conversations]) => {
-    let remaining = MAX_CACHED_MESSAGES_PER_PROFILE;
+    let remaining = CACHE_LIMITS[policy].perProfile;
     const kept = Object.entries(conversations).reverse().flatMap(([conversationId, messages]) => {
       if (remaining <= 0) return [];
-      const limited = limitMessageList(messages).slice(-remaining);
+      const limited = limitMessageList(messages, policy).slice(-remaining);
       remaining -= limited.length;
       return [[conversationId, limited] as const];
     }).reverse();
@@ -63,7 +71,8 @@ export function limitMessagesByProfile(value: Record<string, Record<string, Mess
   }));
 }
 
-export function sanitizeMessagesByProfile(value: unknown): Record<string, Record<string, Message[]>> {
+export function sanitizeMessagesByProfile(value: unknown, policy: CachePolicy = "standard"): Record<string, Record<string, Message[]>> {
+  if (policy === "disabled") return {};
   if (!isRecord(value)) return {};
   const parsed = Object.fromEntries(Object.entries(value).map(([profileId, conversations]) => {
     if (!isRecord(conversations)) return [profileId, {}] as const;
@@ -73,7 +82,7 @@ export function sanitizeMessagesByProfile(value: unknown): Record<string, Record
     ]));
     return [profileId, validConversations] as const;
   }));
-  return limitMessagesByProfile(parsed);
+  return limitMessagesByProfile(parsed, policy);
 }
 
 export function sanitizeSyncCursors(value: unknown): Record<string, number> {

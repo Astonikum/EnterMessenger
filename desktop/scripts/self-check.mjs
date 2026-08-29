@@ -13,7 +13,7 @@ globalThis.localStorage = {
 globalThis.window = globalThis;
 
 assert.deepEqual(readLocalSettings(), DEFAULT_LOCAL_SETTINGS);
-const customSettings = { ...DEFAULT_LOCAL_SETTINGS, theme: "light", fontScale: 1.1, density: "compact", accent: "blue", locale: "en", notifications: { desktop: false, sound: true, preview: false }, cachePolicy: "minimal" };
+const customSettings = { ...DEFAULT_LOCAL_SETTINGS, theme: "light", fontScale: 1.1, density: "compact", accent: "blue", locale: "en", notifications: { ...DEFAULT_LOCAL_SETTINGS.notifications, desktop: false, sound: true, preview: false }, cachePolicy: "minimal" };
 writeLocalSettings(customSettings);
 assert.deepEqual(readLocalSettings(), customSettings);
 globalThis.matchMedia = () => ({ matches: true });

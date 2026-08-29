@@ -56,7 +56,7 @@ async function saveAs(url: string, attachment: MessageAttachment) {
   }
 }
 
-function MediaViewer({ url, attachment, onClose }: { url: string; attachment: MessageAttachment; onClose: () => void }) {
+function MediaViewer({ url, attachment, onClose, autoplay = false }: { url: string; attachment: MessageAttachment; onClose: () => void; autoplay?: boolean }) {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const [rotation, setRotation] = useState(0);
   const [zoom, setZoom] = useState(1);
@@ -150,7 +150,7 @@ function MediaViewer({ url, attachment, onClose }: { url: string; attachment: Me
   const content = attachment.kind === "image"
       ? <img src={url} alt={attachment.name} onLoad={(event) => setMediaSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
       : attachment.kind === "video"
-      ? <video ref={(node) => { mediaRef.current = node; }} src={url} playsInline onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setMediaSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight }); playMedia(event.currentTarget); }} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
+      ? <video ref={(node) => { mediaRef.current = node; }} src={url} playsInline onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setMediaSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight }); if (autoplay) playMedia(event.currentTarget); }} className="block max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-200" style={{ transform: `rotate(${rotation}deg) scale(${zoom})` }} />
       : <div className="flex w-[min(36rem,80vw)] flex-col items-center gap-3 rounded-3xl bg-white/10 px-8 py-10 text-center backdrop-blur-xl"><div className="grid size-16 place-items-center rounded-2xl bg-white/10"><Icon name="mic" className="size-8 text-white/80" /></div><p className="max-w-full truncate text-sm font-medium text-white">{attachment.name}</p><audio ref={(node) => { mediaRef.current = node; }} src={url} onPlay={() => { setPlaybackError(false); setPlaying(true); }} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} onError={() => { setPlaying(false); setPlaybackError(true); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); playMedia(event.currentTarget); }} className="sr-only" /></div>;
   const mediaKind = attachment.kind === "image" ? "Фото" : attachment.kind === "video" ? "Видео" : "Аудио";
   return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -250,10 +250,11 @@ function AudioBubble({ attachment, url, grouped, className, contextProps }: { at
   </div>;
 }
 
-export function MediaBubble({ profile, attachment, grouped = false, className, onAttachmentContextMenu }: { profile?: Profile; attachment: MessageAttachment; grouped?: boolean; className?: string; onAttachmentContextMenu?: (attachment: MessageAttachment, actions: MediaContextActions) => void }) {
+export function MediaBubble({ profile, attachment, grouped = false, className, autoDownload = true, autoplayVideo = false, onAttachmentContextMenu }: { profile?: Profile; attachment: MessageAttachment; grouped?: boolean; className?: string; autoDownload?: boolean; autoplayVideo?: boolean; onAttachmentContextMenu?: (attachment: MessageAttachment, actions: MediaContextActions) => void }) {
   const [url, setUrl] = useState<string>();
   const [error, setError] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [manualDownload, setManualDownload] = useState(false);
   const profileKey = profile ? `${profile.id}:${profile.server}:${profile.token}` : "";
 
   useEffect(() => {
@@ -262,6 +263,7 @@ export function MediaBubble({ profile, attachment, grouped = false, className, o
     let objectUrl: string | undefined;
     setUrl(undefined);
     setError(false);
+    if (!autoDownload && !manualDownload) return () => undefined;
     if (!profile) return () => undefined;
     void downloadMedia(profile, attachment.id, controller.signal)
       .then((ciphertext) => decryptMedia(ciphertext, attachment))
@@ -272,13 +274,14 @@ export function MediaBubble({ profile, attachment, grouped = false, className, o
       })
       .catch(() => { if (!disposed) setError(true); });
     return () => { disposed = true; controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [attachment.id, attachment.key, attachment.nonce, attachment.sha256, attachment.mimeType, profileKey]);
+  }, [attachment.id, attachment.key, attachment.nonce, attachment.sha256, attachment.mimeType, autoDownload, manualDownload, profileKey]);
 
   if (error) return <div className={cn("rounded-xl border border-destructive/30 bg-background/20 px-3 py-2 text-xs", className)}>Не удалось загрузить вложение</div>;
+  if (!url && !autoDownload && !manualDownload) return <Button type="button" variant="ghost" className={cn("min-h-16 min-w-44 rounded-xl bg-background/15 px-3 py-2 text-xs text-current/80 hover:bg-background/25", grouped && "h-full min-w-0", className)} onClick={() => setManualDownload(true)}><Icon name="download" className="size-4" />Загрузить медиа</Button>;
   if (!url) return <div className={cn("flex min-h-16 min-w-44 items-center gap-2 rounded-xl bg-background/15 px-3 py-2 text-xs text-current/70", grouped && "h-full min-w-0 justify-center", className)}><Icon name="progress_activity" className="size-4 animate-spin" />{!grouped && "Загрузка вложения…"}</div>;
   const contextProps = { "data-attachment-context": "true", onContextMenu: () => onAttachmentContextMenu?.(attachment, { save: () => downloadObjectUrl(url, attachment.name), saveAs: () => void saveAs(url, attachment) }) };
   if (attachment.kind === "image") return <><button type="button" {...contextProps} className={cn("block overflow-hidden rounded-xl p-0", grouped && "h-full", className)} onClick={() => setViewerOpen(true)} aria-label={`Открыть ${attachment.name}`}><img src={url} alt={attachment.name} className={grouped ? "size-full object-cover" : "max-h-80 max-w-full object-cover"} /></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
-  if (attachment.kind === "video") return <><button type="button" {...contextProps} className={cn("relative block overflow-hidden rounded-xl bg-black p-0", grouped && "h-full", className)} onClick={() => setViewerOpen(true)} aria-label={`Открыть ${attachment.name}`}><video src={url} muted playsInline preload="metadata" className={cn("pointer-events-none", grouped ? "size-full object-cover" : "max-h-80 max-w-full object-contain")} /><span className="pointer-events-none absolute inset-0 grid place-items-center text-3xl text-white/90 drop-shadow">▶</span></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} onClose={() => setViewerOpen(false)} />}</>;
+  if (attachment.kind === "video") return <><button type="button" {...contextProps} className={cn("relative block overflow-hidden rounded-xl bg-black p-0", grouped && "h-full", className)} onClick={() => setViewerOpen(true)} aria-label={`Открыть ${attachment.name}`}><video src={url} muted playsInline preload="metadata" autoPlay={autoplayVideo} className={cn("pointer-events-none", grouped ? "size-full object-cover" : "max-h-80 max-w-full object-contain")} /><span className="pointer-events-none absolute inset-0 grid place-items-center text-3xl text-white/90 drop-shadow">▶</span></button>{viewerOpen && <MediaViewer url={url} attachment={attachment} autoplay={autoplayVideo} onClose={() => setViewerOpen(false)} />}</>;
   if (isAudioAttachment(attachment)) return <AudioBubble attachment={attachment} url={url} grouped={grouped} className={className} contextProps={contextProps} />;
   return <a href={url} download={attachment.name} {...contextProps} className={cn("flex min-w-52 items-center gap-3 rounded-xl bg-background/15 px-3 py-2.5 transition-colors hover:bg-background/25", grouped && "h-full min-w-0 px-2", className)}><span className="grid size-9 shrink-0 place-items-center rounded-lg bg-background/20"><Icon name="attach_file" className="size-4" /></span><span className="min-w-0"><span className="block truncate text-sm font-medium">{attachment.name}</span><span className="block text-xs opacity-65">{formatFileSize(attachment.size)}</span></span></a>;
 }
@@ -289,10 +292,10 @@ function mediaGridClass(count: number) {
   return "grid-cols-2";
 }
 
-export function MediaGroup({ profile, attachments, overlay, captioned = false, onAttachmentContextMenu }: { profile?: Profile; attachments: MessageAttachment[]; overlay?: ReactNode; captioned?: boolean; onAttachmentContextMenu?: (attachment: MessageAttachment, actions: MediaContextActions) => void }) {
+export function MediaGroup({ profile, attachments, overlay, captioned = false, autoDownload = true, autoplayVideo = false, onAttachmentContextMenu }: { profile?: Profile; attachments: MessageAttachment[]; overlay?: ReactNode; captioned?: boolean; autoDownload?: boolean; autoplayVideo?: boolean; onAttachmentContextMenu?: (attachment: MessageAttachment, actions: MediaContextActions) => void }) {
   const rounding = captioned ? "rounded-t-xl rounded-b-none" : "rounded-xl";
   const content = attachments.length === 1
-    ? <MediaBubble profile={profile} attachment={attachments[0]} className={rounding} onAttachmentContextMenu={onAttachmentContextMenu} />
-    : <div className={cn("grid min-w-0 gap-0.5 overflow-hidden", rounding, mediaGridClass(attachments.length), attachments.length === 3 ? "auto-rows-[5.5rem]" : "auto-rows-[7rem]")}>{attachments.map((attachment, index) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} grouped className={cn("rounded-none", attachments.length === 3 && index === 0 ? "row-span-2" : undefined)} onAttachmentContextMenu={onAttachmentContextMenu} />)}</div>;
+    ? <MediaBubble profile={profile} attachment={attachments[0]} autoDownload={autoDownload} autoplayVideo={autoplayVideo} className={rounding} onAttachmentContextMenu={onAttachmentContextMenu} />
+    : <div className={cn("grid min-w-0 gap-0.5 overflow-hidden", rounding, mediaGridClass(attachments.length), attachments.length === 3 ? "auto-rows-[5.5rem]" : "auto-rows-[7rem]")}>{attachments.map((attachment, index) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} autoDownload={autoDownload} autoplayVideo={autoplayVideo} grouped className={cn("rounded-none", attachments.length === 3 && index === 0 ? "row-span-2" : undefined)} onAttachmentContextMenu={onAttachmentContextMenu} />)}</div>;
   return <div className="relative min-w-0">{content}{overlay}</div>;
 }

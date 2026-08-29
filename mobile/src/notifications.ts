@@ -9,28 +9,38 @@ Notifications.setNotificationHandler({
   },
 });
 
-export async function configureNotifications() {
-  if (Platform.OS === "web") return;
-  try {
+let notificationSetup: Promise<boolean> | null = null;
+
+export function configureNotifications(): Promise<boolean> {
+  if (Platform.OS === "web") return Promise.resolve(false);
+  if (notificationSetup) return notificationSetup;
+  notificationSetup = (async () => {
     if (Platform.OS === "android") {
-      await Notifications.setNotificationChannelAsync("messages", {
-        name: "Сообщения",
-        importance: Notifications.AndroidImportance.HIGH,
-        vibrationPattern: [0, 250, 250, 250],
-        sound: "default",
-      });
+      try {
+        await Notifications.setNotificationChannelAsync("messages", {
+          name: "Сообщения",
+          importance: Notifications.AndroidImportance.HIGH,
+          vibrationPattern: [0, 250, 250, 250],
+          sound: "default",
+        });
+      } catch {
+        // A channel failure must not prevent permission/token setup.
+      }
     }
-    const permissions = await Notifications.getPermissionsAsync();
-    if (permissions.status !== "granted") await Notifications.requestPermissionsAsync();
-  } catch {
-    // Notification support is optional in Expo web and preview runtimes.
-  }
+    try {
+      const permissions = await Notifications.getPermissionsAsync();
+      if (permissions.status === "granted") return true;
+      return (await Notifications.requestPermissionsAsync()).status === "granted";
+    } catch {
+      return false;
+    }
+  })();
+  return notificationSetup;
 }
 
 export async function registerForPushNotifications() {
   if (Platform.OS === "web") return null;
-  const permissions = await Notifications.getPermissionsAsync();
-  if (permissions.status !== "granted") return null;
+  if (!(await configureNotifications())) return null;
   try {
     return (await Notifications.getExpoPushTokenAsync()).data;
   } catch {
@@ -47,12 +57,13 @@ export async function notifyIncomingMessage(input: {
 }) {
   try {
     const settings = await readSettings();
-    if (!settings.notifications.desktop) return;
+    if (!settings.notifications.desktop || !settings.notifications.allAccounts || !settings.notifications.privateChats) return;
     await Notifications.scheduleNotificationAsync({
       content: {
         title: input.title,
-        body: settings.notifications.preview ? input.text : "Новое сообщение",
-        sound: settings.notifications.sound ? "default" : undefined,
+        body: settings.notifications.preview && settings.notifications.inAppPreview ? input.text : "Новое сообщение",
+        sound: settings.notifications.sound && settings.notifications.inAppSound ? "default" : undefined,
+        badge: settings.notifications.showCounter ? 1 : undefined,
         data: { local: true, sound: settings.notifications.sound, profileId: input.profileId, conversationId: input.conversationId, messageId: input.messageId },
       },
       trigger: Platform.OS === "android" ? { channelId: "messages", seconds: 1 } : null,

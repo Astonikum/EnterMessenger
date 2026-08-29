@@ -70,7 +70,13 @@ assert.deepEqual(normalizeSettings(JSON.parse("{\"theme\":\"neon\",\"textSize\":
   density: "comfortable",
   accent: "violet",
   locale: "en",
-  notifications: { desktop: true, preview: false, sound: true },
+  messageTextSize: 16,
+  bubbleRadius: 17,
+  chatListLayout: "two-line",
+  notifications: { ...DEFAULT_SETTINGS.notifications, preview: false, sound: true },
+  media: DEFAULT_SETTINGS.media,
+  proxy: DEFAULT_SETTINGS.proxy,
+  energySaving: DEFAULT_SETTINGS.energySaving,
   cachePolicy: "standard",
 });
 assert.deepEqual(normalizeSettings({ cache: { retentionDays: -4.6 } }), { ...DEFAULT_SETTINGS, cachePolicy: "disabled" });
@@ -97,7 +103,13 @@ assert.deepEqual(persistedSettings, {
   density: "comfortable",
   accent: "violet",
   locale: "ru",
-  notifications: { desktop: false, preview: false, sound: true },
+  messageTextSize: 16,
+  bubbleRadius: 17,
+  chatListLayout: "two-line",
+  notifications: { ...DEFAULT_SETTINGS.notifications, desktop: false, preview: false, sound: true },
+  media: DEFAULT_SETTINGS.media,
+  proxy: DEFAULT_SETTINGS.proxy,
+  energySaving: DEFAULT_SETTINGS.energySaving,
   cachePolicy: "minimal",
 });
 assert.deepEqual(writtenSettings, persistedSettings);

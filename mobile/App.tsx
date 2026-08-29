@@ -9,8 +9,9 @@ import { Montserrat_500Medium } from "@expo-google-fonts/montserrat/500Medium";
 import { Montserrat_600SemiBold } from "@expo-google-fonts/montserrat/600SemiBold";
 import { Montserrat_700Bold } from "@expo-google-fonts/montserrat/700Bold";
 import * as NavigationBar from "expo-navigation-bar";
+import * as Battery from "expo-battery";
 import * as Notifications from "expo-notifications";
-import { Alert, Animated, AppState, Easing, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { Alert, Animated, AppState, Appearance, Easing, Image, PanResponder, Platform, Pressable, StyleSheet, Text, View, useColorScheme, useWindowDimensions } from "react-native";
 import { initialWindowMetrics, SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { AuthScreen } from "./src/components/AuthScreen";
@@ -25,10 +26,10 @@ import { logEvent } from "./src/logs";
 import { friendlyError } from "./src/client-errors";
 import { EMPTY_MESSAGES, makeId, messageTime } from "./src/data";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./src/rn-e2e";
-import { acknowledgeMessage, createConversation, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, registerPushToken, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type SyncResponse, uploadMedia } from "./src/rn-api";
+import { acknowledgeMessage, createConversation, deleteAccount as deleteRemoteAccount, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, registerPushToken, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type RealtimeClose, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type SyncResponse, uploadMedia } from "./src/rn-api";
 import { decryptMedia, encryptMedia, encryptMediaBytes } from "./src/media";
 import type { PendingMedia } from "./src/components/ChatScreen";
-import { colors, fonts } from "./src/theme";
+import { colors, fonts, makeThemeColors } from "./src/theme";
 import { migrateLocalServerAddress } from "./src/rn-address";
 import { createRealtimeQueue, createSyncQueue } from "./src/sync-queue";
 import { createRealtimeLifecycle } from "./src/realtime-lifecycle";
@@ -37,6 +38,7 @@ import type { Conversation, Message, OutboxEntry, Profile, SearchUser } from "./
 import { deleteSessionToken, readSessionToken, writeSessionToken } from "./src/secure-session";
 import { limitMessageList, limitMessagesByProfile, limitOutboxEntries, MAX_OUTBOX_ATTEMPTS, retryDelay, sanitizeMessagesByProfile, sanitizeOutboxByProfile, sanitizeSyncCursors } from "./src/storage-limits";
 import { folderContains, sanitizeFoldersByProfile, type ChatFolder } from "./src/folders";
+import { DEFAULT_SETTINGS, readSettings, type MobileSettings } from "./src/settings";
 
 const PROFILES_KEY = "enter-profiles";
 const MESSAGES_KEY = "enter-mobile-messages";
@@ -199,6 +201,8 @@ export default function App() {
   const [searchError, setSearchError] = useState("");
   const [messageError, setMessageError] = useState("");
   const [mediaUploadProgress, setMediaUploadProgress] = useState<number | null>(null);
+  const [localSettings, setLocalSettings] = useState<MobileSettings>(DEFAULT_SETTINGS);
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [forwardMessage, setForwardMessage] = useState<Message | null>(null);
@@ -228,6 +232,22 @@ export default function App() {
   const handledNotificationRef = useRef<string | null>(null);
   const hasRenderedScreen = useRef(false);
   const { width: viewportWidth } = useWindowDimensions();
+  const systemColorScheme = useColorScheme();
+  const themeColors = useMemo(() => makeThemeColors(localSettings.theme, localSettings.accent, systemColorScheme), [localSettings.accent, localSettings.theme, systemColorScheme]);
+  const energySavingActive = localSettings.energySaving.enabled && batteryLevel !== null && batteryLevel <= localSettings.energySaving.threshold / 100;
+
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    Appearance.setColorScheme(localSettings.theme === "system" ? null : localSettings.theme);
+  }, [localSettings.theme]);
+
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    let mounted = true;
+    void Battery.getBatteryLevelAsync().then((level) => { if (mounted) setBatteryLevel(level); }).catch(() => undefined);
+    const subscription = Battery.addBatteryLevelListener(({ batteryLevel: level }) => setBatteryLevel(level));
+    return () => { mounted = false; subscription.remove(); };
+  }, []);
 
   useLayoutEffect(() => {
     if (!hasRenderedScreen.current) {
@@ -240,14 +260,14 @@ export default function App() {
     previousScreen.current = screen;
     setScreenDirection(movingBack ? -1 : 1);
     screenMotion.setValue(0);
-    Animated.timing(screenMotion, { toValue: 1, duration: 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
-  }, [screen, screenMotion]);
+    Animated.timing(screenMotion, { toValue: 1, duration: energySavingActive && !localSettings.energySaving.smoothTransitions ? 0 : 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [energySavingActive, localSettings.energySaving.smoothTransitions, screen, screenMotion]);
 
   useEffect(() => {
     if (Platform.OS !== "android") return;
-    void NavigationBar.setBackgroundColorAsync(colors.background);
-    void NavigationBar.setButtonStyleAsync("light");
-  }, []);
+    void NavigationBar.setBackgroundColorAsync(themeColors.background);
+    void NavigationBar.setButtonStyleAsync(themeColors.background === "#f5f5f7" ? "dark" : "light");
+  }, [themeColors.background]);
 
   useEffect(() => { activeConversationIdRef.current = activeConversationId; }, [activeConversationId]);
   useEffect(() => { screenRef.current = screen; }, [screen]);
@@ -323,7 +343,7 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     void (async () => {
-      const [storedProfiles, storedMessages, storedCursors, storedConversations, storedFolders, storedNavigation, storedOutbox] = await Promise.all([
+      const [storedProfiles, storedMessages, storedCursors, storedConversations, storedFolders, storedNavigation, storedOutbox, storedSettings] = await Promise.all([
         AsyncStorage.getItem(PROFILES_KEY),
         AsyncStorage.getItem(MESSAGES_KEY),
         AsyncStorage.getItem(CURSORS_KEY),
@@ -331,7 +351,9 @@ export default function App() {
         AsyncStorage.getItem(FOLDERS_KEY),
         AsyncStorage.getItem(NAVIGATION_KEY),
         AsyncStorage.getItem(OUTBOX_KEY),
+        readSettings(),
       ]);
+      setLocalSettings(storedSettings);
       let candidates: StoredProfile[] = [];
       let navigation: NavigationState = {};
       let cachedConversations: ConversationsByProfile = {};
@@ -352,7 +374,7 @@ export default function App() {
       }))).filter((profile): profile is Profile => profile !== null);
       try {
         const parsed: unknown = storedMessages ? JSON.parse(storedMessages) : {};
-        setMessagesByProfile(sanitizeMessagesByProfile(parsed));
+        setMessagesByProfile(sanitizeMessagesByProfile(parsed, storedSettings.cachePolicy));
       } catch { setMessagesByProfile({}); }
       try {
         const parsed: unknown = storedCursors ? JSON.parse(storedCursors) : {};
@@ -394,7 +416,7 @@ export default function App() {
   }, []);
 
   useEffect(() => { if (hydrated) persistJson(PROFILES_KEY, profiles.map(profileForStorage)); }, [hydrated, profiles]);
-  useEffect(() => { if (hydrated) persistJson(MESSAGES_KEY, limitMessagesByProfile(messagesByProfile)); }, [hydrated, messagesByProfile]);
+  useEffect(() => { if (hydrated) persistJson(MESSAGES_KEY, limitMessagesByProfile(messagesByProfile, localSettings.cachePolicy)); }, [hydrated, localSettings.cachePolicy, messagesByProfile]);
   useEffect(() => { if (hydrated) persistJson(CURSORS_KEY, syncCursors); }, [hydrated, syncCursors]);
   useEffect(() => { outboxRef.current = outboxByProfile; if (hydrated) persistJson(OUTBOX_KEY, Object.fromEntries(Object.entries(outboxByProfile).map(([profileId, entries]) => [profileId, limitOutboxEntries(entries)]))); }, [hydrated, outboxByProfile]);
   useEffect(() => { if (hydrated) persistJson(CONVERSATIONS_KEY, conversationsByProfile); }, [hydrated, conversationsByProfile]);
@@ -431,6 +453,8 @@ export default function App() {
     const decryptAttempts = new Map<string, number>();
     const quarantinedMessageIds = new Set<string>();
     let pushRegistrationStarted = false;
+    let syncNotificationsReady = false;
+    let syncNotificationsAllowed = false;
 
     const senderDevicesFor = (address: string) => {
       const cached = senderDeviceCache.get(address);
@@ -448,9 +472,17 @@ export default function App() {
     async function registerProfilePush(deviceId: string) {
       if (pushRegistrationStarted || (Platform.OS !== "android" && Platform.OS !== "ios")) return;
       pushRegistrationStarted = true;
-      const token = await registerForPushNotifications();
-      if (!token || cancelled) return;
-      await registerPushToken(profile, token, deviceId, Platform.OS).catch(() => undefined);
+      try {
+        const token = await registerForPushNotifications();
+        if (!token || cancelled) {
+          if (!cancelled) logEvent("network", "Push token unavailable", "Permission denied or push provider unavailable", "warn");
+          return;
+        }
+        await registerPushToken(profile, token, deviceId, Platform.OS);
+        if (!cancelled) logEvent("network", "Push token registered", Platform.OS, "success");
+      } catch (reason) {
+        if (!cancelled) logEvent("network", "Push token registration failed", reason instanceof Error ? reason.message : "Push registration error", "warn");
+      }
     }
 
     async function ensureOwnBundle() {
@@ -599,6 +631,7 @@ export default function App() {
       }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
       logEvent("crypto", "Sync decryption completed", `success ${decrypted.length}, retries ${retryingFailures.length}, skipped ${quarantinedCount}`, retryingFailures.length || quarantinedCount ? "warn" : "success");
       if (cancelled || !appActive) return false;
+      const newIncomingMessages = decrypted.filter(({ message }) => message.author === "them" && !seenMessageIds.has(message.id));
       const acknowledged = [...new Set(decrypted
         .filter(({ message }) => message.author === "them")
         .map(({ message }) => message.id))];
@@ -614,7 +647,16 @@ export default function App() {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
       });
+      if (syncNotificationsReady && syncNotificationsAllowed) {
+        newIncomingMessages.forEach(({ conversationId, message }) => {
+          if (activeConversationIdRef.current === conversationId && screenRef.current === "chat") return;
+          const conversation = conversations.find((item) => item.id === conversationId)
+            ?? result.conversations.find((item) => item.id === conversationId);
+          void notifyIncomingMessage({ profileId: profile.id, conversationId, messageId: message.id, title: conversation?.name ?? "Enter", text: message.text });
+        });
+      }
       if (retryingFailures.length === 0) advanceCursor(Math.max(cursor, result.nextCursor));
+      if (retryingFailures.length === 0) syncNotificationsReady = true;
       setMessageError(retryingFailures.length > 0
         ? `Не удалось расшифровать ${retryingFailures.length} сообщений. Повторю попытку (осталось ${MAX_DECRYPT_RETRIES - Math.max(...retryingFailures.map((messageId) => decryptAttempts.get(messageId) ?? 0))}).`
         : quarantinedCount > 0
@@ -700,18 +742,31 @@ export default function App() {
 
     let realtime: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let fallbackInterval: ReturnType<typeof setInterval> | null = null;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let fallbackDelay = 5_000;
+    let realtimeReady = false;
     let reconnectDelay = 1000;
 
     const startFallbackSync = () => {
-      if (!appActive || fallbackInterval !== null) return;
-      fallbackInterval = setInterval(() => { if (appActive) void syncOnce(); }, 500);
+      if (!appActive || fallbackTimer !== null || realtimeReady) return;
+      fallbackTimer = setTimeout(() => {
+        fallbackTimer = null;
+        if (cancelled || !appActive || realtimeReady) return;
+        syncNotificationsAllowed = true;
+        void syncOnce().catch(() => undefined).then(() => {
+          if (cancelled || !appActive || realtimeReady) return;
+          fallbackDelay = Math.min(30_000, fallbackDelay * 2);
+          startFallbackSync();
+        });
+      }, fallbackDelay);
     };
     const stopFallbackSync = () => {
-      if (fallbackInterval !== null) {
-        clearInterval(fallbackInterval);
-        fallbackInterval = null;
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
       }
+      fallbackDelay = 5_000;
+      syncNotificationsAllowed = false;
     };
     const scheduleRealtimeReconnect = () => {
       if (cancelled || !appActive || reconnectTimer !== null) return;
@@ -722,9 +777,11 @@ export default function App() {
         if (appActive) connectRealtime();
       }, delay);
     };
-    const handleRealtimeClose = () => {
+    const handleRealtimeClose = (details?: RealtimeClose) => {
       if (cancelled || !appActive) return;
-      logEvent("realtime", "Realtime connection closed", "switching to reconnect", "warn");
+      realtimeReady = false;
+      const closeDetails = details ? `code ${details.code}, clean ${details.wasClean}${details.reason ? `, reason ${details.reason}` : ""}` : "code unknown";
+      logEvent("realtime", "Realtime connection closed", `${closeDetails}; switching to reconnect`, "warn");
       startFallbackSync();
       scheduleRealtimeReconnect();
     };
@@ -735,6 +792,7 @@ export default function App() {
         socket = openRealtime(profile, cursor, (event) => {
           if (cancelled || !appActive || realtime !== socket) return;
           if (event.type === "ready") {
+            realtimeReady = true;
             logEvent("realtime", "Realtime connection established", undefined, "success");
             reconnectDelay = 1000;
             stopFallbackSync();
@@ -753,10 +811,10 @@ export default function App() {
             logEvent("realtime", "Realtime returned an error", "closing connection", "error");
             socket?.close();
           }
-        }, () => {
+        }, (details) => {
           if (realtime !== socket) return;
           realtime = null;
-          handleRealtimeClose();
+          handleRealtimeClose(details);
         });
         realtime = socket;
       } catch (reason) {
@@ -776,6 +834,7 @@ export default function App() {
         reconnectTimer = null;
       }
       stopFallbackSync();
+      realtimeReady = false;
       const socket = realtime;
       realtime = null;
       socket?.close();
@@ -875,6 +934,12 @@ export default function App() {
 
   async function forgetLocalPrivateKeys() {
     if (activeProfile) await deleteDeviceKeys(activeProfile.id);
+  }
+
+  async function deleteAccountAndProfile() {
+    if (!activeProfile) return;
+    await deleteRemoteAccount(activeProfile);
+    removeProfile(activeProfile);
   }
 
   function expireProfileSession(profileId: string) {
@@ -1109,21 +1174,21 @@ export default function App() {
   if (!hydrated || !fontsLoaded) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider>;
   if (profiles.length === 0 || showAuth) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider>;
 
-  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.app} edges={["top", "bottom", "left", "right"]}><StatusBar style="light" /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
-    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : current.reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
-    {screen !== "chat" && <BottomNav screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
+  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar style={themeColors.background === "#f5f5f7" ? "dark" : "light"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
+    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} themeColors={themeColors} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} onDeleteAccount={deleteAccountAndProfile} onSettingsChange={setLocalSettings} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} messageTextSize={localSettings.messageTextSize} bubbleRadius={localSettings.bubbleRadius} themeColors={themeColors} mediaSettings={localSettings.media} energySavingActive={energySavingActive} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} themeColors={themeColors} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} listLayout={localSettings.chatListLayout} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
+    {screen !== "chat" && <BottomNav themeColors={themeColors} screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
     <ProfileSheet visible={showProfiles} profiles={profiles} activeProfile={activeProfile} onClose={() => setShowProfiles(false)} onSelect={selectProfile} onAdd={() => setShowAuth(true)} onRemove={removeProfile} />
     <ForwardSheet visible={Boolean(forwardMessage)} message={forwardMessage} conversations={conversations} currentId={activeConversationId} onClose={() => setForwardMessage(null)} onForward={(id) => forwardMessage && sendForwardedMessage(forwardMessage, id)} />
     {screen === "logs" && <View style={styles.logsOverlay}><LogsScreen onClose={() => setScreen("settings")} /></View>}
   </View></SafeAreaView></SafeAreaProvider>;
 }
 
-function BottomNav({ screen, onInbox, onProfile, onSettings }: { screen: Screen; onInbox: () => void; onProfile: () => void; onSettings: () => void }) {
-  return <View style={styles.bottomNav}><NavButton active={screen === "inbox"} icon="chat" label="Чаты" onPress={onInbox} /><NavButton active={screen === "profile"} icon="person" label="Профиль" onPress={onProfile} /><NavButton active={screen === "settings"} icon="settings" label="Настройки" onPress={onSettings} /></View>;
+function BottomNav({ themeColors = colors, screen, onInbox, onProfile, onSettings }: { themeColors?: typeof colors; screen: Screen; onInbox: () => void; onProfile: () => void; onSettings: () => void }) {
+  return <View style={[styles.bottomNav, { backgroundColor: themeColors.surface, borderColor: themeColors.border }]}><NavButton themeColors={themeColors} active={screen === "inbox"} icon="chat" label="Чаты" onPress={onInbox} /><NavButton themeColors={themeColors} active={screen === "profile"} icon="person" label="Профиль" onPress={onProfile} /><NavButton themeColors={themeColors} active={screen === "settings"} icon="settings" label="Настройки" onPress={onSettings} /></View>;
 }
 
-function NavButton({ active, icon, label, onPress }: { active: boolean; icon: "chat" | "person" | "settings"; label: string; onPress: () => void }) {
-  return <Pressable onPress={onPress} style={({ pressed }) => [styles.navButton, active && styles.navActive, pressed && styles.pressed]}><Icon name={icon} size={20} color={active ? colors.foreground : colors.muted} /><Text style={[styles.navLabel, active && styles.navLabelActive]}>{label}</Text></Pressable>;
+function NavButton({ themeColors = colors, active, icon, label, onPress }: { themeColors?: typeof colors; active: boolean; icon: "chat" | "person" | "settings"; label: string; onPress: () => void }) {
+  return <Pressable onPress={onPress} style={({ pressed }) => [styles.navButton, active && { backgroundColor: themeColors.accent }, pressed && styles.pressed]}><Icon name={icon} size={20} color={active ? themeColors.foreground : themeColors.muted} /><Text style={[styles.navLabel, active && { color: themeColors.foreground }]}>{label}</Text></Pressable>;
 }
 
 const styles = StyleSheet.create({

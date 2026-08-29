@@ -171,6 +171,17 @@ struct AccountSettingsPatch {
     show_last_seen: Option<bool>,
     read_receipts: Option<bool>,
     typing_indicators: Option<bool>,
+    show_phone: Option<bool>,
+    show_profile_photo: Option<bool>,
+    allow_forwarding: Option<bool>,
+    allow_calls: Option<bool>,
+    suggest_people: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BlockAccountRequest {
+    address: String,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +202,22 @@ struct AccountSettingsResponse {
     show_last_seen: bool,
     read_receipts: bool,
     typing_indicators: bool,
+    show_phone: bool,
+    show_profile_photo: bool,
+    allow_forwarding: bool,
+    allow_calls: bool,
+    suggest_people: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockedAccountResponse {
+    id: String,
+    address: String,
+    handle: String,
+    name: String,
+    server: String,
+    created_at: i64,
 }
 
 #[derive(Serialize)]
@@ -475,6 +502,7 @@ const MAX_ENCRYPTED_MESSAGE_BATCH_BYTES: usize = 3 * 1024 * 1024;
 const MAX_LOGO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct RealtimeMetrics {
@@ -590,12 +618,14 @@ fn valid_account_folders(folders: &[storage::StoredFolder]) -> bool {
             && folder_ids.insert(folder.id.as_str())
             && valid_display_text(folder.name.trim(), 160)
             && matches!(folder.template.as_str(), "custom" | "personal" | "all")
-            && matches!(folder.icon.as_str(), "folder" | "chat" | "person" | "star" | "bookmark")
+            && matches!(
+                folder.icon.as_str(),
+                "folder" | "chat" | "person" | "star" | "bookmark"
+            )
             && folder.chat_ids.len() <= MAX_FOLDER_CHAT_IDS
-            && folder
-                .chat_ids
-                .iter()
-                .all(|chat_id| protocol::valid_identifier(chat_id) && chat_ids.insert(chat_id.as_str()))
+            && folder.chat_ids.iter().all(|chat_id| {
+                protocol::valid_identifier(chat_id) && chat_ids.insert(chat_id.as_str())
+            })
     })
 }
 
@@ -716,6 +746,11 @@ fn canonical_address(server_url: &str, handle: &str) -> String {
     format!("{handle}@{server}")
 }
 
+fn normalized_enter_address(address: &str) -> Option<String> {
+    let (handle, server) = enter_address_parts(address)?;
+    Some(canonical_address(server, handle))
+}
+
 fn constant_time_equal(left: &str, right: &str) -> bool {
     let mut difference = left.len() ^ right.len();
     for (left, right) in left.bytes().zip(right.bytes()) {
@@ -758,7 +793,8 @@ fn federation_delivery_error(
         return Some("invalid_federation_delivery");
     }
     let encrypted_message = &delivery.message.encrypted_message;
-    let Some((_, encrypted_message_sender_server)) = enter_address_parts(&encrypted_message.sender) else {
+    let Some((_, encrypted_message_sender_server)) = enter_address_parts(&encrypted_message.sender)
+    else {
         return Some("invalid_federation_delivery");
     };
     if !same_server(&delivery.sender_server, encrypted_message_sender_server) {
@@ -844,7 +880,8 @@ async fn deliver_local_message(
     created_at: i64,
     notify: bool,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some((recipient_handle, recipient_server)) = enter_address_parts(&encrypted_message.recipient)
+    let Some((recipient_handle, recipient_server)) =
+        enter_address_parts(&encrypted_message.recipient)
     else {
         return Ok(());
     };
@@ -865,7 +902,18 @@ async fn deliver_local_message(
     }
 
     let sender_address = canonical_address(&state.config.public_url, &sender.handle);
-    let delivery_id = format!("{}:{}", encrypted_message.message_id, encrypted_message.key_id);
+    if state
+        .db
+        .is_blocked_address(&recipient.id, &sender_address)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::FORBIDDEN, "blocked_sender"));
+    }
+    let delivery_id = format!(
+        "{}:{}",
+        encrypted_message.message_id, encrypted_message.key_id
+    );
     let delivered = state
         .db
         .deliver_message(
@@ -945,7 +993,20 @@ async fn federation_delivery(
             .await
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     if !registered_recipient_key {
-        return Err(error(StatusCode::BAD_REQUEST, "recipient_key_not_registered"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "recipient_key_not_registered",
+        ));
+    }
+    if let Some(sender_address) = normalized_enter_address(&encrypted_message.sender) {
+        if state
+            .db
+            .is_blocked_address(&recipient.id, &sender_address)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+        {
+            return Err(error(StatusCode::FORBIDDEN, "blocked_sender"));
+        }
     }
     let message_json = serde_json::to_string(encrypted_message)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_federation_delivery"))?;
@@ -997,6 +1058,23 @@ struct ExpoPushMessage {
     channel_id: String,
 }
 
+#[derive(Deserialize)]
+struct ExpoPushResponse {
+    data: Vec<ExpoPushTicket>,
+}
+
+#[derive(Deserialize)]
+struct ExpoPushTicket {
+    status: String,
+    message: Option<String>,
+    details: Option<ExpoPushTicketDetails>,
+}
+
+#[derive(Deserialize)]
+struct ExpoPushTicketDetails {
+    error: Option<String>,
+}
+
 async fn send_push_notification(
     state: AppState,
     account_id: String,
@@ -1024,17 +1102,72 @@ async fn send_push_notification(
             channel_id: "messages".to_owned(),
         })
         .collect::<Vec<_>>();
-    match reqwest::Client::new()
+    let client = match reqwest::Client::builder()
+        .timeout(PUSH_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("push client setup failed: {error}");
+            return;
+        }
+    };
+    let response = match client
         .post(&state.config.expo_push_url)
         .json(&payload)
         .send()
         .await
     {
-        Ok(response) if !response.status().is_success() => {
-            eprintln!("push provider returned {}", response.status());
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("push delivery failed: {error}");
+            return;
         }
-        Err(error) => eprintln!("push delivery failed: {error}"),
-        _ => {}
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = body.chars().take(256).collect::<String>();
+        eprintln!("push provider returned {status}: {body}");
+        return;
+    }
+    let provider_response = match response.json::<ExpoPushResponse>().await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("push provider returned invalid JSON: {error}");
+            return;
+        }
+    };
+    if provider_response.data.len() != payload.len() {
+        eprintln!(
+            "push provider returned {} tickets for {} notifications",
+            provider_response.data.len(),
+            payload.len()
+        );
+    }
+    for (index, ticket) in provider_response.data.iter().enumerate() {
+        if ticket.status == "ok" {
+            continue;
+        }
+        let provider_error = ticket
+            .details
+            .as_ref()
+            .and_then(|details| details.error.as_deref())
+            .unwrap_or("unknown");
+        eprintln!(
+            "push provider rejected account={} token_index={} error={} message={}",
+            account_id,
+            index,
+            provider_error,
+            ticket.message.as_deref().unwrap_or("unknown")
+        );
+        if provider_error == "DeviceNotRegistered" {
+            if let Some(message) = payload.get(index) {
+                if let Err(error) = state.db.delete_push_token(&account_id, &message.to).await {
+                    eprintln!("failed to remove invalid push token: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -1232,6 +1365,11 @@ fn account_settings_response(
         show_last_seen: settings.show_last_seen,
         read_receipts: settings.read_receipts,
         typing_indicators: settings.typing_indicators,
+        show_phone: settings.show_phone,
+        show_profile_photo: settings.show_profile_photo,
+        allow_forwarding: settings.allow_forwarding,
+        allow_calls: settings.allow_calls,
+        suggest_people: settings.suggest_people,
     }
 }
 
@@ -1277,6 +1415,21 @@ async fn patch_account_settings(
     if let Some(value) = request.typing_indicators {
         settings.typing_indicators = value;
     }
+    if let Some(value) = request.show_phone {
+        settings.show_phone = value;
+    }
+    if let Some(value) = request.show_profile_photo {
+        settings.show_profile_photo = value;
+    }
+    if let Some(value) = request.allow_forwarding {
+        settings.allow_forwarding = value;
+    }
+    if let Some(value) = request.allow_calls {
+        settings.allow_calls = value;
+    }
+    if let Some(value) = request.suggest_people {
+        settings.suggest_people = value;
+    }
     if let Some(name) = request.name {
         let name = name.trim();
         if !valid_display_text(name, 160) {
@@ -1303,6 +1456,126 @@ async fn patch_account_settings(
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
     Ok(Json(account_settings_response(account, settings)))
+}
+
+fn blocked_account_response(blocked: storage::StoredBlockedAccount) -> BlockedAccountResponse {
+    BlockedAccountResponse {
+        id: blocked.id,
+        address: blocked.address,
+        handle: blocked.handle,
+        name: blocked.name,
+        server: blocked.server,
+        created_at: blocked.created_at,
+    }
+}
+
+async fn list_blocked_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<BlockedAccountResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let blocked = state
+        .db
+        .blocked_accounts(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
+    Ok(Json(
+        blocked.into_iter().map(blocked_account_response).collect(),
+    ))
+}
+
+async fn block_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BlockAccountRequest>,
+) -> Result<Json<BlockedAccountResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    let Some((handle, server)) = enter_address_parts(&request.address) else {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_address"));
+    };
+    let normalized = normalized_enter_address(&request.address)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_address"))?;
+    if handle.len() > 128 || server.len() > 2048 || handle.is_empty() || server.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_address"));
+    }
+    if normalized
+        == canonical_address(
+            &state.config.public_url,
+            &state
+                .db
+                .account_by_id(&account_id)
+                .await
+                .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+                .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "unauthorized"))?
+                .handle,
+        )
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "cannot_block_self"));
+    }
+    let local = if same_server(&state.config.public_url, server) {
+        state
+            .db
+            .account_by_handle(handle)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    } else {
+        None
+    };
+    let blocked = storage::StoredBlockedAccount {
+        id: format!("blocked:{}", Uuid::new_v4()),
+        address: normalized,
+        handle: handle.to_owned(),
+        name: local
+            .map(|account| account.name)
+            .unwrap_or_else(|| handle.to_owned()),
+        server: normalize_server(server),
+        created_at: storage::now_ms(),
+    };
+    if !state
+        .db
+        .add_blocked_account(&account_id, &blocked)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::CONFLICT, "already_blocked"));
+    }
+    Ok(Json(blocked_account_response(blocked)))
+}
+
+async fn unblock_account(
+    State(state): State<AppState>,
+    Path(blocked_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    if !protocol::valid_identifier(&blocked_id) && !blocked_id.starts_with("blocked:") {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_blacklist_entry"));
+    }
+    if !state
+        .db
+        .remove_blocked_account(&account_id, &blocked_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::NOT_FOUND, "blacklist_entry_not_found"));
+    }
+    Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
+async fn delete_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let account_id = bearer_account_id(&state, &headers).await?;
+    if !state
+        .db
+        .delete_account(&account_id)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?
+    {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
 async fn change_password(
@@ -2041,7 +2314,12 @@ async fn update_account_folders(
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
     state
         .realtime
-        .publish(&account_id, RealtimeEvent::Folders { folders: folders.clone() })
+        .publish(
+            &account_id,
+            RealtimeEvent::Folders {
+                folders: folders.clone(),
+            },
+        )
         .await;
     Ok(Json(folders))
 }
@@ -2180,7 +2458,11 @@ async fn send_message(
         {
             return Err(error(StatusCode::BAD_REQUEST, "federation_not_configured"));
         }
-        if !encrypted_message_belongs_to_account(encrypted_message, &sender, &state.config.public_url) {
+        if !encrypted_message_belongs_to_account(
+            encrypted_message,
+            &sender,
+            &state.config.public_url,
+        ) {
             return Err(error(StatusCode::FORBIDDEN, "sender_identity_mismatch"));
         }
         let registered_device = state
@@ -2192,7 +2474,8 @@ async fn send_message(
             return Err(error(StatusCode::FORBIDDEN, "device_key_not_registered"));
         }
         if same_server(&state.config.public_url, recipient_server) {
-            let Some((recipient_handle, _)) = enter_address_parts(&encrypted_message.recipient) else {
+            let Some((recipient_handle, _)) = enter_address_parts(&encrypted_message.recipient)
+            else {
                 return Err(error(StatusCode::BAD_REQUEST, "invalid_message"));
             };
             let Some(recipient) = state
@@ -2214,7 +2497,10 @@ async fn send_message(
                     .await
                     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
             if !registered_recipient_key {
-                return Err(error(StatusCode::BAD_REQUEST, "recipient_key_not_registered"));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "recipient_key_not_registered",
+                ));
             }
         }
     }
@@ -2297,8 +2583,12 @@ async fn send_message(
         .cursor(&account_id)
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed"))?;
-    let message = message_response(message)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_stored_encrypted_message"))?;
+    let message = message_response(message).map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_stored_encrypted_message",
+        )
+    })?;
     Ok(Json(SendMessageResponse {
         next_cursor: cursor,
         message,
@@ -2433,7 +2723,8 @@ async fn device_history(
             .ok()
             .and_then(|value| size.checked_add(value.len()))
     });
-    if request.entries.len() > 50 || history_size.is_none_or(|size| size > MAX_ENCRYPTED_MESSAGE_BATCH_BYTES)
+    if request.entries.len() > 50
+        || history_size.is_none_or(|size| size > MAX_ENCRYPTED_MESSAGE_BATCH_BYTES)
     {
         return Err(error(StatusCode::BAD_REQUEST, "too_many_history_entries"));
     }
@@ -2446,7 +2737,11 @@ async fn device_history(
             || entry.message_id != encrypted_message.message_id
             || entry.conversation_id != encrypted_message.conversation_id
             || !protocol::is_supported_message(encrypted_message)
-            || !encrypted_message_belongs_to_account(encrypted_message, &sender, &state.config.public_url)
+            || !encrypted_message_belongs_to_account(
+                encrypted_message,
+                &sender,
+                &state.config.public_url,
+            )
             || entry
                 .source_key_id
                 .as_deref()
@@ -2505,12 +2800,12 @@ async fn device_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_equal, conversation_response, enter_address_parts,
-        encrypted_message_belongs_to_account, federation_authorized, federation_delivery_error,
-        federation_urls, is_embedded_app_origin, is_local_dev_origin, normalize_server, origin,
+        constant_time_equal, conversation_response, encrypted_message_belongs_to_account,
+        enter_address_parts, federation_authorized, federation_delivery_error, federation_urls,
+        is_embedded_app_origin, is_local_dev_origin, normalize_server, origin,
         realtime_error_payload, realtime_hello_error, realtime_origin_allowed, same_server,
-        valid_encrypted_message_batch, valid_public_jwk_material, RealtimeEvent, RealtimeHello, RealtimeHub,
-        MAX_ENCRYPTED_MESSAGES_PER_MESSAGE, REALTIME_PROTOCOL_VERSION,
+        valid_encrypted_message_batch, valid_public_jwk_material, RealtimeEvent, RealtimeHello,
+        RealtimeHub, MAX_ENCRYPTED_MESSAGES_PER_MESSAGE, REALTIME_PROTOCOL_VERSION,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -2597,10 +2892,13 @@ mod tests {
             associated_data: "aad".to_owned(),
             signature: "signature".to_owned(),
         };
-        assert!(valid_encrypted_message_batch(std::slice::from_ref(&encrypted_message)));
+        assert!(valid_encrypted_message_batch(std::slice::from_ref(
+            &encrypted_message
+        )));
         assert!(!valid_encrypted_message_batch(&vec![
             encrypted_message;
-            MAX_ENCRYPTED_MESSAGES_PER_MESSAGE + 1
+            MAX_ENCRYPTED_MESSAGES_PER_MESSAGE
+                + 1
         ]));
     }
 
@@ -3063,6 +3361,15 @@ async fn main() {
             "/api/v1/account/settings",
             get(get_account_settings).patch(patch_account_settings),
         )
+        .route(
+            "/api/v1/account/blacklist",
+            get(list_blocked_accounts).post(block_account),
+        )
+        .route(
+            "/api/v1/account/blacklist/:blocked_id",
+            delete(unblock_account),
+        )
+        .route("/api/v1/account", delete(delete_account))
         .route("/api/v1/sessions", get(list_sessions))
         .route(
             "/api/v1/sessions/current",

@@ -6,6 +6,7 @@ import { isAudioAttachment } from "../lib/media";
 import { ContextMenu } from "./ui/context-menu";
 import { Icon } from "./ui/icon";
 import { MediaBubble, MediaGroup, type MediaContextActions } from "./media-bubble";
+import type { MediaSettings } from "../lib/local-settings";
 
 type MessageListProps = {
   messages: Message[];
@@ -19,6 +20,7 @@ type MessageListProps = {
   searching?: boolean;
   readOnly?: boolean;
   profile?: Profile;
+  mediaSettings?: MediaSettings;
 };
 
 const AUTO_SCROLL_THRESHOLD = 32;
@@ -28,8 +30,17 @@ function sameStack(left?: Message, right?: Message) {
   return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
 }
 
+function mediaAutoDownloadAllowed(attachment: MessageAttachment, settings?: MediaSettings) {
+  if (!settings) return true;
+  const connection = (navigator as Navigator & { connection?: { type?: string } }).connection;
+  const network = connection?.type === "cellular" ? "cellular" : "wifi";
+  if (!settings.autoDownload[network]) return false;
+  const limit = attachment.kind === "video" ? settings.autoDownload.videoLimitMb : attachment.kind === "image" ? settings.autoDownload.photoLimitMb : settings.autoDownload.fileLimitMb;
+  return attachment.size <= limit * 1024 * 1024;
+}
+
 // #preview MessageList {"messages":[{"id":"1","author":"them","text":"Привет!","time":"12:48"},{"id":"2","author":"me","text":"На связи.","time":"12:49"}]}
-export function MessageList({ messages, onReply = () => undefined, onEdit = () => undefined, onTogglePinned = () => undefined, onSave = () => undefined, onDelete = () => undefined, onReact = () => undefined, onForward = () => undefined, searching = false, readOnly = false, profile }: MessageListProps) {
+export function MessageList({ messages, onReply = () => undefined, onEdit = () => undefined, onTogglePinned = () => undefined, onSave = () => undefined, onDelete = () => undefined, onReact = () => undefined, onForward = () => undefined, searching = false, readOnly = false, profile, mediaSettings }: MessageListProps) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [attachmentContext, setAttachmentContext] = useState<{ messageId: string; attachment: MessageAttachment; actions: MediaContextActions } | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -95,8 +106,8 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
           {message.author === "me" && (message.deliveryStatus ? <span title={message.deliveryStatus === "failed" ? "Не отправлено, будет повтор" : "Отправляется"}>{message.deliveryStatus === "failed" ? "!" : "…"}</span> : <span title={message.readAt ? "Прочитано" : message.deliveredAt ? "Доставлено" : "Отправлено"}><Icon name={message.readAt || message.deliveredAt ? "done_all" : "check"} className="size-3" /></span>)}
           {message.edited && <span>изменено</span>}
         </div> : null;
-        const messageCopy = <>{message.text && <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.text}</p>}{message.reaction && <span className="mt-1 inline-flex rounded-full bg-background/25 px-1.5 py-0.5 text-sm">{message.reaction}</span>}{messageMeta}</>;
-        const fileList = otherAttachments.length > 0 ? <div className={cn("flex flex-col gap-1.5", visualAttachments.length > 0 && "mt-2", (message.text || message.reaction) && "mb-2")}>{otherAttachments.map((attachment) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} onAttachmentContextMenu={(selectedAttachment, actions) => setAttachmentContext({ messageId: message.id, attachment: selectedAttachment, actions })} />)}</div> : null;
+        const messageCopy = <>{message.text && <p className="chat-message-text whitespace-pre-wrap">{message.text}</p>}{message.reaction && <span className="mt-1 inline-flex rounded-full bg-background/25 px-1.5 py-0.5 text-sm">{message.reaction}</span>}{messageMeta}</>;
+        const fileList = otherAttachments.length > 0 ? <div className={cn("flex flex-col gap-1.5", visualAttachments.length > 0 && "mt-2", (message.text || message.reaction) && "mb-2")}>{otherAttachments.map((attachment) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} autoDownload={mediaAutoDownloadAllowed(attachment, mediaSettings)} autoplayVideo={mediaSettings?.autoplayVideo ?? false} onAttachmentContextMenu={(selectedAttachment, actions) => setAttachmentContext({ messageId: message.id, attachment: selectedAttachment, actions })} />)}</div> : null;
 
         return (
           <div key={message.id} className={cn("chat-message", message.author === "me" ? "chat-message-out" : "chat-message-in", "flex", sameAsPrevious ? "" : "pt-2", message.author === "me" ? "justify-end" : "justify-start")}>
@@ -114,7 +125,7 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
                 visualAttachments.length > 0 && !otherAttachments.length && "bg-transparent",
                 visualAttachments.length > 0 && otherAttachments.length > 0 && (message.author === "me" ? "bg-primary" : "bg-accent"),
               )}>
-                {visualAttachments.length ? <MediaGroup profile={profile} attachments={visualAttachments} overlay={mediaOverlay} captioned={mediaCaption} onAttachmentContextMenu={(attachment, actions) => setAttachmentContext({ messageId: message.id, attachment, actions })} /> : null}
+                {visualAttachments.length ? <MediaGroup profile={profile} attachments={visualAttachments} autoDownload={visualAttachments.every((attachment) => mediaAutoDownloadAllowed(attachment, mediaSettings))} autoplayVideo={mediaSettings?.autoplayVideo ?? false} overlay={mediaOverlay} captioned={mediaCaption} onAttachmentContextMenu={(attachment, actions) => setAttachmentContext({ messageId: message.id, attachment, actions })} /> : null}
                 {fileList}{mediaCaption ? <div className={cn("mt-0 rounded-t-none rounded-b-xl px-3.5 py-2.5", message.author === "me" ? "bg-primary text-primary-foreground" : "bg-accent")}>{messageCopy}</div> : <>{messageCopy}</>}
               </div>
             </ContextMenu>

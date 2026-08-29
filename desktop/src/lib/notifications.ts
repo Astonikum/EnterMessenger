@@ -1,4 +1,5 @@
 import { readLocalSettings, writeLocalSettings, type NotificationSettings } from "./local-settings";
+import { isTauri } from "@tauri-apps/api/core";
 
 export type { NotificationSettings } from "./local-settings";
 
@@ -11,14 +12,34 @@ export function writeNotificationSettings(settings: NotificationSettings) {
 }
 
 export async function requestDesktopNotificationPermission() {
+  if (isTauri()) {
+    try {
+      const plugin = await import("@tauri-apps/plugin-notification");
+      if (await plugin.isPermissionGranted()) return true;
+      return (await plugin.requestPermission()) === "granted";
+    } catch {
+      return false;
+    }
+  }
   try {
-    const plugin = await import("@tauri-apps/plugin-notification");
-    if (await plugin.isPermissionGranted()) return true;
-    return (await plugin.requestPermission()) === "granted";
-  } catch {
     if (!("Notification" in window)) return false;
     if (Notification.permission === "granted") return true;
     return (await Notification.requestPermission()) === "granted";
+  } catch {
+    return false;
+  }
+}
+
+async function showDesktopWindow() {
+  if (!isTauri()) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const window = getCurrentWindow();
+    await window.show();
+    await window.unminimize();
+    await window.setFocus();
+  } catch {
+    // The notification action can still select the conversation if focus fails.
   }
 }
 
@@ -29,21 +50,23 @@ export async function notifyIncomingMessage(input: {
   text: string;
 }) {
   const settings = readNotificationSettings();
-  if (!settings.desktop) return;
+  if (!settings.desktop || !settings.allAccounts || !settings.privateChats) return;
   if (!(await requestDesktopNotificationPermission())) return;
-  const body = settings.preview ? input.text : "Новое сообщение";
+  const body = settings.preview && settings.inAppPreview ? input.text : "Новое сообщение";
 
-  try {
-    const plugin = await import("@tauri-apps/plugin-notification");
-    plugin.sendNotification({
-      title: input.title,
-      body,
-      sound: settings.sound ? "Ping" : undefined,
-      extra: { profileId: input.profileId, conversationId: input.conversationId },
-    });
-    return;
-  } catch {
-    // Browser fallback keeps the Vite preview usable outside Tauri.
+  if (isTauri()) {
+    try {
+      const plugin = await import("@tauri-apps/plugin-notification");
+      plugin.sendNotification({
+        title: input.title,
+        body,
+        sound: settings.sound && settings.inAppSound ? "Ping" : undefined,
+        extra: { profileId: input.profileId, conversationId: input.conversationId },
+      });
+      return;
+    } catch {
+      // Browser fallback keeps the Vite preview usable outside Tauri.
+    }
   }
 
   if (!("Notification" in window) || Notification.permission !== "granted") return;
@@ -57,12 +80,16 @@ export async function notifyIncomingMessage(input: {
 }
 
 export async function subscribeToNotificationActions(onOpen: (profileId: string, conversationId: string) => void) {
+  if (!isTauri()) return () => undefined;
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
     const listener = await plugin.onAction((notification) => {
       const profileId = typeof notification.extra?.profileId === "string" ? notification.extra.profileId : null;
       const conversationId = typeof notification.extra?.conversationId === "string" ? notification.extra.conversationId : null;
-      if (profileId && conversationId) onOpen(profileId, conversationId);
+      if (profileId && conversationId) {
+        void showDesktopWindow();
+        onOpen(profileId, conversationId);
+      }
     });
     return () => { void listener.unregister(); };
   } catch {

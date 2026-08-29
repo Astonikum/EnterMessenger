@@ -102,7 +102,7 @@ fn media_limit_bytes(value: Option<&str>) -> usize {
 fn configured_address(value: Option<&str>, port: u16) -> SocketAddr {
     let address = value
         .and_then(|value| value.parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     SocketAddr::new(address, port)
 }
 
@@ -120,10 +120,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_defaults_to_loopback() {
+    fn bind_defaults_to_all_ipv4_interfaces() {
         assert_eq!(
             configured_address(None, 50121),
-            SocketAddr::from(([127, 0, 0, 1], 50121))
+            SocketAddr::from(([0, 0, 0, 0], 50121))
         );
     }
 
@@ -139,7 +139,7 @@ mod tests {
     fn bind_rejects_invalid_address() {
         assert_eq!(
             configured_address(Some("not-an-ip"), 50121),
-            SocketAddr::from(([127, 0, 0, 1], 50121))
+            SocketAddr::from(([0, 0, 0, 0], 50121))
         );
     }
 

@@ -79,9 +79,23 @@ export type AccountSettings = {
   showLastSeen: boolean;
   readReceipts: boolean;
   typingIndicators: boolean;
+  showPhone: boolean;
+  showProfilePhoto: boolean;
+  allowForwarding: boolean;
+  allowCalls: boolean;
+  suggestPeople: boolean;
 };
 
-export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators">>;
+export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators" | "showPhone" | "showProfilePhoto" | "allowForwarding" | "allowCalls" | "suggestPeople">>;
+
+export type BlockedAccount = {
+  id: string;
+  address: string;
+  handle: string;
+  name: string;
+  server: string;
+  createdAt: number;
+};
 
 export type ChangePasswordPayload = {
   currentPassword: string;
@@ -258,7 +272,26 @@ function isAccountSettings(value: unknown): value is AccountSettings {
     && typeof value.showOnline === "boolean"
     && typeof value.showLastSeen === "boolean"
     && typeof value.readReceipts === "boolean"
-    && typeof value.typingIndicators === "boolean";
+    && typeof value.typingIndicators === "boolean"
+    && typeof value.showPhone === "boolean"
+    && typeof value.showProfilePhoto === "boolean"
+    && typeof value.allowForwarding === "boolean"
+    && typeof value.allowCalls === "boolean"
+    && typeof value.suggestPeople === "boolean";
+}
+
+function isBlockedAccount(value: unknown): value is BlockedAccount {
+  return isRecord(value)
+    && isString(value.id, 256)
+    && isString(value.address, 2048)
+    && isString(value.handle, 256)
+    && isString(value.name, 256)
+    && isString(value.server, 2048)
+    && isUnixMillis(value.createdAt);
+}
+
+function isBlockedAccountList(value: unknown): value is BlockedAccount[] {
+  return Array.isArray(value) && value.length <= 10_000 && value.every(isBlockedAccount);
 }
 
 function isAccountDevice(value: unknown): value is AccountDevice {
@@ -365,6 +398,33 @@ export async function updateAccountSettings(profile: Profile, patch: AccountSett
   return readJson<AccountSettings>(response, isAccountSettings);
 }
 
+export async function fetchBlacklist(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/account/blacklist"), { headers: headers(profile) });
+  return readJson<BlockedAccount[]>(response, isBlockedAccountList);
+}
+
+export async function blockAccount(profile: Profile, address: string) {
+  const response = await request(apiUrl(profile, "/api/v1/account/blacklist"), {
+    method: "POST",
+    headers: headers(profile),
+    body: JSON.stringify({ address }),
+  });
+  return readJson<BlockedAccount>(response, isBlockedAccount);
+}
+
+export async function unblockAccount(profile: Profile, id: string) {
+  const response = await request(apiUrl(profile, `/api/v1/account/blacklist/${encodeURIComponent(id)}`), {
+    method: "DELETE",
+    headers: headers(profile),
+  });
+  return readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
+export async function deleteAccount(profile: Profile) {
+  const response = await request(apiUrl(profile, "/api/v1/account"), { method: "DELETE", headers: headers(profile) });
+  return readJson<{ accepted: boolean }>(response, isAcceptedResponse);
+}
+
 export async function changePassword(profile: Profile, payload: ChangePasswordPayload) {
   const response = await request(apiUrl(profile, "/auth/change-password"), {
     method: "POST",
@@ -431,7 +491,9 @@ export async function updateAccountFolders(profile: Profile, folders: ChatFolder
   return readJson<ChatFolder[]>(response, isFolderList);
 }
 
-export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: () => void) {
+export type RealtimeClose = { code: number; reason: string; wasClean: boolean };
+
+export function openRealtime(profile: Profile, since: number, onEvent: (event: RealtimeEvent) => void, onClose: (details: RealtimeClose) => void) {
   const websocket = new WebSocket(`${profile.server.replace(/^http/, "ws").replace(/\/+$/, "")}/api/v1/realtime`);
   websocket.onopen = () => websocket.send(JSON.stringify({ type: "hello", version: 1, token: profile.token, since: Math.max(0, since) }));
   websocket.onmessage = (event) => {
@@ -442,7 +504,7 @@ export function openRealtime(profile: Profile, since: number, onEvent: (event: R
       // Ignore malformed frames; the next snapshot repairs state.
     }
   };
-  websocket.onclose = onClose;
+  websocket.onclose = (event) => onClose({ code: event.code, reason: event.reason, wasClean: event.wasClean });
   return websocket;
 }
 

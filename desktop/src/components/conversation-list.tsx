@@ -14,6 +14,7 @@ type ConversationListProps = {
   conversations: Conversation[];
   activeId: string | null;
   activeFolder?: string;
+  listLayout?: "two-line" | "three-line";
   folders?: ChatFolder[];
   onSelect?: (id: string) => void;
   className?: string;
@@ -39,7 +40,7 @@ function previewText(value: string) {
 }
 
 // #preview ConversationList {"conversations":[{"id":"maria","name":"Мария","avatar":"maria","lastMessage":"Привет!","time":"12:48","online":true,"unread":2,"pinned":true}],"activeId":"maria"}
-export function ConversationList({ conversations, activeId, activeFolder = "all", folders = [], onSelect = () => undefined, className, isLoading = false, isConnected = false, searchUser = null, searchBusy = false, searchError = "", onSearchUser = () => undefined, onOpenSearchUser = () => undefined, onTogglePinned = () => undefined, onToggleMuted = () => undefined, onMarkUnread = () => undefined, onArchive = () => undefined, onManageFolders = () => undefined, onDelete = () => undefined, onReorder = () => undefined }: ConversationListProps) {
+export function ConversationList({ conversations, activeId, activeFolder = "all", listLayout = "two-line", folders = [], onSelect = () => undefined, className, isLoading = false, isConnected = false, searchUser = null, searchBusy = false, searchError = "", onSearchUser = () => undefined, onOpenSearchUser = () => undefined, onTogglePinned = () => undefined, onToggleMuted = () => undefined, onMarkUnread = () => undefined, onArchive = () => undefined, onManageFolders = () => undefined, onDelete = () => undefined, onReorder = () => undefined }: ConversationListProps) {
   const [query, setQuery] = useState("");
   const searchTimer = useRef<number | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -121,6 +122,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
                   <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{previewText(conversation.lastMessage)}</span>
                   {conversation.time && <span className="shrink-0 text-[0.625rem] text-muted-foreground">{conversation.time}</span>}
                 </span>
+                {listLayout === "three-line" && <span className="mt-0.5 block truncate text-[0.625rem] text-muted-foreground">{conversation.handle ? `@${conversation.handle.replace(/^@/, "")}` : conversation.online ? "В сети" : "Не в сети"}</span>}
               </span>
               {conversation.unread ? <span className="grid shrink-0 min-w-5 place-items-center rounded-full bg-primary px-1.5 py-0.5 text-[0.625rem] font-bold text-primary-foreground">{conversation.unread}</span> : null}
             </button>

@@ -15,11 +15,17 @@ pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_SYNC_EVENTS: i64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AccountSettings {
     pub show_online: bool,
     pub show_last_seen: bool,
     pub read_receipts: bool,
     pub typing_indicators: bool,
+    pub show_phone: bool,
+    pub show_profile_photo: bool,
+    pub allow_forwarding: bool,
+    pub allow_calls: bool,
+    pub suggest_people: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +45,11 @@ impl Default for AccountSettings {
             show_last_seen: true,
             read_receipts: true,
             typing_indicators: true,
+            show_phone: false,
+            show_profile_photo: true,
+            allow_forwarding: true,
+            allow_calls: true,
+            suggest_people: true,
         }
     }
 }
@@ -65,6 +76,16 @@ pub struct StoredDevice {
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlockedAccount {
+    pub id: String,
+    pub address: String,
+    pub handle: String,
+    pub name: String,
+    pub server: String,
+    pub created_at: i64,
 }
 
 fn legacy_session_id(token: &str) -> String {
@@ -552,6 +573,18 @@ impl SqliteStorage {
                  value_json TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS blocked_accounts (
+                 owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 id TEXT NOT NULL,
+                 address TEXT NOT NULL,
+                 handle TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 server TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY(owner_account_id, id),
+                 UNIQUE(owner_account_id, address)
+             );
+             CREATE INDEX IF NOT EXISTS blocked_accounts_owner ON blocked_accounts(owner_account_id, created_at DESC);
              CREATE TABLE IF NOT EXISTS account_folders (
                  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
                  folders_json TEXT NOT NULL,
@@ -714,6 +747,8 @@ impl SqliteStorage {
         }
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL", [])?;
         connection.execute("CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at INTEGER NOT NULL)", [])?;
+        connection.execute("CREATE TABLE IF NOT EXISTS blocked_accounts (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, id TEXT NOT NULL, address TEXT NOT NULL, handle TEXT NOT NULL, name TEXT NOT NULL, server TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(owner_account_id, id), UNIQUE(owner_account_id, address))", [])?;
+        connection.execute("CREATE INDEX IF NOT EXISTS blocked_accounts_owner ON blocked_accounts(owner_account_id, created_at DESC)", [])?;
         connection.execute("CREATE TABLE IF NOT EXISTS account_folders (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, folders_json TEXT NOT NULL, updated_at INTEGER NOT NULL)", [])?;
         connection.execute("CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER, PRIMARY KEY(owner_account_id, device_id))", [])?;
         connection.execute(
@@ -1053,6 +1088,58 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn blocked_accounts(&self, owner_account_id: &str) -> SqlResult<Vec<StoredBlockedAccount>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, address, handle, name, server, created_at FROM blocked_accounts WHERE owner_account_id = ?1 ORDER BY created_at DESC, id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![owner_account_id], |row| {
+                Ok(StoredBlockedAccount {
+                    id: row.get(0)?,
+                    address: row.get(1)?,
+                    handle: row.get(2)?,
+                    name: row.get(3)?,
+                    server: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn add_blocked_account(
+        &mut self,
+        owner_account_id: &str,
+        blocked: &StoredBlockedAccount,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "INSERT OR IGNORE INTO blocked_accounts (owner_account_id, id, address, handle, name, server, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![owner_account_id, blocked.id, blocked.address, blocked.handle, blocked.name, blocked.server, blocked.created_at],
+        )? > 0)
+    }
+
+    pub fn remove_blocked_account(&mut self, owner_account_id: &str, id: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM blocked_accounts WHERE owner_account_id = ?1 AND id = ?2",
+            params![owner_account_id, id],
+        )? > 0)
+    }
+
+    pub fn is_blocked_address(&self, owner_account_id: &str, address: &str) -> SqlResult<bool> {
+        Ok(self.connection.query_row(
+            "SELECT 1 FROM blocked_accounts WHERE owner_account_id = ?1 AND address = ?2 LIMIT 1",
+            params![owner_account_id, address],
+            |_| Ok(()),
+        ).optional()?.is_some())
+    }
+
+    pub fn delete_account(&mut self, account_id: &str) -> SqlResult<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?
+            > 0)
+    }
+
     pub fn account_folders(&self, account_id: &str) -> SqlResult<Vec<StoredFolder>> {
         let raw = self
             .connection
@@ -1326,6 +1413,14 @@ impl SqliteStorage {
             .query_map(params![account_id], |row| row.get(0))?
             .collect();
         tokens
+    }
+
+    pub fn delete_push_token(&mut self, account_id: &str, token: &str) -> SqlResult<bool> {
+        let changed = self.connection.execute(
+            "DELETE FROM push_tokens WHERE owner_account_id = ?1 AND token = ?2",
+            params![account_id, token],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn touch_presence(&mut self, account_id: &str, now: i64) -> SqlResult<()> {
@@ -2092,6 +2187,7 @@ mod tests {
             show_last_seen: false,
             read_receipts: true,
             typing_indicators: false,
+            ..AccountSettings::default()
         };
         storage
             .update_account_settings(&account.id, &settings, 2)
@@ -2121,8 +2217,14 @@ mod tests {
             .update_account_folders(&account.id, &folders, 2)
             .expect("write folders");
 
-        assert_eq!(storage.account_folders(&account.id).expect("read folders"), folders);
-        assert_eq!(storage.sync(&account.id, 0, "").expect("sync").folders, folders);
+        assert_eq!(
+            storage.account_folders(&account.id).expect("read folders"),
+            folders
+        );
+        assert_eq!(
+            storage.sync(&account.id, 0, "").expect("sync").folders,
+            folders
+        );
     }
 
     #[test]
@@ -2337,6 +2439,13 @@ mod tests {
             storage.push_tokens(&account.id).expect("list tokens"),
             vec!["ExponentPushToken[second]".to_owned()]
         );
+        assert!(storage
+            .delete_push_token(&account.id, "ExponentPushToken[second]")
+            .expect("delete token"));
+        assert!(storage
+            .push_tokens(&account.id)
+            .expect("list tokens")
+            .is_empty());
     }
 
     #[test]
@@ -3293,6 +3402,127 @@ impl Storage {
         }
     }
 
+    pub async fn blocked_accounts(
+        &self,
+        owner_account_id: &str,
+    ) -> Result<Vec<StoredBlockedAccount>, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .blocked_accounts(owner_account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, address, handle, name, server, created_at FROM blocked_accounts WHERE owner_account_id = $1 ORDER BY created_at DESC, id ASC",
+                )
+                .bind(owner_account_id)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(StoredBlockedAccount {
+                            id: row.try_get("id")?,
+                            address: row.try_get("address")?,
+                            handle: row.try_get("handle")?,
+                            name: row.try_get("name")?,
+                            server: row.try_get("server")?,
+                            created_at: row.try_get("created_at")?,
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    pub async fn add_blocked_account(
+        &self,
+        owner_account_id: &str,
+        blocked: &StoredBlockedAccount,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .add_blocked_account(owner_account_id, blocked)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "INSERT INTO blocked_accounts (owner_account_id, id, address, handle, name, server, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+            )
+            .bind(owner_account_id)
+            .bind(&blocked.id)
+            .bind(&blocked.address)
+            .bind(&blocked.handle)
+            .bind(&blocked.name)
+            .bind(&blocked.server)
+            .bind(blocked.created_at)
+            .execute(pool)
+            .await?
+            .rows_affected() > 0),
+        }
+    }
+
+    pub async fn remove_blocked_account(
+        &self,
+        owner_account_id: &str,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .remove_blocked_account(owner_account_id, id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "DELETE FROM blocked_accounts WHERE owner_account_id = $1 AND id = $2",
+            )
+            .bind(owner_account_id)
+            .bind(id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
+    pub async fn is_blocked_address(
+        &self,
+        owner_account_id: &str,
+        address: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .is_blocked_address(owner_account_id, address)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "SELECT 1 FROM blocked_accounts WHERE owner_account_id = $1 AND address = $2 LIMIT 1",
+            )
+            .bind(owner_account_id)
+            .bind(address)
+            .fetch_optional(pool)
+            .await?
+            .is_some()),
+        }
+    }
+
+    pub async fn delete_account(&self, account_id: &str) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .delete_account(account_id)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(account_id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+                > 0),
+        }
+    }
+
     pub async fn update_account_folders(
         &self,
         account_id: &str,
@@ -3754,6 +3984,29 @@ impl Storage {
         }
     }
 
+    pub async fn delete_push_token(
+        &self,
+        account_id: &str,
+        token: &str,
+    ) -> Result<bool, StorageError> {
+        match &self.backend {
+            StorageBackend::Sqlite(storage) => storage
+                .lock()
+                .map_err(|_| StorageError::LockPoisoned)?
+                .delete_push_token(account_id, token)
+                .map_err(Into::into),
+            StorageBackend::Postgres(pool) => Ok(sqlx::query(
+                "DELETE FROM push_tokens WHERE owner_account_id = $1 AND token = $2",
+            )
+            .bind(account_id)
+            .bind(token)
+            .execute(pool)
+            .await?
+            .rows_affected()
+                > 0),
+        }
+    }
+
     pub async fn touch_presence(&self, account_id: &str, now: i64) -> Result<(), StorageError> {
         match &self.backend {
             StorageBackend::Sqlite(storage) => storage
@@ -3964,15 +4217,14 @@ impl Storage {
                     })
                 })
                 .collect::<Result<Vec<_>, sqlx::Error>>()?;
-                let folders = sqlx::query(
-                    "SELECT folders_json FROM account_folders WHERE account_id = $1",
-                )
-                .bind(account_id)
-                .fetch_optional(pool)
-                .await?
-                .and_then(|row| row.try_get::<String, _>("folders_json").ok())
-                .and_then(|value| serde_json::from_str(&value).ok())
-                .unwrap_or_default();
+                let folders =
+                    sqlx::query("SELECT folders_json FROM account_folders WHERE account_id = $1")
+                        .bind(account_id)
+                        .fetch_optional(pool)
+                        .await?
+                        .and_then(|row| row.try_get::<String, _>("folders_json").ok())
+                        .and_then(|value| serde_json::from_str(&value).ok())
+                        .unwrap_or_default();
                 let mut messages = Vec::new();
                 let mut read_receipts = Vec::new();
                 let mut delivery_receipts = Vec::new();
@@ -4856,6 +5108,8 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
          CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL DEFAULT 0, session_id TEXT, device_id TEXT, platform TEXT NOT NULL DEFAULT 'unknown', device_name TEXT, app_version TEXT, last_seen_at BIGINT);\
          CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL;\
          CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at BIGINT NOT NULL);\
+         CREATE TABLE IF NOT EXISTS blocked_accounts (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, id TEXT NOT NULL, address TEXT NOT NULL, handle TEXT NOT NULL, name TEXT NOT NULL, server TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(owner_account_id, id), UNIQUE(owner_account_id, address));\
+         CREATE INDEX IF NOT EXISTS blocked_accounts_owner ON blocked_accounts(owner_account_id, created_at DESC);\
          CREATE TABLE IF NOT EXISTS account_folders (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, folders_json TEXT NOT NULL, updated_at BIGINT NOT NULL);\
          CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at BIGINT NOT NULL, last_seen_at BIGINT, revoked_at BIGINT, PRIMARY KEY(owner_account_id, device_id));\
          CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL, handle TEXT, avatar TEXT NOT NULL, subtitle TEXT, can_write BOOLEAN NOT NULL DEFAULT TRUE, last_message TEXT NOT NULL DEFAULT '', last_message_at BIGINT, pinned BOOLEAN NOT NULL DEFAULT FALSE, online BOOLEAN NOT NULL DEFAULT FALSE, sort_order BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL);\
@@ -4910,9 +5164,8 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
                 "UPDATE messages SET message_json = CASE WHEN message_json = '' THEN \"{historical_message_column}\" ELSE message_json END"
             );
             sqlx::query(&copy_statement).execute(pool).await?;
-            let drop_statement = format!(
-                "ALTER TABLE messages DROP COLUMN \"{historical_message_column}\""
-            );
+            let drop_statement =
+                format!("ALTER TABLE messages DROP COLUMN \"{historical_message_column}\"");
             sqlx::query(&drop_statement).execute(pool).await?;
         } else {
             let rename_statement = format!(
@@ -4939,6 +5192,8 @@ async fn migrate_postgres(pool: &PgPool) -> Result<(), StorageError> {
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT",
         "CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id ON sessions(session_id) WHERE session_id IS NOT NULL",
         "CREATE TABLE IF NOT EXISTS account_settings (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, value_json TEXT NOT NULL, updated_at BIGINT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS blocked_accounts (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, id TEXT NOT NULL, address TEXT NOT NULL, handle TEXT NOT NULL, name TEXT NOT NULL, server TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(owner_account_id, id), UNIQUE(owner_account_id, address))",
+        "CREATE INDEX IF NOT EXISTS blocked_accounts_owner ON blocked_accounts(owner_account_id, created_at DESC)",
         "CREATE TABLE IF NOT EXISTS devices (owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, device_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'unknown', name TEXT, app_version TEXT, created_at BIGINT NOT NULL, last_seen_at BIGINT, revoked_at BIGINT, PRIMARY KEY(owner_account_id, device_id))",
     ] {
         sqlx::query(statement).execute(pool).await?;

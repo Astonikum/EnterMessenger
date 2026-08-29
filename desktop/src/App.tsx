@@ -4,7 +4,7 @@ import { MessengerView } from "./views/messenger-view";
 import { readTabState, writeTabState } from "./lib/app-state";
 import { EMPTY_MESSAGES } from "./lib/empty-messages";
 import { clearMessageCache, MESSAGE_CACHE_KEY_PREFIX, readMessageCache, readMessageCacheAsync, writeMessageCache } from "./lib/message-cache";
-import { acknowledgeMessage, createConversation, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type DeviceHistoryEntry, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
+import { acknowledgeMessage, createConversation, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type DeviceHistoryEntry, type RealtimeClose, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./lib/e2e";
 import { decryptMedia, encryptMedia, encryptMediaBytes, isAudioAttachment } from "./lib/media";
 import type { PendingMedia } from "./components/message-composer";
@@ -236,12 +236,13 @@ export default function App() {
     const profileId = state.activeProfileId;
     return profileId ? state.activeFolderByProfile?.[profileId] ?? ALL_FOLDER : ALL_FOLDER;
   });
+  const [localSettings, setLocalSettings] = useState<LocalClientSettings>(() => readLocalSettings());
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [editingMessage, setEditingMessage] = useState<Message | null>(null);
   const [messageToForward, setMessageToForward] = useState<Message | null>(null);
-  const [conversations, setConversations] = useState<Conversation[]>(() => readMessageCache(activeProfileId)?.conversations ?? []);
-  const [messagesByProfile, setMessagesByProfile] = useState<Record<string, Record<string, Message[]>>>(() => Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id)?.messages ?? EMPTY_MESSAGES])));
-  const [syncCursors, setSyncCursors] = useState<Record<string, number>>(() => Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id)?.cursor ?? 0])));
+  const [conversations, setConversations] = useState<Conversation[]>(() => readMessageCache(activeProfileId, localSettings.cachePolicy)?.conversations ?? []);
+  const [messagesByProfile, setMessagesByProfile] = useState<Record<string, Record<string, Message[]>>>(() => Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id, localSettings.cachePolicy)?.messages ?? EMPTY_MESSAGES])));
+  const [syncCursors, setSyncCursors] = useState<Record<string, number>>(() => Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id, localSettings.cachePolicy)?.cursor ?? 0])));
   const [outboxByProfile, setOutboxByProfile] = useState<Record<string, OutboxEntry[]>>(readOutbox);
   const [syncConnected, setSyncConnected] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
@@ -252,7 +253,6 @@ export default function App() {
   const [foldersByProfile, setFoldersByProfile] = useState<Record<string, ChatFolder[]>>(() => Object.fromEntries(profiles.map((profile) => [profile.id, readFolders(profile.id)])));
   const [folderEditor, setFolderEditor] = useState<ChatFolder | "new" | null>(null);
   const [folderPickerConversationId, setFolderPickerConversationId] = useState<string | null>(null);
-  const [localSettings, setLocalSettings] = useState<LocalClientSettings>(() => readLocalSettings());
   const [searchResult, setSearchResult] = useState<SearchUser | null>(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -264,7 +264,7 @@ export default function App() {
   const syncCursorsRef = useRef(syncCursors);
   const outboxRef = useRef(outboxByProfile);
   const retryingOutbox = useRef(new Set<string>());
-  const cacheUpdatedAtRef = useRef<Record<string, number>>(Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id)?.updatedAt ?? 0])));
+  const cacheUpdatedAtRef = useRef<Record<string, number>>(Object.fromEntries(profiles.map((profile) => [profile.id, readMessageCache(profile.id, localSettings.cachePolicy)?.updatedAt ?? 0])));
   const skipNextCacheWriteRef = useRef(false);
   const persistedOutboxProfilesRef = useRef(new Set(Object.keys(outboxByProfile)));
   const mediaOperationRef = useRef(0);
@@ -274,6 +274,10 @@ export default function App() {
   useEffect(() => {
     applyLocalSettings(localSettings);
   }, [localSettings]);
+
+  useEffect(() => {
+    if (localSettings.cachePolicy === "disabled") profiles.forEach((profile) => clearMessageCache(profile.id));
+  }, [localSettings.cachePolicy, profiles]);
 
   useEffect(() => {
     Object.entries(foldersByProfile).forEach(([profileId, folders]) => writeFolders(profileId, folders));
@@ -295,7 +299,7 @@ export default function App() {
   }
 
   function persistMessageCache(profileId: string, profileMessages: Record<string, Message[]>, cursor: number, profileConversations: Conversation[]) {
-    cacheUpdatedAtRef.current[profileId] = writeMessageCache(profileId, profileMessages, cursor, profileConversations);
+    cacheUpdatedAtRef.current[profileId] = writeMessageCache(profileId, profileMessages, cursor, profileConversations, localSettings.cachePolicy);
   }
 
   function setFoldersAndSync(profileId: string, nextFolders: ChatFolder[]) {
@@ -342,6 +346,7 @@ export default function App() {
       if (!profiles.some((profile) => profile.id === profileId)) return;
       setActiveProfileId(profileId);
       setActiveConversationId(conversationId);
+      setActivePanel("chats");
     }).then((cleanup) => {
       if (active) dispose = cleanup;
       else cleanup();
@@ -351,6 +356,7 @@ export default function App() {
       if (!detail?.profileId || !detail.conversationId || !profiles.some((profile) => profile.id === detail.profileId)) return;
       setActiveProfileId(detail.profileId);
       setActiveConversationId(detail.conversationId);
+      setActivePanel("chats");
     };
     window.addEventListener("enter:open-conversation", openConversation);
     return () => {
@@ -389,14 +395,14 @@ export default function App() {
       persistMessageCache(activeProfileId, messagesByProfile[activeProfileId] ?? EMPTY_MESSAGES, syncCursors[activeProfileId] ?? 0, conversations);
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [activeProfileId, conversations, messagesByProfile, syncCursors]);
+  }, [activeProfileId, conversations, localSettings.cachePolicy, messagesByProfile, syncCursors]);
 
   useEffect(() => {
     if (!activeProfileId) return;
     const flush = () => persistMessageCache(activeProfileId, messagesByProfile[activeProfileId] ?? EMPTY_MESSAGES, syncCursors[activeProfileId] ?? 0, conversations);
     window.addEventListener("pagehide", flush);
     return () => window.removeEventListener("pagehide", flush);
-  }, [activeProfileId, conversations, messagesByProfile, syncCursors]);
+  }, [activeProfileId, conversations, localSettings.cachePolicy, messagesByProfile, syncCursors]);
 
   useEffect(() => {
     const state = readTabState();
@@ -414,11 +420,11 @@ export default function App() {
   }, [activeConversationId, activeFolder, activePanel, activeProfileId]);
 
   useEffect(() => {
-    const cached = activeProfileId ? readMessageCache(activeProfileId) : null;
+    const cached = activeProfileId ? readMessageCache(activeProfileId, localSettings.cachePolicy) : null;
     setConversations(cached?.conversations ?? []);
     setActiveConversationId(activeProfileId ? readTabState().activeConversationByProfile?.[activeProfileId] ?? null : null);
     setActiveFolder(activeProfileId ? readTabState().activeFolderByProfile?.[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER);
-  }, [activeProfileId]);
+  }, [activeProfileId, localSettings.cachePolicy]);
 
   useEffect(() => {
     if (activeFolder !== ALL_FOLDER && !availableFolders.some((folder) => folder.id === activeFolder)) setActiveFolder(ALL_FOLDER);
@@ -447,7 +453,7 @@ export default function App() {
       if (!activeProfileId || !event.key?.startsWith(MESSAGE_CACHE_KEY_PREFIX)) return;
       const profileId = event.key.slice(MESSAGE_CACHE_KEY_PREFIX.length);
       if (profileId !== activeProfileId) return;
-      const cached = readMessageCache(profileId);
+      const cached = readMessageCache(profileId, localSettings.cachePolicy);
       if (!cached || (cached.updatedAt ?? 0) <= (cacheUpdatedAtRef.current[profileId] ?? 0)) return;
       cacheUpdatedAtRef.current[profileId] = cached.updatedAt ?? Date.now();
       skipNextCacheWriteRef.current = true;
@@ -517,6 +523,8 @@ export default function App() {
     const senderDeviceCache = new Map<string, Promise<PublicDeviceKey[]>>();
     const decryptAttempts = new Map<string, number>();
     const quarantinedMessageIds = new Set<string>();
+    let syncNotificationsReady = false;
+    let syncNotificationsAllowed = false;
 
     function senderDevicesFor(address: string) {
       const cached = senderDeviceCache.get(address);
@@ -695,6 +703,7 @@ export default function App() {
       }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
       logEvent("crypto", "Sync decryption completed", `success ${decryptedMessages.length}, retries ${retryingFailures.length}, skipped ${quarantinedCount}`, retryingFailures.length || quarantinedCount ? "warn" : "success");
       if (cancelled) return false;
+      const newIncomingMessages = decryptedMessages.filter(({ message }) => message.author === "them" && !seenMessageIds.has(message.id));
       const acknowledged = [...new Set(decryptedMessages
         .filter(({ message }) => message.author === "them")
         .map(({ message }) => message.id))];
@@ -709,7 +718,16 @@ export default function App() {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decryptedMessages), result.readReceipts), result.deliveryReceipts) };
       });
+      if (syncNotificationsReady && syncNotificationsAllowed) {
+        newIncomingMessages.forEach(({ conversationId, message }) => {
+          if (activeConversationIdRef.current === conversationId && document.visibilityState === "visible" && document.hasFocus()) return;
+          const conversation = conversations.find((item) => item.id === conversationId)
+            ?? result.conversations.find((item) => item.id === conversationId);
+          void notifyIncomingMessage({ profileId: profile.id, conversationId, title: conversation?.name ?? "Enter", text: message.text });
+        });
+      }
       if (retryingFailures.length === 0) advanceCursor(Math.max(cursor, result.nextCursor));
+      if (retryingFailures.length === 0) syncNotificationsReady = true;
       setMessageError(retryingFailures.length > 0
         ? `Не удалось расшифровать ${retryingFailures.length} сообщений. Повторю попытку (осталось ${MAX_DECRYPT_RETRIES - Math.max(...retryingFailures.map((messageId) => decryptAttempts.get(messageId) ?? 0))}).`
         : quarantinedCount > 0
@@ -799,17 +817,31 @@ export default function App() {
 
     let realtime: WebSocket | null = null;
     let reconnectTimer: number | null = null;
-    let fallbackInterval: number | null = null;
+    let fallbackTimer: number | null = null;
+    let fallbackDelay = 5_000;
+    let realtimeReady = false;
     let reconnectDelay = 1000;
 
     const startFallbackSync = () => {
-      if (fallbackInterval === null) fallbackInterval = window.setInterval(() => void syncOnce(), 500);
+      if (fallbackTimer !== null || realtimeReady) return;
+      fallbackTimer = window.setTimeout(() => {
+        fallbackTimer = null;
+        if (cancelled || realtimeReady) return;
+        syncNotificationsAllowed = true;
+        void syncOnce().catch(() => undefined).then(() => {
+          if (cancelled || realtimeReady) return;
+          fallbackDelay = Math.min(30_000, fallbackDelay * 2);
+          startFallbackSync();
+        });
+      }, fallbackDelay);
     };
     const stopFallbackSync = () => {
-      if (fallbackInterval !== null) {
-        window.clearInterval(fallbackInterval);
-        fallbackInterval = null;
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
       }
+      fallbackDelay = 5_000;
+      syncNotificationsAllowed = false;
     };
     const scheduleRealtimeReconnect = () => {
       if (cancelled || reconnectTimer !== null) return;
@@ -820,9 +852,11 @@ export default function App() {
         connectRealtime();
       }, delay);
     };
-    const handleRealtimeClose = () => {
+    const handleRealtimeClose = (details?: RealtimeClose) => {
       if (cancelled) return;
-      logEvent("realtime", "Realtime connection closed", "switching to reconnect", "warn");
+      realtimeReady = false;
+      const closeDetails = details ? `code ${details.code}, clean ${details.wasClean}${details.reason ? `, reason ${details.reason}` : ""}` : "code unknown";
+      logEvent("realtime", "Realtime connection closed", `${closeDetails}; switching to reconnect`, "warn");
       startFallbackSync();
       scheduleRealtimeReconnect();
     };
@@ -831,6 +865,7 @@ export default function App() {
       try {
         realtime = openRealtime(profile, cursor, (event) => {
           if (event.type === "ready") {
+            realtimeReady = true;
             logEvent("realtime", "Realtime connection established", undefined, "success");
             reconnectDelay = 1000;
             stopFallbackSync();
@@ -858,7 +893,7 @@ export default function App() {
 
     void (async () => {
       try {
-        const cached = await readMessageCacheAsync(profile.id);
+        const cached = await readMessageCacheAsync(profile.id, localSettings.cachePolicy);
         if (cancelled) return;
         if (cached) {
           cacheUpdatedAtRef.current[profile.id] = Math.max(cacheUpdatedAtRef.current[profile.id] ?? 0, cached.updatedAt ?? 0);
@@ -908,7 +943,7 @@ export default function App() {
       setOutboxProfile(nextProfile.id, pendingEntries.map((entry) => ({ ...entry, blocked: undefined, attempts: 0, nextAttemptAt: Date.now() })));
     }
     setActiveProfileId(nextProfile.id);
-    const cached = readMessageCache(nextProfile.id);
+    const cached = readMessageCache(nextProfile.id, localSettings.cachePolicy);
     setMessagesByProfile((current) => ({ ...current, [nextProfile.id]: cached?.messages ?? EMPTY_MESSAGES }));
     const cachedCursor = cached?.cursor ?? 0;
     syncCursorsRef.current[nextProfile.id] = cachedCursor;
@@ -1335,7 +1370,7 @@ export default function App() {
   function selectProfile(profile: Profile) {
     if (profile.id !== activeProfileId) cancelMediaOperation();
     if (activeProfileId) persistMessageCache(activeProfileId, messagesByProfile[activeProfileId] ?? EMPTY_MESSAGES, syncCursors[activeProfileId] ?? 0, conversations);
-    const cached = readMessageCache(profile.id);
+    const cached = readMessageCache(profile.id, localSettings.cachePolicy);
     setActiveProfileId(profile.id);
     setActiveConversationId(readTabState().activeConversationByProfile?.[profile.id] ?? null);
     setActiveFolder(readTabState().activeFolderByProfile?.[profile.id] ?? ALL_FOLDER);
@@ -1364,6 +1399,8 @@ export default function App() {
         activeProfile={activeProfile}
         folders={availableFolders}
         activeFolder={activeFolder}
+        chatListLayout={localSettings.chatListLayout}
+        mediaSettings={localSettings.media}
         conversations={conversationsWithPreviews}
         syncConnected={syncConnected}
         activeConversationId={activeConversationId}

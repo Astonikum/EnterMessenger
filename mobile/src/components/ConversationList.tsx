@@ -1,20 +1,23 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, FlatList, Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { Conversation, Profile, SearchUser } from "../types";
 import { folderContains, type ChatFolder } from "../folders";
-import { colors, fonts, radii } from "../theme";
+import { colors, fonts, radii, type ThemeColors } from "../theme";
 import { Icon } from "./Icon";
 import { ConversationAvatar, ProfileAvatar } from "./Avatar";
 import { SafeAreaSheet } from "./SafeAreaSheet";
 import { FolderEditorSheet, FolderMenuSheet, FolderPickerSheet, type FolderDraft } from "./FolderSheets";
+import { readSettings } from "../settings";
 
 type Action = "pin" | "mute" | "archive" | "delete" | "unread" | "folder";
 type Props = {
   profile?: Profile;
+  themeColors?: ThemeColors;
   syncConnected?: boolean;
   conversations: Conversation[];
   folders: ChatFolder[];
   activeFolder?: string;
+  listLayout?: "two-line" | "three-line";
   activeId: string | null;
   query: string;
   searchUser?: SearchUser | null;
@@ -39,31 +42,33 @@ function preview(value: string) {
   return compact.length > 54 ? `${compact.slice(0, 54).trimEnd()}…` : compact;
 }
 
-export function ConversationList({ profile, syncConnected = false, conversations, folders, activeFolder = ALL_FOLDER, activeId, query, searchUser, searchBusy, searchError, onQueryChange, onSelect, onProfilePress, onOpenSearchUser, onAction, onSelectFolder, onCreateFolder, onUpdateFolder, onDeleteFolder, onToggleConversationFolder }: Props) {
+export function ConversationList({ profile, themeColors = colors, syncConnected = false, conversations, folders, activeFolder = ALL_FOLDER, listLayout = "two-line", activeId, query, searchUser, searchBusy, searchError, onQueryChange, onSelect, onProfilePress, onOpenSearchUser, onAction, onSelectFolder, onCreateFolder, onUpdateFolder, onDeleteFolder, onToggleConversationFolder }: Props) {
   const [folderMenu, setFolderMenu] = useState<ChatFolder>();
   const [folderEditor, setFolderEditor] = useState<ChatFolder | "new" | null>(null);
   const [folderTarget, setFolderTarget] = useState<Conversation>();
+  const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
+  useEffect(() => { void readSettings().then((settings) => setDensity(settings.density)); }, []);
   const visible = useMemo(() => conversations.filter((item) => !item.archived && !item.deleted && (activeFolder === ALL_FOLDER || folders.some((folder) => folder.id === activeFolder && folderContains(folder, item))) && `${item.name} ${item.handle ?? ""} ${item.lastMessage}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned))), [activeFolder, conversations, folders, query]);
 
-  return <View style={styles.root}>
-    <View style={styles.header}><Image source={require("../../assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /><View style={styles.headerTitle}><Text style={styles.headerTitleText}>{syncConnected ? "Сообщения" : "Подключение..."}</Text></View><Pressable onPress={onProfilePress} hitSlop={8}>{profile ? <ProfileAvatar name={profile.name} size={40} /> : <View style={styles.emptyProfile}><Icon name="plus" size={19} color={colors.muted} /></View>}</Pressable></View>
-    <View style={styles.search}><Icon name="search" size={19} color={colors.muted} /><TextInput value={query} onChangeText={onQueryChange} placeholder="Поиск чатов или @username" placeholderTextColor={colors.muted} autoCapitalize="none" style={styles.searchInput} returnKeyType="search" /></View>
+  return <View style={[styles.root, { backgroundColor: themeColors.background }]}>
+    <View style={[styles.header, { backgroundColor: themeColors.background }]}><Image source={require("../../assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /><View style={styles.headerTitle}><Text style={[styles.headerTitleText, { color: themeColors.foreground }]}>{syncConnected ? "Сообщения" : "Подключение..."}</Text></View><Pressable onPress={onProfilePress} hitSlop={8}>{profile ? <ProfileAvatar name={profile.name} size={40} /> : <View style={[styles.emptyProfile, { borderColor: themeColors.border }]}><Icon name="plus" size={19} color={themeColors.muted} /></View>}</Pressable></View>
+    <View style={[styles.search, { backgroundColor: themeColors.surface, borderColor: themeColors.border }]}><Icon name="search" size={19} color={themeColors.muted} /><TextInput value={query} onChangeText={onQueryChange} placeholder="Поиск чатов или @username" placeholderTextColor={themeColors.muted} autoCapitalize="none" style={[styles.searchInput, { color: themeColors.foreground }]} returnKeyType="search" /></View>
     <ScrollView bounces={false} horizontal style={styles.folderScroll} showsHorizontalScrollIndicator={false} contentContainerStyle={styles.folderBar}>
-      <FolderChip active={activeFolder === ALL_FOLDER} icon="chat" label="Все чаты" onPress={() => onSelectFolder(ALL_FOLDER)} />
-      {folders.map((folder) => <FolderChip key={folder.id} active={activeFolder === folder.id} icon={folder.icon} label={folder.name} onPress={() => onSelectFolder(folder.id)} onLongPress={() => setFolderMenu(folder)} />)}
-      <Pressable accessibilityLabel="+" onPress={() => setFolderEditor("new")} style={({ pressed }) => [styles.folderChip, styles.folderAddButton, pressed && styles.pressed]}><Icon name="plus" size={15} color={colors.muted} /></Pressable>
+      <FolderChip themeColors={themeColors} active={activeFolder === ALL_FOLDER} icon="chat" label="Все чаты" onPress={() => onSelectFolder(ALL_FOLDER)} />
+      {folders.map((folder) => <FolderChip key={folder.id} themeColors={themeColors} active={activeFolder === folder.id} icon={folder.icon} label={folder.name} onPress={() => onSelectFolder(folder.id)} onLongPress={() => setFolderMenu(folder)} />)}
+      <Pressable accessibilityLabel="+" onPress={() => setFolderEditor("new")} style={({ pressed }) => [styles.folderChip, styles.folderAddButton, { backgroundColor: themeColors.surface, borderColor: themeColors.border }, pressed && styles.pressed]}><Icon name="plus" size={15} color={themeColors.muted} /></Pressable>
     </ScrollView>
-    {searchBusy && <View style={styles.inlineNotice}><ActivityIndicator size="small" color={colors.primary} /><Text style={styles.noticeText}>Ищем пользователя…</Text></View>}
-    {!!searchError && <View style={[styles.inlineNotice, styles.errorNotice]}><Icon name="error" size={18} color={colors.danger} /><Text style={[styles.noticeText, styles.errorText]}>{searchError}</Text></View>}
-    {searchUser && <Pressable style={styles.searchResult} onPress={() => onOpenSearchUser(searchUser)} disabled={searchUser.deviceCount === 0}><ProfileAvatar name={searchUser.name} size={44} /><View style={styles.rowCopy}><Text style={styles.rowName}>{searchUser.name}</Text><Text style={styles.rowMeta} numberOfLines={1}>@{searchUser.handle} · {searchUser.server.replace(/^https?:\/\//, "")}</Text></View><Icon name="arrowForward" size={19} color={colors.muted} /></Pressable>}
-    <FlatList bounces={false} data={visible} keyExtractor={(item) => item.id} contentContainerStyle={styles.list} showsVerticalScrollIndicator={false} renderItem={({ item }) => <ConversationRow conversation={item} folders={folders} active={activeId === item.id} onSelect={() => onSelect(item.id)} onAction={onAction} onOpenFolderPicker={() => setFolderTarget(item)} />} ListEmptyComponent={<View style={styles.empty}><Text style={styles.emptyTitle}>Нет чатов</Text></View>} />
+    {searchBusy && <View style={[styles.inlineNotice, { backgroundColor: themeColors.surface }]}><ActivityIndicator size="small" color={themeColors.primary} /><Text style={[styles.noticeText, { color: themeColors.muted }]}>Ищем пользователя…</Text></View>}
+    {!!searchError && <View style={[styles.inlineNotice, styles.errorNotice, { backgroundColor: themeColors.surface }]}><Icon name="error" size={18} color={themeColors.danger} /><Text style={[styles.noticeText, styles.errorText, { color: themeColors.danger }]}>{searchError}</Text></View>}
+    {searchUser && <Pressable style={[styles.searchResult, { backgroundColor: themeColors.accent }]} onPress={() => onOpenSearchUser(searchUser)} disabled={searchUser.deviceCount === 0}><ProfileAvatar name={searchUser.name} size={44} /><View style={styles.rowCopy}><Text style={[styles.rowName, { color: themeColors.foreground }]}>{searchUser.name}</Text><Text style={[styles.rowMeta, { color: themeColors.muted }]} numberOfLines={1}>@{searchUser.handle} · {searchUser.server.replace(/^https?:\/\//, "")}</Text></View><Icon name="arrowForward" size={19} color={themeColors.muted} /></Pressable>}
+    <FlatList bounces={false} data={visible} keyExtractor={(item) => item.id} contentContainerStyle={styles.list} showsVerticalScrollIndicator={false} renderItem={({ item }) => <ConversationRow themeColors={themeColors} conversation={item} folders={folders} listLayout={listLayout} density={density} active={activeId === item.id} onSelect={() => onSelect(item.id)} onAction={onAction} onOpenFolderPicker={() => setFolderTarget(item)} />} ListEmptyComponent={<View style={styles.empty}><Text style={[styles.emptyTitle, { color: themeColors.foreground }]}>Нет чатов</Text></View>} />
     <FolderMenuSheet visible={Boolean(folderMenu)} folder={folderMenu} onClose={() => setFolderMenu(undefined)} onOpen={() => { if (folderMenu) onSelectFolder(folderMenu.id); }} onEdit={() => { if (folderMenu) setFolderEditor(folderMenu); }} onDelete={() => { if (folderMenu) onDeleteFolder(folderMenu); }} />
     <FolderEditorSheet visible={folderEditor !== null} folder={folderEditor === "new" ? null : folderEditor} onClose={() => setFolderEditor(null)} onSave={(draft) => { if (folderEditor === "new") onCreateFolder(draft); else if (folderEditor) onUpdateFolder({ ...folderEditor, ...draft }); setFolderEditor(null); }} />
     <FolderPickerSheet visible={Boolean(folderTarget)} conversation={folderTarget} folders={folders} onClose={() => setFolderTarget(undefined)} onToggle={(folderId, included) => { if (folderTarget) onToggleConversationFolder(folderTarget.id, folderId, included); }} />
   </View>;
 }
 
-function ConversationRow({ conversation, folders, active, onSelect, onAction, onOpenFolderPicker }: { conversation: Conversation; folders: ChatFolder[]; active: boolean; onSelect: () => void; onAction: (conversation: Conversation, action: Action) => void; onOpenFolderPicker: () => void }) {
+function ConversationRow({ themeColors = colors, conversation, folders, listLayout, density = "comfortable", active, onSelect, onAction, onOpenFolderPicker }: { themeColors?: ThemeColors; conversation: Conversation; folders: ChatFolder[]; listLayout: "two-line" | "three-line"; density?: "comfortable" | "compact"; active: boolean; onSelect: () => void; onAction: (conversation: Conversation, action: Action) => void; onOpenFolderPicker: () => void }) {
   const [actionsVisible, setActionsVisible] = useState(false);
   function openActions() {
     setActionsVisible(true);
@@ -77,10 +82,10 @@ function ConversationRow({ conversation, folders, active, onSelect, onAction, on
 
   return <>
     <View>
-    <Pressable onPress={onSelect} onLongPress={openActions} style={({ pressed }) => [styles.row, active && styles.activeRow, pressed && styles.pressed]}>
-    <View><ConversationAvatar conversation={conversation} size={48} />{conversation.online && <View style={styles.online} />}</View>
-    <View style={styles.rowCopy}><View style={styles.nameLine}><Text style={styles.rowName} numberOfLines={1}>{conversation.name}</Text>{conversation.pinned && <Icon name="pin" size={13} color={colors.primary} />}{conversation.muted && <Icon name="notificationsOff" size={13} color={colors.muted} />}{folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" size={13} color={colors.muted} /> : null}</View><View style={styles.previewLine}><Text style={styles.rowMessage} numberOfLines={1}>{preview(conversation.lastMessage)}</Text>{conversation.time ? <Text style={styles.rowTime}>{conversation.time}</Text> : null}</View></View>
-    <View style={styles.rowRight}>{conversation.unread ? <View style={styles.unread}><Text style={styles.unreadText}>{conversation.unread}</Text></View> : null}</View>
+    <Pressable onPress={onSelect} onLongPress={openActions} style={({ pressed }) => [styles.row, density === "compact" && styles.compactRow, active && { backgroundColor: themeColors.accent }, pressed && styles.pressed]}>
+    <View><ConversationAvatar conversation={conversation} size={48} />{conversation.online && <View style={[styles.online, { borderColor: themeColors.background }]} />}</View>
+    <View style={styles.rowCopy}><View style={styles.nameLine}><Text style={[styles.rowName, { color: themeColors.foreground }]} numberOfLines={1}>{conversation.name}</Text>{conversation.pinned && <Icon name="pin" size={13} color={themeColors.primary} />}{conversation.muted && <Icon name="notificationsOff" size={13} color={themeColors.muted} />}{folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" size={13} color={themeColors.muted} /> : null}</View><View style={styles.previewLine}><Text style={[styles.rowMessage, { color: themeColors.muted }]} numberOfLines={1}>{preview(conversation.lastMessage)}</Text>{conversation.time ? <Text style={[styles.rowTime, { color: themeColors.muted }]}>{conversation.time}</Text> : null}</View>{listLayout === "three-line" && <Text style={[styles.rowExtra, { color: themeColors.muted }]} numberOfLines={1}>{conversation.handle ? `@${conversation.handle.replace(/^@/, "")}` : conversation.online ? "В сети" : "Не в сети"}</Text>}</View>
+    <View style={styles.rowRight}>{conversation.unread ? <View style={[styles.unread, { backgroundColor: themeColors.primary }]}><Text style={[styles.unreadText, { color: themeColors.primaryText }]}>{conversation.unread}</Text></View> : null}</View>
     </Pressable>
     </View>
     <Modal visible={actionsVisible} transparent animationType="slide" onRequestClose={() => setActionsVisible(false)}>
@@ -100,8 +105,8 @@ function ConversationRow({ conversation, folders, active, onSelect, onAction, on
   </>;
 }
 
-function FolderChip({ active, icon, label, onPress, onLongPress }: { active: boolean; icon: "chat" | "folder" | "person" | "star" | "bookmark"; label: string; onPress: () => void; onLongPress?: () => void }) {
-  return <Pressable style={({ pressed }) => [styles.folderChip, active && styles.folderChipActive, pressed && styles.pressed]} onPress={onPress} onLongPress={onLongPress}><Icon name={icon} size={15} color={active ? colors.foreground : colors.muted} /><Text style={[styles.folderText, active && styles.folderTextActive]}>{label}</Text></Pressable>;
+function FolderChip({ themeColors = colors, active, icon, label, onPress, onLongPress }: { themeColors?: ThemeColors; active: boolean; icon: "chat" | "folder" | "person" | "star" | "bookmark"; label: string; onPress: () => void; onLongPress?: () => void }) {
+  return <Pressable style={({ pressed }) => [styles.folderChip, { backgroundColor: themeColors.surface, borderColor: themeColors.border }, active && { borderColor: themeColors.primary, backgroundColor: themeColors.accent }, pressed && styles.pressed]} onPress={onPress} onLongPress={onLongPress}><Icon name={icon} size={15} color={active ? themeColors.foreground : themeColors.muted} /><Text style={[styles.folderText, { color: themeColors.muted }, active && { color: themeColors.foreground }]}>{label}</Text></Pressable>;
 }
 
 function ConversationAction({ icon, label, onPress, destructive = false }: { icon: "pin" | "notifications" | "notificationsOff" | "chat" | "folder" | "archive" | "delete"; label: string; onPress: () => void; destructive?: boolean }) {
@@ -133,6 +138,7 @@ const styles = StyleSheet.create({
   searchResult: { marginHorizontal: 12, marginBottom: 8, padding: 10, borderRadius: radii.md, backgroundColor: colors.accent, flexDirection: "row", alignItems: "center", gap: 12 },
   list: { flexGrow: 1, paddingHorizontal: 12, paddingBottom: 18 },
   row: { minHeight: 72, borderRadius: radii.md, paddingHorizontal: 8, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 12 },
+  compactRow: { minHeight: 58, paddingVertical: 5, gap: 9 },
   activeRow: { backgroundColor: colors.accent },
   pressed: { opacity: 0.72 },
   online: { position: "absolute", right: -1, bottom: 1, width: 12, height: 12, borderRadius: 6, backgroundColor: colors.success, borderWidth: 2, borderColor: colors.background },
@@ -142,6 +148,7 @@ const styles = StyleSheet.create({
   rowName: { flexShrink: 1, color: colors.foreground, fontFamily: fonts.bodySemibold, fontSize: 15 },
   rowMeta: { color: colors.muted, fontFamily: fonts.body, fontSize: 12 },
   rowMessage: { flex: 1, minWidth: 0, color: colors.muted, fontFamily: fonts.body, fontSize: 13 },
+  rowExtra: { color: colors.muted, fontFamily: fonts.body, fontSize: 11 },
   rowRight: { alignItems: "flex-end", alignSelf: "stretch", justifyContent: "center", gap: 6, paddingVertical: 1 },
   rowTime: { color: colors.muted, fontFamily: fonts.body, fontSize: 11 },
   unread: { minWidth: 20, height: 20, borderRadius: 10, backgroundColor: colors.primary, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 },
