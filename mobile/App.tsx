@@ -16,7 +16,7 @@ import { logEvent } from "./src/logs";
 import { friendlyError } from "./src/client-errors";
 import { EMPTY_MESSAGES, makeId, messageTime } from "./src/data";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./src/rn-e2e";
-import { acknowledgeMessage, createConversation, deleteAccount as deleteRemoteAccount, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, registerPushToken, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type RealtimeClose, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type SyncResponse, uploadMedia } from "./src/rn-api";
+import { acknowledgeMessage, createConversation, deleteAccount as deleteRemoteAccount, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, registerPushToken, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type RealtimeClose, type RealtimeEvent, type RemoteMessage, type SyncResponse, uploadMedia } from "./src/rn-api";
 import { decryptMedia, encryptMedia, encryptMediaBytes } from "./src/media";
 import type { PendingMedia } from "./src/components/ChatScreen";
 import { colors, fonts, makeThemeColors } from "./src/theme";
@@ -25,10 +25,15 @@ import { createRealtimeQueue, createSyncQueue } from "./src/sync-queue";
 import { createRealtimeLifecycle } from "./src/realtime-lifecycle";
 import { configureNotifications, notifyIncomingMessage, registerForPushNotifications } from "./src/notifications";
 import type { Conversation, Message, OutboxEntry, Profile, SearchUser } from "./src/types";
+import { messagePreview } from "../common/src/messages.ts";
 import { deleteSessionToken, readSessionToken, writeSessionToken } from "./src/secure-session";
 import { limitMessageList, limitMessagesByProfile, limitOutboxEntries, MAX_OUTBOX_ATTEMPTS, retryDelay, sanitizeMessagesByProfile, sanitizeOutboxByProfile, sanitizeSyncCursors } from "./src/storage-limits";
+import { isCachedConversation } from "../common/src/storage-models.ts";
 import { folderContains, sanitizeFoldersByProfile, type ChatFolder } from "./src/folders";
 import { DEFAULT_SETTINGS, readSettings, type MobileSettings } from "./src/settings";
+import { CommonDebugProvider } from "./src/common-debug";
+import { isUnauthorized, mergeDeliveryReceipts, mergeReadReceipts, mergeRemoteMessages } from "../common/src/message-state.ts";
+import { formatProfileAddress } from "../common/src/address.ts";
 
 const PROFILES_KEY = "enter-profiles";
 const MESSAGES_KEY = "enter-mobile-messages";
@@ -50,16 +55,6 @@ type NavigationState = {
   activeFolderByProfile?: Record<string, string>;
   screen?: Screen;
 };
-
-function isCachedConversation(value: unknown): value is Conversation {
-  if (!value || typeof value !== "object") return false;
-  const conversation = value as Partial<Conversation>;
-  return typeof conversation.id === "string"
-    && typeof conversation.name === "string"
-    && typeof conversation.avatar === "string"
-    && typeof conversation.lastMessage === "string"
-    && typeof conversation.time === "string";
-}
 
 type StoredProfile = Omit<Profile, "token"> & { token?: string };
 
@@ -87,33 +82,16 @@ function profileForStorage(profile: Profile): StoredProfile {
   return metadata;
 }
 
-function profileAddress(profile: Profile) {
-  return `${profile.handle.replace(/^@+/, "")}@${profile.server.replace(/^https?:\/\//, "")}`;
-}
-
-function messagePreview(message: Message) {
-  if (message.text.trim()) return message.text;
-  const attachments = message.attachments ?? [];
-  if (attachments.some(({ kind }) => kind === "image")) return "[Фото]";
-  if (attachments.some(({ kind }) => kind === "video")) return "[Видео]";
-  if (attachments.some(({ kind }) => kind === "audio")) return "[Аудио]";
-  return attachments.length > 0 ? "[Файлы]" : "";
-}
-
-function isUnauthorized(reason: unknown) {
-  return reason instanceof Error && /\b401\b/.test(reason.message);
-}
-
 async function prepareProfile(profile: Profile, password?: string) {
   const device = await ensureDeviceKeys(profile.id);
   const account = password ? await ensureAccountKey(profile.id, password) : await readAccountKey(profile.id);
   await registerDeviceKey(profile, deviceKeyBundle(device), account ? { keyId: account.keyId, encryptionPublicKey: account.encryptionPublicKey } : undefined);
-  return { device, account: account ? accountKeyBundle(account, profileAddress(profile)) : null, bundle: { ...deviceKeyBundle(device), address: profileAddress(profile) } satisfies PublicDeviceKey };
+  return { device, account: account ? accountKeyBundle(account, formatProfileAddress(profile.handle, profile.server)) : null, bundle: { ...deviceKeyBundle(device), address: formatProfileAddress(profile.handle, profile.server) } satisfies PublicDeviceKey };
 }
 
 async function allDeviceKeys(profile: Profile, ownBundle: PublicDeviceKey) {
   try {
-    const keys = await fetchPublicDeviceKeys(profile, profileAddress(profile));
+    const keys = await fetchPublicDeviceKeys(profile, formatProfileAddress(profile.handle, profile.server));
     return keys.some((key) => key.keyId === ownBundle.keyId) ? keys : [ownBundle, ...keys];
   } catch {
     return [ownBundle];
@@ -126,46 +104,6 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
   if (!sender) throw new Error("Ключ устройства отправителя не найден");
   const payload = decodeMessagePayload(await decryptMessage(profile, remote.encryptedMessage, sender));
   return { id: remote.encryptedMessage.message_id, author: remote.author, text: payload.text, editOf: payload.editOf, attachments: payload.attachments, time: messageTime(new Date(remote.createdAt)), stackId: remote.stackId, encryptedMessage: remote.encryptedMessage };
-}
-
-function resolveMessageEdits(messages: Message[]) {
-  const baseMessages = messages.filter((message) => !message.editOf);
-  const editEvents = messages.filter((message) => Boolean(message.editOf));
-  editEvents.forEach((edit) => {
-    const targetIndex = baseMessages.findIndex((message) => message.id === edit.editOf);
-    if (targetIndex >= 0) baseMessages[targetIndex] = { ...baseMessages[targetIndex], text: edit.text, edited: true };
-  });
-  return [...baseMessages, ...editEvents];
-}
-
-function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array<{ conversationId: string; message: Message }>) {
-  const next = { ...current };
-  incoming.forEach(({ conversationId, message }) => {
-    const existing = next[conversationId] ?? [];
-    const index = existing.findIndex((item) => item.id === message.id);
-    if (index < 0) next[conversationId] = [...existing, message];
-    else { const replaced = [...existing]; replaced[index] = { ...replaced[index], ...message, readAt: message.readAt ?? replaced[index].readAt, deliveredAt: message.deliveredAt ?? replaced[index].deliveredAt }; next[conversationId] = replaced; }
-    next[conversationId] = limitMessageList(resolveMessageEdits(next[conversationId]));
-  });
-  return next;
-}
-
-function mergeReadReceipts(current: Record<string, Message[]>, receipts: Array<{ messageId: string; readAt: number }>) {
-  if (receipts.length === 0) return current;
-  const reads = new Map(receipts.map((receipt) => [receipt.messageId, receipt.readAt]));
-  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
-    const readAt = reads.get(message.id);
-    return readAt && (!message.readAt || readAt > message.readAt) ? { ...message, readAt } : message;
-  })]));
-}
-
-function mergeDeliveryReceipts(current: Record<string, Message[]>, receipts: RemoteDeliveryReceipt[]) {
-  if (receipts.length === 0) return current;
-  const deliveredAtByMessage = new Map(receipts.map((receipt) => [receipt.messageId, receipt.deliveredAt]));
-  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
-    const deliveredAt = deliveredAtByMessage.get(message.id);
-    return deliveredAt && (!message.deliveredAt || deliveredAt > message.deliveredAt) ? { ...message, deliveredAt } : message;
-  })]));
 }
 
 export default function App() {
@@ -623,7 +561,7 @@ export default function App() {
       decrypted.forEach(({ message }) => seenMessageIds.add(message.id));
       setMessagesByProfile((current) => {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
-        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
+        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted, limitMessageList), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
       });
       if (syncNotificationsReady && syncNotificationsAllowed) {
         newIncomingMessages.forEach(({ conversationId, message }) => {
@@ -687,7 +625,7 @@ export default function App() {
           seenMessageIds.add(message.id);
           setMessagesByProfile((current) => {
             const existing = current[profile.id] ?? EMPTY_MESSAGES;
-            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }]) };
+            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }], limitMessageList) };
           });
           if (isNewMessage && event.message.author === "them") {
             updateConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
@@ -1149,16 +1087,16 @@ export default function App() {
     if (action === "mute") updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, muted: !item.muted } : item));
   }
 
-  if (!hydrated) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider>;
-  if (profiles.length === 0 || showAuth) return <SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider>;
+  if (!hydrated) return <CommonDebugProvider enabled={false}><SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider></CommonDebugProvider>;
+  if (profiles.length === 0 || showAuth) return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider></CommonDebugProvider>;
 
-  return <SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar barStyle={themeColors.background === "#f5f5f7" ? "dark-content" : "light-content"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
+  return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar barStyle={themeColors.background === "#f5f5f7" ? "dark-content" : "light-content"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
     <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} themeColors={themeColors} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} onDeleteAccount={deleteAccountAndProfile} onSettingsChange={setLocalSettings} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} messageTextSize={localSettings.messageTextSize} bubbleRadius={localSettings.bubbleRadius} themeColors={themeColors} mediaSettings={localSettings.media} energySavingActive={energySavingActive} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} themeColors={themeColors} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} listLayout={localSettings.chatListLayout} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
     {screen !== "chat" && <BottomNav themeColors={themeColors} screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
     <ProfileSheet visible={showProfiles} profiles={profiles} activeProfile={activeProfile} onClose={() => setShowProfiles(false)} onSelect={selectProfile} onAdd={() => setShowAuth(true)} onRemove={removeProfile} />
     <ForwardSheet visible={Boolean(forwardMessage)} message={forwardMessage} conversations={conversations} currentId={activeConversationId} onClose={() => setForwardMessage(null)} onForward={(id) => forwardMessage && sendForwardedMessage(forwardMessage, id)} />
     {screen === "logs" && <View style={styles.logsOverlay}><LogsScreen onClose={() => setScreen("settings")} /></View>}
-  </View></SafeAreaView></SafeAreaProvider>;
+  </View></SafeAreaView></SafeAreaProvider></CommonDebugProvider>;
 }
 
 function BottomNav({ themeColors = colors, screen, onInbox, onProfile, onSettings }: { themeColors?: typeof colors; screen: Screen; onInbox: () => void; onProfile: () => void; onSettings: () => void }) {

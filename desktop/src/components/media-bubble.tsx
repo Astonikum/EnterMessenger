@@ -7,19 +7,9 @@ import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./ui/dialog";
 import { Icon } from "./ui/icon";
+import { formatDuration, formatFileSize } from "../../../common/src/format.ts";
 
-function formatFileSize(size: number) {
-  if (size < 1024) return `${size} Б`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
-  return `${(size / (1024 * 1024)).toFixed(size > 10 * 1024 * 1024 ? 0 : 1)} МБ`;
-}
-
-function formatTime(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
-  const total = Math.floor(seconds);
-  const minutes = Math.floor(total / 60);
-  return `${minutes}:${String(total % 60).padStart(2, "0")}`;
-}
+const formatTime = formatDuration;
 
 const speedOptions = [
   { value: 0.5, label: "Медленно" },

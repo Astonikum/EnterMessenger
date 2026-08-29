@@ -8,8 +8,9 @@ import { DEFAULT_SETTINGS, readSettings, writeSettings, type MobileSettings } fr
 import { blockAccount, changePassword, deleteDevice, deleteSession, fetchAccountSettings, fetchBlacklist, fetchDevices, fetchSessions, refreshSessionMetadata, revokeOtherSessions, unblockAccount, updateAccountSettings, type AccountDevice, type AccountSession, type AccountSettings, type BlockedAccount } from "../rn-api";
 import { friendlyError } from "../client-errors";
 import { CURRENT_VERSION, fetchLatestRelease, isNewerVersion, type PlatformRelease } from "../github-releases";
+import { deviceDetails, deviceTitle, formatReleaseDate, formatSessionDate, knownValue, sessionDetails, sessionTitle, shortId } from "../../../common/src/format.ts";
 
-type CategoryId = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "updates" | "logs";
+type CategoryId = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "debug" | "updates" | "logs";
 type Category = { id: CategoryId; label: string; icon: IconName };
 
 const categories: Category[] = [
@@ -20,6 +21,7 @@ const categories: Category[] = [
   { id: "privacy", label: "Приватность", icon: "key" },
   { id: "storage", label: "Данные и хранилище", icon: "database" },
   { id: "energy", label: "Энергосбережение", icon: "speed" },
+  { id: "debug", label: "Debug", icon: "logs" },
   { id: "updates", label: "Обновления", icon: "download" },
   { id: "logs", label: "Диагностические логи", icon: "logs" },
 ];
@@ -76,7 +78,6 @@ export function SettingsScreen({ profile, themeColors = colors, onClose, onOpenL
   }, [category, profile]);
 
   useEffect(() => {
-    if (category !== "updates") return;
     const controller = new AbortController();
     setUpdateState((current) => ({ ...current, loading: true, error: "" }));
     void fetchLatestRelease("mobile", controller.signal)
@@ -86,7 +87,7 @@ export function SettingsScreen({ profile, themeColors = colors, onClose, onOpenL
         setUpdateState({ loading: false, error: friendlyError(reason, "Не удалось проверить релизы GitHub"), release: null, checkedAt: Date.now() });
       });
     return () => controller.abort();
-  }, [category, updateRefreshKey]);
+  }, [updateRefreshKey]);
 
   function saveLocal(patch: Partial<MobileSettings>) {
     const next = { ...localSettings, ...patch };
@@ -136,7 +137,8 @@ export function SettingsScreen({ profile, themeColors = colors, onClose, onOpenL
     await runAction("Пароль изменён", async () => { await changePassword(profile, { currentPassword: passwords.current, newPassword: passwords.next }); setPasswords({ current: "", next: "", confirm: "" }); });
   }
 
-  if (!category) return <ThemeContext.Provider value={themeColors}><View style={[styles.root, { backgroundColor: themeColors.background }]}><Header title="Настройки" themeColors={themeColors} onBack={onClose} centered /><ScrollView contentContainerStyle={styles.categoryList} showsVerticalScrollIndicator={false}>{categories.map((item) => <Pressable key={item.id} onPress={() => { if (item.id === "logs") { onOpenLogs(); return; } setRemoteState(idleState); setLocalState(idleState); setCategory(item.id); }} style={({ pressed }) => [styles.category, { backgroundColor: themeColors.surface }, pressed && styles.pressed]} accessibilityRole="button" accessibilityLabel={item.label}><View style={[styles.categoryIcon, { backgroundColor: themeColors.accent }]}><Icon name={item.icon} size={21} color={themeColors.primary} /></View><View style={styles.categoryCopy}><Text style={[styles.categoryLabel, { color: themeColors.foreground }]}>{item.label}</Text></View><Icon name="arrowForward" size={19} color={themeColors.muted} /></Pressable>)}</ScrollView></View></ThemeContext.Provider>;
+  const availableUpdate = updateState.release && isNewerVersion(updateState.release.version) ? updateState.release : null;
+  if (!category) return <ThemeContext.Provider value={themeColors}><View style={[styles.root, { backgroundColor: themeColors.background }]}><Header title="Настройки" themeColors={themeColors} onBack={onClose} centered /><ScrollView contentContainerStyle={styles.categoryList} showsVerticalScrollIndicator={false}>{availableUpdate && <UpdateBanner release={availableUpdate} onPress={() => { setRemoteState(idleState); setLocalState(idleState); setCategory("updates"); }} />}{categories.map((item) => <Pressable key={item.id} onPress={() => { if (item.id === "logs") { onOpenLogs(); return; } setRemoteState(idleState); setLocalState(idleState); setCategory(item.id); }} style={({ pressed }) => [styles.category, { backgroundColor: themeColors.surface }, pressed && styles.pressed]} accessibilityRole="button" accessibilityLabel={item.label}><View style={[styles.categoryIcon, { backgroundColor: themeColors.accent }]}><Icon name={item.icon} size={21} color={themeColors.primary} /></View><View style={styles.categoryCopy}><Text style={[styles.categoryLabel, { color: themeColors.foreground }]}>{item.label}</Text></View><Icon name="arrowForward" size={19} color={themeColors.muted} /></Pressable>)}</ScrollView></View></ThemeContext.Provider>;
 
   const current = categories.find((item) => item.id === category)!;
   return <ThemeContext.Provider value={themeColors}><View style={[styles.root, { backgroundColor: themeColors.background }]}><Header title={current.label} themeColors={themeColors} onBack={() => setCategory(null)} /><ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}><Feedback state={remoteState} /><Feedback state={localState} /><SettingsContent category={category} localSettings={localSettings} saveLocal={saveLocal} account={account} onUpdatePrivacy={updatePrivacy} passwords={passwords} setPasswords={setPasswords} onSavePassword={() => { void savePassword(); }} devices={devices} sessions={sessions} blocked={blocked} profile={profile} updates={updateState} onCheckUpdates={() => setUpdateRefreshKey((value) => value + 1)} onDeleteDevice={(device) => confirmAction("Удалить устройство?", device.name ?? device.deviceId, "Устройство удалено", async () => { await deleteDevice(profile, device.deviceId); setDevices((items) => items.filter((item) => item.deviceId !== device.deviceId)); })} onDeleteSession={(session) => confirmAction("Завершить сессию?", session.deviceName ?? session.id, "Сессия завершена", async () => { await deleteSession(profile, session.id); setSessions((items) => items.filter((item) => item.id !== session.id)); })} onRevokeOthers={() => confirmAction("Завершить другие сессии?", "На других устройствах потребуется войти снова.", "Другие сессии завершены", async () => { await revokeOtherSessions(profile); setSessions((items) => items.filter((item) => item.current)); })} onBlock={(address) => runAction("Пользователь заблокирован", async () => { const value = await blockAccount(profile, address); setBlocked((items) => [value, ...items.filter((item) => item.address !== value.address)]); })} onUnblock={(entry) => runAction("Блокировка снята", async () => { await unblockAccount(profile, entry.id); setBlocked((items) => items.filter((item) => item.id !== entry.id)); })} onClearMessageCache={() => confirmAction("Очистить кэш сообщений?", "Локальные сообщения будут загружены снова при синхронизации.", "Кэш сообщений очищен", onClearMessageCache)} onClearOutbox={() => confirmAction("Очистить очередь отправки?", "Неотправленные сообщения будут удалены с этого устройства.", "Очередь отправки очищена", onClearOutbox)} onForgetKeys={() => confirmAction("Забыть приватные ключи?", "История на этом устройстве перестанет расшифровываться до повторной настройки.", "Локальные ключи удалены", onForgetLocalPrivateKeys)} onDeleteAccount={() => confirmAction("Удалить аккаунт?", "Аккаунт и его данные на сервере будут удалены без возможности восстановления.", "Аккаунт удалён", onDeleteAccount)} /></ScrollView></View></ThemeContext.Provider>;
@@ -154,51 +156,9 @@ function Feedback({ state }: { state: OperationState }) {
   return null;
 }
 
-function knownValue(value: string | null | undefined) {
-  const normalized = value?.trim();
-  return normalized && normalized.toLowerCase() !== "unknown" ? normalized : undefined;
-}
-
-function shortId(value: string | null | undefined) {
-  return value ? value.slice(0, 8) : "—";
-}
-
-function formatSessionDate(value: number | null | undefined) {
-  return value && Number.isFinite(value)
-    ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value))
-    : "—";
-}
-
-function deviceTitle(device: AccountDevice) {
-  return knownValue(device.name) || `Устройство ${shortId(device.deviceId)}`;
-}
-
-function deviceDetails(device: AccountDevice) {
-  return [
-    knownValue(device.platform) || "Платформа не указана",
-    knownValue(device.appVersion) ? `версия ${knownValue(device.appVersion)}` : undefined,
-    `ID ${shortId(device.deviceId)}`,
-    `активно ${formatSessionDate(device.lastSeenAt ?? device.createdAt)}`,
-  ].filter(Boolean).join(" · ");
-}
-
-function sessionTitle(session: AccountSession) {
-  return knownValue(session.deviceName) || `Устройство ${shortId(session.deviceId || session.id)}`;
-}
-
-function sessionDetails(session: AccountSession) {
-  return [
-    knownValue(session.platform) || "Платформа не указана",
-    knownValue(session.appVersion) ? `версия ${knownValue(session.appVersion)}` : undefined,
-    session.deviceId ? `ID ${shortId(session.deviceId)}` : `сессия ${shortId(session.id)}`,
-    `создана ${formatSessionDate(session.createdAt)}`,
-    `активна ${formatSessionDate(session.lastSeenAt ?? session.createdAt)}`,
-    session.current ? "текущая" : `до ${formatSessionDate(session.expiresAt)}`,
-  ].filter(Boolean).join(" · ");
-}
-
-function formatReleaseDate(value: string | null) {
-  return value ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium" }).format(new Date(value)) : "дата не указана";
+function UpdateBanner({ release, onPress }: { release: PlatformRelease; onPress: () => void }) {
+  const themeColors = useThemeColors();
+  return <Pressable onPress={onPress} style={({ pressed }) => [styles.updateBanner, { backgroundColor: themeColors.accent, borderColor: themeColors.primary }, pressed && styles.pressed]} accessibilityRole="button" accessibilityLabel={`Доступно обновление до версии ${release.version}`}><View style={[styles.updateBannerIcon, { backgroundColor: themeColors.primary }]}><Icon name="download" size={19} color={themeColors.primaryText} /></View><View style={styles.updateBannerCopy}><Text style={[styles.updateBannerTitle, { color: themeColors.foreground }]}>Доступно обновление</Text><Text style={[styles.updateBannerDetail, { color: themeColors.muted }]}>Версия v{release.version}</Text></View><Icon name="arrowForward" size={19} color={themeColors.primary} /></Pressable>;
 }
 
 function UpdatesContent({ state, onCheck }: { state: UpdateState; onCheck: () => void }) {
@@ -246,6 +206,7 @@ function SettingsContent({ category, localSettings, saveLocal, account, onUpdate
   if (category === "privacy") return <View style={styles.stack}><Section title="Приватность"><ToggleRow label="Подтверждения прочтения" hint="Показывать собеседникам, что сообщение прочитано" value={account.readReceipts} onChange={(value) => onUpdatePrivacy("readReceipts", value)} /><ToggleRow label="Статус в сети" hint="Показывать, когда вы активны" value={account.showOnline} onChange={(value) => onUpdatePrivacy("showOnline", value)} /><ToggleRow label="Последнее посещение" hint="Показывать время последней активности" value={account.showLastSeen} onChange={(value) => onUpdatePrivacy("showLastSeen", value)} /><ToggleRow label="Номер телефона" hint="Разрешать отображение номера" value={account.showPhone} onChange={(value) => onUpdatePrivacy("showPhone", value)} /><ToggleRow label="Фотографии профиля" hint="Разрешать просмотр фотографий" value={account.showProfilePhoto} onChange={(value) => onUpdatePrivacy("showProfilePhoto", value)} /><ToggleRow label="Пересылка сообщений" hint="Разрешать пересылку сообщений от вас" value={account.allowForwarding} onChange={(value) => onUpdatePrivacy("allowForwarding", value)} /><ToggleRow label="Звонки" hint="Разрешать входящие звонки" value={account.allowCalls} onChange={(value) => onUpdatePrivacy("allowCalls", value)} /><ToggleRow label="Индикатор набора" hint="Показывать, когда вы печатаете" value={account.typingIndicators} onChange={(value) => onUpdatePrivacy("typingIndicators", value)} /></Section><Section title="Чёрный список"><BlacklistForm onBlock={onBlock} /><RemoteList loading={false} empty="Заблокированных пользователей нет" items={blocked} render={(entry) => <ActionRow key={entry.id} label={entry.name} detail={entry.address} actionLabel="Разблокировать" onAction={() => onUnblock(entry)} />} /></Section><Section title="Удаление аккаунта"><Text style={styles.statusDetail}>Удаляет аккаунт и данные на сервере без возможности восстановления.</Text><DangerButton label="Удалить аккаунт" onPress={onDeleteAccount} /></Section></View>;
   if (category === "storage") { const media = localSettings.media; const auto = media.autoDownload; return <View style={styles.stack}><Section title="Использование сети и кэша"><ChoiceRow label="Политика кэша" hint="Фактические правила хранения сообщений" value={localSettings.cachePolicy} options={["standard", "minimal", "disabled"]} onChange={(cachePolicy) => saveLocal({ cachePolicy: cachePolicy as MobileSettings["cachePolicy"] })} /><ActionRow label="Кэш сообщений" detail="Локальные сообщения будут загружены снова" actionLabel="Очистить" onAction={onClearMessageCache} /><ActionRow label="Очередь отправки" detail="Неотправленные сообщения хранятся на устройстве" actionLabel="Очистить" onAction={onClearOutbox} /></Section><Section title="Автозагрузка медиа">{<ToggleRow label="Через мобильную сеть" hint="Фото, видео и файлы в пределах лимитов" value={auto.cellular} onChange={(value) => saveLocal({ media: { ...media, autoDownload: { ...auto, cellular: value } } })} />}<ToggleRow label="Через Wi‑Fi" hint="Разрешить автозагрузку по Wi‑Fi" value={auto.wifi} onChange={(value) => saveLocal({ media: { ...media, autoDownload: { ...auto, wifi: value } } })} /><ToggleRow label="В роуминге" hint="Разрешить автозагрузку в роуминге" value={auto.roaming} onChange={(value) => saveLocal({ media: { ...media, autoDownload: { ...auto, roaming: value } } })} /><SliderRow label="Лимит фото" hint="Максимальный размер автозагрузки" value={auto.photoLimitMb} min={1} max={100} suffix=" МБ" onChange={(value) => saveLocal({ media: { ...media, autoDownload: { ...auto, photoLimitMb: value } } })} /><SliderRow label="Лимит видео" hint="Максимальный размер автозагрузки" value={auto.videoLimitMb} min={1} max={500} suffix=" МБ" onChange={(value) => saveLocal({ media: { ...media, autoDownload: { ...auto, videoLimitMb: value } } })} /><ToggleRow label="Автовоспроизведение видео и GIF" hint="Запускать видео после загрузки" value={media.autoplayVideo} onChange={(value) => saveLocal({ media: { ...media, autoplayVideo: value, autoplayGif: value } })} /><ToggleRow label="Сохранять в галерею" hint="Для текущих личных чатов" value={media.saveToGallery.privateChats} onChange={(value) => saveLocal({ media: { ...media, saveToGallery: { ...media.saveToGallery, privateChats: value } } })} /><ToggleRow label="Потоковое воспроизведение" hint="Только для незашифрованных источников" value={media.streaming} onChange={(value) => saveLocal({ media: { ...media, streaming: value } })} /></Section><Section title="Прокси"><ToggleRow label="Использовать прокси" hint="Параметры сохраняются для нативного сетевого адаптера" value={localSettings.proxy.enabled} onChange={(value) => saveLocal({ proxy: { ...localSettings.proxy, enabled: value } })} /><Field label="Хост" hint="Адрес прокси" value={localSettings.proxy.host} onChangeText={(host) => saveLocal({ proxy: { ...localSettings.proxy, host } })} placeholder="proxy.example.com" /><Field label="Порт" hint="Порт от 1 до 65535" keyboardType="number-pad" value={String(localSettings.proxy.port)} onChangeText={(port) => saveLocal({ proxy: { ...localSettings.proxy, port: Number(port) || 1 } })} /></Section></View>; }
   if (category === "energy") { const energy = localSettings.energySaving; const toggle = (key: Exclude<keyof typeof energy, "threshold">, label: string) => <ToggleRow key={String(key)} label={label} hint="Ограничивается только при активном режиме" value={energy[key]} onChange={(value) => saveLocal({ energySaving: { ...energy, [key]: value } })} />; return <View style={styles.stack}><Section title="Режим энергосбережения"><ToggleRow label="Включать режим" hint={`При заряде ниже ${energy.threshold}%`} value={energy.enabled} onChange={(value) => saveLocal({ energySaving: { ...energy, enabled: value } })} /><SliderRow label="Порог включения" hint="Уровень заряда" value={energy.threshold} min={5} max={50} suffix="%" onChange={(value) => saveLocal({ energySaving: { ...energy, threshold: value } })} /></Section><Section title="Параметры">{toggle("stickers", "Анимация стикеров")}{toggle("emoji", "Анимация эмодзи")}{toggle("chatAnimations", "Анимации в чатах")}{toggle("callAnimations", "Анимации звонков")}{toggle("autoplayVideo", "Автозапуск видео")}{toggle("autoplayGif", "Автозапуск GIF")}{toggle("particles", "Движение частиц")}{toggle("smoothTransitions", "Плавные переходы")}</Section></View>; }
+  if (category === "debug") return <View style={styles.stack}><Section title="Debug"><ToggleRow label="Показывать common-элементы" hint="Общие элементы интерфейса будут отмечены красной обводкой" value={localSettings.debug.showCommonElements} onChange={(value) => saveLocal({ debug: { ...localSettings.debug, showCommonElements: value } })} /></Section></View>;
   return <UpdatesContent state={updates} onCheck={onCheckUpdates} />;
 }
 
@@ -307,6 +268,11 @@ const styles = StyleSheet.create({
   headerTitle: { color: colors.foreground, fontFamily: fonts.headingBold, fontSize: 19 },
   centeredHeaderTitle: { position: "absolute", left: 0, right: 0, alignItems: "center" },
   categoryList: { padding: 16, gap: 8 },
+  updateBanner: { minHeight: 76, borderRadius: radii.md, borderWidth: 1, padding: 12, flexDirection: "row", alignItems: "center", gap: 12 },
+  updateBannerIcon: { width: 44, height: 44, borderRadius: 14, alignItems: "center", justifyContent: "center" },
+  updateBannerCopy: { flex: 1, gap: 4 },
+  updateBannerTitle: { fontFamily: fonts.bodySemibold, fontSize: 15 },
+  updateBannerDetail: { fontFamily: fonts.body, fontSize: 12 },
   category: { minHeight: 76, backgroundColor: colors.surface, borderRadius: radii.md, padding: 12, flexDirection: "row", alignItems: "center", gap: 12 },
   categoryIcon: { width: 44, height: 44, borderRadius: 14, backgroundColor: "#2c2552", alignItems: "center", justifyContent: "center" },
   categoryCopy: { flex: 1, gap: 4 },

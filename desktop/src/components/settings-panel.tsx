@@ -8,8 +8,9 @@ import { MessageList } from "./message-list";
 import type { Profile } from "../types";
 import { friendlyError } from "../lib/client-errors";
 import { CURRENT_VERSION, fetchLatestRelease, isNewerVersion, type PlatformRelease } from "../lib/github-releases";
+import { deviceDetails, deviceTitle, formatReleaseDate, formatSessionDate, knownValue, sessionDetails, sessionTitle, shortId } from "../../../common/src/format.ts";
 
-type SettingsSection = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "updates";
+type SettingsSection = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "debug" | "updates";
 type PendingAction = { kind: "device" | "session" | "other-sessions" | "outbox" | "profile" | "account"; targetId: string; label: string };
 type Feedback = { kind: "success" | "error"; text: string } | null;
 
@@ -33,6 +34,7 @@ const sections: Array<{ id: SettingsSection; label: string; icon: string }> = [
   { id: "privacy", label: "Приватность", icon: "security" },
   { id: "storage", label: "Данные и хранилище", icon: "database" },
   { id: "energy", label: "Энергосбережение", icon: "bolt" },
+  { id: "debug", label: "Debug", icon: "logs" },
   { id: "updates", label: "Обновления", icon: "download" },
 ];
 
@@ -48,53 +50,6 @@ function formatBytes(value: number | undefined) {
     if (amount < 1024 || nextUnit === units[units.length - 1]) break;
   }
   return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
-}
-
-function knownValue(value: string | null | undefined) {
-  const normalized = value?.trim();
-  return normalized && normalized.toLowerCase() !== "unknown" ? normalized : undefined;
-}
-
-function shortId(value: string | null | undefined) {
-  return value ? value.slice(0, 8) : "—";
-}
-
-function formatSessionDate(value: number | null | undefined) {
-  return value && Number.isFinite(value)
-    ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value))
-    : "—";
-}
-
-function formatReleaseDate(value: string | null) {
-  return value ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium" }).format(new Date(value)) : "дата не указана";
-}
-
-function deviceTitle(device: ManagedDevice) {
-  return knownValue(device.name) || `Устройство ${shortId(device.deviceId)}`;
-}
-
-function deviceDetails(device: ManagedDevice) {
-  return [
-    knownValue(device.platform) || "Платформа не указана",
-    knownValue(device.appVersion) ? `версия ${knownValue(device.appVersion)}` : undefined,
-    `ID ${shortId(device.deviceId)}`,
-    `активно ${formatSessionDate(device.lastSeenAt ?? device.createdAt)}`,
-  ].filter(Boolean).join(" · ");
-}
-
-function sessionTitle(session: ManagedSession) {
-  return knownValue(session.deviceName) || `Устройство ${shortId(session.deviceId || session.id)}`;
-}
-
-function sessionDetails(session: ManagedSession) {
-  return [
-    knownValue(session.platform) || "Платформа не указана",
-    knownValue(session.appVersion) ? `версия ${knownValue(session.appVersion)}` : undefined,
-    session.deviceId ? `ID ${shortId(session.deviceId)}` : `сессия ${shortId(session.id)}`,
-    `создана ${formatSessionDate(session.createdAt)}`,
-    `активна ${formatSessionDate(session.lastSeenAt ?? session.createdAt)}`,
-    session.current ? "текущая" : `до ${formatSessionDate(session.expiresAt)}`,
-  ].filter(Boolean).join(" · ");
 }
 
 function FieldLabel({ children, htmlFor, description }: { children: string; htmlFor: string; description?: string }) {
@@ -163,7 +118,6 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
   useEffect(() => { void loadRemote(); refreshStorage(); }, [loadRemote, refreshStorage]);
 
   useEffect(() => {
-    if (section !== "updates") return;
     const controller = new AbortController();
     setUpdateState((current) => ({ ...current, loading: true, error: "" }));
     void fetchLatestRelease("desktop", controller.signal)
@@ -173,7 +127,7 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
         setUpdateState({ loading: false, error: friendlyError(reason, "Не удалось проверить релизы GitHub"), release: null, checkedAt: Date.now() });
       });
     return () => controller.abort();
-  }, [section, updateRefreshKey]);
+  }, [updateRefreshKey]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -376,6 +330,10 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     return <section aria-labelledby="settings-energy-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-energy-title">Энергосбережение</h2><p className="settings-muted mt-1">Автоматически ограничивает тяжёлые эффекты при низком заряде.</p></div></div><div className="settings-card"><ToggleRow id="settings-energy-enabled" label="Режим энергосбережения" description={`Включается при заряде ниже ${energy.threshold}%`} checked={energy.enabled} onChange={(checked) => updateLocal("energySaving", { ...energy, enabled: checked })} /><RangeRow id="settings-energy-threshold" label="Порог включения" description="Уровень заряда для режима" value={energy.threshold} min={5} max={50} suffix="%" onChange={(value) => updateLocal("energySaving", { ...energy, threshold: value })} /></div><div className="settings-card settings-list"><h3>Параметры энергосбережения</h3>{toggle("stickers", "Анимация стикеров")}{toggle("emoji", "Анимация эмодзи")}{toggle("chatAnimations", "Анимации в чатах")}{toggle("callAnimations", "Анимации звонков")}{toggle("autoplayVideo", "Автозапуск видео")}{toggle("autoplayGif", "Автозапуск GIF")}{toggle("particles", "Движение частиц")}{toggle("smoothTransitions", "Плавные переходы")}</div></section>;
   }
 
+  function renderDebug() {
+    return <section aria-labelledby="settings-debug-title" className="settings-section-content"><div className="settings-section-heading"><div><h2 id="settings-debug-title">Debug</h2><p className="settings-muted mt-1">Временные подсказки для проверки общего слоя desktop/mobile.</p></div></div><div className="settings-card"><ToggleRow id="settings-debug-common-elements" label="Показывать common-элементы" description="Общие элементы интерфейса будут отмечены красной обводкой" checked={localSettings.debug.showCommonElements} onChange={(checked) => updateLocal("debug", { ...localSettings.debug, showCommonElements: checked })} /></div></section>;
+  }
+
   function renderUpdates() {
     const release = updateState.release;
     const status = release ? (isNewerVersion(release.version) ? `Доступна новая версия v${release.version}` : release.version === CURRENT_VERSION ? `Установлена последняя версия v${CURRENT_VERSION}` : `Установлена версия v${CURRENT_VERSION}`) : "";
@@ -405,12 +363,15 @@ function SettingsPanel({ profile, localSettings, messageCount, outboxCount, onLo
     if (section === "privacy") return renderPrivacy();
     if (section === "storage") return renderStorage();
     if (section === "energy") return renderEnergy();
+    if (section === "debug") return renderDebug();
     return renderUpdates();
   }
 
+  const availableUpdate = updateState.release && isNewerVersion(updateState.release.version) ? updateState.release : null;
+
   return <div className="settings-workspace" role="region" aria-labelledby="settings-title">
       <header className="settings-panel-header"><h1 id="settings-title" className="font-heading text-[1.1875rem] font-semibold tracking-tight">Настройки</h1><button type="button" className="icon-button" title="Закрыть настройки" aria-label="Закрыть настройки" onClick={onClose}><Icon name="close" className="size-4" /></button></header>
-      <div className="settings-panel-body"><nav className="settings-nav" aria-label="Разделы настроек">{sections.map((item) => <button key={item.id} type="button" className={`settings-nav-item settings-nav-item-${item.id}${item.id === section ? " settings-nav-item-active" : ""}`} aria-current={item.id === section ? "page" : undefined} onClick={() => setSection(item.id)}><span className="settings-nav-icon"><Icon name={item.icon} className="size-4 shrink-0" /></span><span>{item.label}</span></button>)}</nav><div className="settings-main">{feedback && <div className={feedback.kind === "error" ? "settings-error settings-feedback" : "settings-success settings-feedback"} role={feedback.kind === "error" ? "alert" : "status"} aria-live="polite"><Icon name={feedback.kind === "error" ? "error" : "check_circle"} className="size-4 shrink-0" /><span>{feedback.text}</span></div>}{renderSection()}</div></div>
+      <div className="settings-panel-body"><nav className="settings-nav" aria-label="Разделы настроек">{availableUpdate && <button type="button" className="settings-update-banner" onClick={() => setSection("updates")} aria-label={`Доступно обновление до версии ${availableUpdate.version}`}><span className="settings-update-banner-icon"><Icon name="download" className="size-4 shrink-0" /></span><span className="settings-update-banner-copy"><strong>Доступно обновление</strong><span>Версия v{availableUpdate.version}</span></span><Icon name="chevron_right" className="size-4 shrink-0" /></button>}{sections.map((item) => <button key={item.id} type="button" className={`settings-nav-item settings-nav-item-${item.id}${item.id === section ? " settings-nav-item-active" : ""}`} aria-current={item.id === section ? "page" : undefined} onClick={() => setSection(item.id)}><span className="settings-nav-icon"><Icon name={item.icon} className="size-4 shrink-0" /></span><span>{item.label}</span></button>)}</nav><div className="settings-main">{feedback && <div className={feedback.kind === "error" ? "settings-error settings-feedback" : "settings-success settings-feedback"} role={feedback.kind === "error" ? "alert" : "status"} aria-live="polite"><Icon name={feedback.kind === "error" ? "error" : "check_circle"} className="size-4 shrink-0" /><span>{feedback.text}</span></div>}{renderSection()}</div></div>
       {pendingAction && <div className="settings-confirm" role="alertdialog" aria-modal="true" aria-labelledby="settings-confirm-title"><div><h2 id="settings-confirm-title">Подтвердите действие</h2><p className="mt-1 text-sm text-muted-foreground">Вы действительно хотите: {pendingAction.label}? Это действие нельзя отменить.</p></div><div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setPendingAction(null)} disabled={Boolean(actionBusy)}>Отмена</Button><Button className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void executePendingAction()} disabled={Boolean(actionBusy)}>{actionBusy ? "Выполнение…" : "Подтвердить"}</Button></div></div>}
   </div>;
 }

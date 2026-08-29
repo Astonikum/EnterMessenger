@@ -78,9 +78,11 @@ assert.deepEqual(normalizeSettings(JSON.parse("{\"theme\":\"neon\",\"textSize\":
   proxy: DEFAULT_SETTINGS.proxy,
   energySaving: DEFAULT_SETTINGS.energySaving,
   cachePolicy: "standard",
+  debug: DEFAULT_SETTINGS.debug,
 });
 assert.deepEqual(normalizeSettings({ cache: { retentionDays: -4.6 } }), { ...DEFAULT_SETTINGS, cachePolicy: "disabled" });
 assert.deepEqual(normalizeSettings(null), DEFAULT_SETTINGS);
+assert.equal(normalizeSettings({ debug: { showCommonElements: true } }).debug.showCommonElements, true);
 assert.equal(getSuggestedServerAddress("192.168.0.160"), "192.168.0.160:50121");
 assert.equal(getSuggestedServerAddress("0.0.0.0"), "");
 assert.equal(normalizeServerAddress("31.77.151.34:50121"), "http://31.77.151.34:50121");
@@ -114,6 +116,7 @@ assert.deepEqual(persistedSettings, {
   proxy: DEFAULT_SETTINGS.proxy,
   energySaving: DEFAULT_SETTINGS.energySaving,
   cachePolicy: "minimal",
+  debug: DEFAULT_SETTINGS.debug,
 });
 assert.deepEqual(writtenSettings, persistedSettings);
 assert.deepEqual(JSON.parse(await storage.getItem(SETTINGS_STORAGE_KEY)), persistedSettings);

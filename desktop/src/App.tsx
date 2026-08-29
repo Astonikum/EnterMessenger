@@ -4,9 +4,9 @@ import { MessengerView } from "./views/messenger-view";
 import { readTabState, writeTabState } from "./lib/app-state";
 import { EMPTY_MESSAGES } from "./lib/empty-messages";
 import { clearMessageCache, MESSAGE_CACHE_KEY_PREFIX, readMessageCache, readMessageCacheAsync, writeMessageCache } from "./lib/message-cache";
-import { acknowledgeMessage, createConversation, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type DeviceHistoryEntry, type RealtimeClose, type RealtimeEvent, type RemoteDeliveryReceipt, type RemoteMessage, type RemoteReadReceipt, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
+import { acknowledgeMessage, createConversation, downloadMedia, fetchPublicAccountKey, fetchPublicDeviceKeys, mapRemoteConversation, markConversationRead, openRealtime, registerDeviceKey, searchUser, sendMessage as sendRemoteMessage, syncDeviceHistory, syncProfile, updateAccountFolders, type DeviceHistoryEntry, type RealtimeClose, type RealtimeEvent, type RemoteMessage, type SearchUser, type SyncResponse, uploadMedia } from "./lib/enter-api";
 import { accountKeyBundle, decodeMessagePayload, decryptMessage, deleteDeviceKeys, deviceKeyBundle, encryptMessage, ensureAccountKey, ensureDeviceKeys, readAccountKey, type PublicAccountKey, type PublicDeviceKey } from "./lib/e2e";
-import { decryptMedia, encryptMedia, encryptMediaBytes, isAudioAttachment } from "./lib/media";
+import { decryptMedia, encryptMedia, encryptMediaBytes } from "./lib/media";
 import type { PendingMedia } from "./components/message-composer";
 import { formatMessageTime, makeId } from "./lib/utils";
 import { migrateLocalServerAddress, normalizeServerAddress } from "./lib/server-address";
@@ -21,6 +21,9 @@ import { friendlyError } from "./lib/client-errors";
 import { folderContains, readFolders, writeFolders } from "./lib/folders";
 import type { AppPanel } from "./components/app-rail";
 import type { ChatFolder, Conversation, Message, OutboxEntry, Profile } from "./types";
+import { messagePreview } from "../../common/src/messages.ts";
+import { formatProfileAddress } from "../../common/src/address.ts";
+import { isUnauthorized, mergeDeliveryReceipts, mergeReadReceipts, mergeRemoteMessages, retryDelay } from "../../common/src/message-state.ts";
 
 const LEGACY_OUTBOX_KEY = "enter-outbox";
 const OUTBOX_KEY_PREFIX = "enter-outbox:";
@@ -28,15 +31,6 @@ const ALL_FOLDER = "all";
 const MAX_DECRYPT_RETRIES = 3;
 const MAX_OUTBOX_ENTRIES = 100;
 const MAX_OUTBOX_ATTEMPTS = 5;
-
-function messagePreview(message: Message) {
-  if (message.text.trim()) return message.text;
-  const attachments = message.attachments ?? [];
-  if (attachments.some(({ kind }) => kind === "image")) return "[Фото]";
-  if (attachments.some(({ kind }) => kind === "video")) return "[Видео]";
-  if (attachments.some(isAudioAttachment)) return "[Аудио]";
-  return attachments.length > 0 ? "[Файлы]" : "";
-}
 
 function isStoredProfile(value: unknown): value is Profile {
   if (!value || typeof value !== "object") return false;
@@ -67,10 +61,6 @@ function readProfiles() {
   } catch {
     return [];
   }
-}
-
-function profileAddress(profile: Profile) {
-  return `${profile.handle.replace(/^@+/, "")}@${profile.server.replace(/^https?:\/\//, "")}`;
 }
 
 function isStoredOutboxEntry(value: unknown): value is OutboxEntry {
@@ -133,25 +123,17 @@ function readOutboxProfile(profileId: string) {
   }
 }
 
-function retryDelay(attempts: number) {
-  return Math.min(60_000, 1000 * 2 ** Math.min(attempts, 6));
-}
-
-function isUnauthorized(reason: unknown) {
-  return reason instanceof Error && /\b401\b/.test(reason.message);
-}
-
 async function prepareProfile(profile: Profile, password?: string) {
   const device = await ensureDeviceKeys(profile.id);
   const account = password ? await ensureAccountKey(profile.id, password) : await readAccountKey(profile.id);
-  await registerDeviceKey(profile, deviceKeyBundle(device), account ? { keyId: account.keyId, encryptionPublicKey: accountKeyBundle(account, profileAddress(profile)).encryptionPublicKey } : undefined);
+  await registerDeviceKey(profile, deviceKeyBundle(device), account ? { keyId: account.keyId, encryptionPublicKey: accountKeyBundle(account, formatProfileAddress(profile.handle, profile.server)).encryptionPublicKey } : undefined);
   logEvent("crypto", "Device keys ready", password ? "after sign-in" : "local key check", "success");
-  return { device, account: account ? accountKeyBundle(account, profileAddress(profile)) : null, bundle: { ...deviceKeyBundle(device), address: profileAddress(profile) } satisfies PublicDeviceKey };
+  return { device, account: account ? accountKeyBundle(account, formatProfileAddress(profile.handle, profile.server)) : null, bundle: { ...deviceKeyBundle(device), address: formatProfileAddress(profile.handle, profile.server) } satisfies PublicDeviceKey };
 }
 
 async function allDeviceKeys(profile: Profile, ownBundle: PublicDeviceKey) {
   try {
-    const keys = await fetchPublicDeviceKeys(profile, profileAddress(profile));
+    const keys = await fetchPublicDeviceKeys(profile, formatProfileAddress(profile.handle, profile.server));
     return keys.some((key) => key.keyId === ownBundle.keyId) ? keys : [ownBundle, ...keys];
   } catch {
     return [ownBundle];
@@ -173,51 +155,6 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
     stackId: remote.stackId,
     encryptedMessage: remote.encryptedMessage,
   };
-}
-
-function resolveMessageEdits(messages: Message[]) {
-  const baseMessages = messages.filter((message) => !message.editOf);
-  const editEvents = messages.filter((message) => Boolean(message.editOf));
-  editEvents.forEach((edit) => {
-    const targetIndex = baseMessages.findIndex((message) => message.id === edit.editOf);
-    if (targetIndex >= 0) baseMessages[targetIndex] = { ...baseMessages[targetIndex], text: edit.text, edited: true };
-  });
-  return [...baseMessages, ...editEvents];
-}
-
-function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array<{ conversationId: string; message: Message }>) {
-  const next = { ...current };
-  incoming.forEach(({ conversationId, message }) => {
-    const existing = next[conversationId] ?? [];
-    const existingIndex = existing.findIndex((item) => item.id === message.id);
-    if (existingIndex >= 0) {
-      const replaced = [...existing];
-      replaced[existingIndex] = { ...replaced[existingIndex], ...message, readAt: message.readAt ?? replaced[existingIndex].readAt, deliveredAt: message.deliveredAt ?? replaced[existingIndex].deliveredAt };
-      next[conversationId] = replaced;
-    } else {
-      next[conversationId] = [...existing, message];
-    }
-    next[conversationId] = resolveMessageEdits(next[conversationId]);
-  });
-  return next;
-}
-
-function mergeReadReceipts(current: Record<string, Message[]>, receipts: RemoteReadReceipt[]) {
-  if (receipts.length === 0) return current;
-  const readAtByMessage = new Map(receipts.map((receipt) => [receipt.messageId, receipt.readAt]));
-  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
-    const readAt = readAtByMessage.get(message.id);
-    return readAt && (!message.readAt || readAt > message.readAt) ? { ...message, readAt } : message;
-  })]));
-}
-
-function mergeDeliveryReceipts(current: Record<string, Message[]>, receipts: RemoteDeliveryReceipt[]) {
-  if (receipts.length === 0) return current;
-  const deliveredAtByMessage = new Map(receipts.map((receipt) => [receipt.messageId, receipt.deliveredAt]));
-  return Object.fromEntries(Object.entries(current).map(([conversationId, messages]) => [conversationId, messages.map((message) => {
-    const deliveredAt = deliveredAtByMessage.get(message.id);
-    return deliveredAt && (!message.deliveredAt || deliveredAt > message.deliveredAt) ? { ...message, deliveredAt } : message;
-  })]));
 }
 
 // #preview default {}

@@ -1,109 +1,24 @@
-import { formatMessageTime } from "./utils";
-import { ENTER_PROTOCOL_VERSION, formatEnterAddress, parseEnterAddress, type EncryptedMessage } from "./enter-protocol";
+import { formatEnterAddress, parseEnterAddress } from "./enter-protocol";
 import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
 import { normalizeServerAddress } from "./server-address";
 import { logEvent } from "./logs";
+import { MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
-import { isChatFolder, type ChatFolder } from "./folders";
+import type { ChatFolder } from "./folders";
 import type { Conversation, Message, Profile } from "../types";
+import type { AccountSettings, AccountSettingsPatch, BlockedAccount, ClientDeviceMetadata, DeviceHistoryEntry, RemoteConversation, RemoteDeliveryReceipt, RemoteMessage, RemoteReadReceipt, RealtimeEvent, SearchUser, SyncResponse } from "../../../common/src/api-types.ts";
+import type { EncryptedMessage } from "../../../common/src/protocol.ts";
+import { isAcceptedResponse, isAccountSettings, isBlockedAccount, isBlockedAccountList, isDeviceHistoryResponse, isEncryptedMessage, isFolderList, isRealtimeEvent, isRemoteConversation, isRemoteMessage, isSyncResponse, isTimestampResponse } from "../../../common/src/api-contract.ts";
+import { apiUrl as buildApiUrl, authHeaders, readJson } from "../../../common/src/api-helpers.ts";
+
+export type { AccountSettings, AccountSettingsPatch, BlockedAccount, ClientDeviceMetadata, DeviceHistoryEntry, RemoteConversation, RemoteDeliveryReceipt, RemoteMessage, RemoteReadReceipt, RealtimeEvent, SearchUser, SyncResponse } from "../../../common/src/api-types.ts";
 
 const REQUEST_TIMEOUT_MS = 10_000;
-const MAX_MEDIA_CIPHERTEXT_BYTES = 200 * 1024 * 1024 + 16;
-const MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH = 2_000_000;
-const MAX_SYNC_ITEMS = 1_000;
-const MAX_FOLDERS = 100;
-
-export type RemoteConversation = {
-  id: string;
-  serverId?: string;
-  name: string;
-  handle?: string | null;
-  avatar: string;
-  subtitle?: string | null;
-  canWrite: boolean;
-  lastMessage: string;
-  lastMessageAt?: number | null;
-  pinned: boolean;
-  online: boolean;
-  lastSeenAt?: number | null;
-  unread: number;
-};
-
-export type RemoteMessage = {
-  id: string;
-  conversationId: string;
-  author: "me" | "them";
-  createdAt: number;
-  stackId: string;
-  encryptedMessage: EncryptedMessage;
-};
-
-export type RemoteReadReceipt = {
-  messageId: string;
-  readAt: number;
-};
-
-export type RemoteDeliveryReceipt = {
-  messageId: string;
-  deliveredAt: number;
-};
-
-export type SyncResponse = {
-  nextCursor: number;
-  conversations: RemoteConversation[];
-  folders?: ChatFolder[];
-  messages: RemoteMessage[];
-  readReceipts: RemoteReadReceipt[];
-  deliveryReceipts: RemoteDeliveryReceipt[];
-};
-
-export type RealtimeEvent =
-  | { type: "ready"; version: number }
-  | ({ type: "sync" } & SyncResponse)
-  | { type: "message"; cursor: number; message: RemoteMessage }
-  | { type: "readReceipt"; cursor: number; messageId: string; readAt: number }
-  | { type: "deliveryReceipt"; cursor: number; messageId: string; deliveredAt: number }
-  | { type: "presence"; conversationId: string; online: boolean; lastSeenAt: number }
-  | { type: "folders"; folders: ChatFolder[] }
-  | { type: "pong" }
-  | { type: "error"; code: string };
+const MAX_MEDIA_CIPHERTEXT_BYTES = MAX_MEDIA_BYTES + 16;
 
 type SendMessageResponse = {
   nextCursor: number;
   message: RemoteMessage;
-};
-
-export type DeviceHistoryEntry = {
-  conversationId: string;
-  messageId: string;
-  sourceKeyId?: string;
-  encryptedMessage: EncryptedMessage;
-};
-
-export type AccountSettings = {
-  id: string;
-  name: string;
-  handle: string;
-  showOnline: boolean;
-  showLastSeen: boolean;
-  readReceipts: boolean;
-  typingIndicators: boolean;
-  showPhone: boolean;
-  showProfilePhoto: boolean;
-  allowForwarding: boolean;
-  allowCalls: boolean;
-  suggestPeople: boolean;
-};
-
-export type AccountSettingsPatch = Partial<Pick<AccountSettings, "name" | "showOnline" | "showLastSeen" | "readReceipts" | "typingIndicators" | "showPhone" | "showProfilePhoto" | "allowForwarding" | "allowCalls" | "suggestPeople">>;
-
-export type BlockedAccount = {
-  id: string;
-  address: string;
-  handle: string;
-  name: string;
-  server: string;
-  createdAt: number;
 };
 
 export type ManagedDevice = ManagedDeviceResponse;
@@ -122,17 +37,11 @@ export type ManagedSession = {
   current: boolean;
 };
 
-export type ClientDeviceMetadata = {
-  platform: string;
-  deviceName: string;
-  appVersion: string;
-};
-
 export function clientDeviceMetadata(): ClientDeviceMetadata {
   const userAgent = navigator.userAgent;
   const browser = userAgent.includes("Edg/") ? "Edge" : userAgent.includes("Chrome/") ? "Chrome" : userAgent.includes("Firefox/") ? "Firefox" : userAgent.includes("Safari/") ? "Safari" : "Browser";
   const platform = navigator.platform || "desktop";
-  return { platform: "web", deviceName: `${browser} · ${platform}`.slice(0, 128), appVersion: "0.2.2" };
+  return { platform: "web", deviceName: `${browser} · ${platform}`.slice(0, 128), appVersion: "0.2.3" };
 }
 
 type PublicKeyDirectoryResponse = {
@@ -142,7 +51,7 @@ type PublicKeyDirectoryResponse = {
   server: string;
   serverId?: string;
   devices: DeviceKeyBundle[];
-  accountKey?: { keyId: string; encryptionPublicKey: string };
+  accountKey?: { keyId: string; encryptionPublicKey: string } | null;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -163,90 +72,6 @@ function isDeviceKeyBundle(value: unknown): value is DeviceKeyBundle {
     && Number.isFinite(value.createdAt);
 }
 
-function isEncryptedMessage(value: unknown): value is EncryptedMessage {
-  if (!isRecord(value) || value.protocol !== ENTER_PROTOCOL_VERSION) return false;
-  return ["message_id", "conversation_id", "sender", "recipient", "sender_device", "key_id", "created_at", "nonce", "ephemeral_public_key", "ciphertext", "associated_data", "signature"]
-    .every((key) => isString(value[key], key === "ciphertext" ? MAX_ENCRYPTED_MESSAGE_CIPHERTEXT_LENGTH : 4096));
-}
-
-function isRemoteConversation(value: unknown): value is RemoteConversation {
-  return isRecord(value)
-    && isString(value.id, 256)
-    && (value.serverId === undefined || isString(value.serverId, 256))
-    && isString(value.name, 256)
-    && (value.handle === undefined || value.handle === null || isString(value.handle, 512))
-    && isString(value.avatar, 2048)
-    && (value.subtitle === undefined || value.subtitle === null || isString(value.subtitle, 512))
-    && typeof value.canWrite === "boolean"
-    && isString(value.lastMessage, 2_000_000)
-    && (value.lastMessageAt === undefined || value.lastMessageAt === null || typeof value.lastMessageAt === "number")
-    && typeof value.pinned === "boolean"
-    && typeof value.online === "boolean"
-    && (value.lastSeenAt === undefined || value.lastSeenAt === null || typeof value.lastSeenAt === "number")
-    && typeof value.unread === "number"
-    && Number.isFinite(value.unread)
-    && value.unread >= 0;
-}
-
-function isRemoteMessage(value: unknown): value is RemoteMessage {
-  return isRecord(value)
-    && isString(value.id, 256)
-    && isString(value.conversationId, 256)
-    && (value.author === "me" || value.author === "them")
-    && typeof value.createdAt === "number"
-    && Number.isFinite(value.createdAt)
-    && isString(value.stackId, 256)
-    && isEncryptedMessage(value.encryptedMessage);
-}
-
-function isReceipt(value: unknown, field: "readAt" | "deliveredAt") {
-  return isRecord(value)
-    && isString(value.messageId, 256)
-    && typeof value[field] === "number"
-    && Number.isFinite(value[field]);
-}
-
-function isFolderList(value: unknown): value is ChatFolder[] {
-  return Array.isArray(value) && value.length <= MAX_FOLDERS && value.every(isChatFolder);
-}
-
-function isSyncResponse(value: unknown): value is SyncResponse {
-  return isRecord(value)
-    && typeof value.nextCursor === "number"
-    && Number.isFinite(value.nextCursor)
-    && value.nextCursor >= 0
-    && Array.isArray(value.conversations)
-    && value.conversations.length <= MAX_SYNC_ITEMS
-    && value.conversations.every(isRemoteConversation)
-    && Array.isArray(value.messages)
-    && value.messages.length <= MAX_SYNC_ITEMS
-    && value.messages.every(isRemoteMessage)
-    && Array.isArray(value.readReceipts)
-    && value.readReceipts.length <= MAX_SYNC_ITEMS
-    && value.readReceipts.every((item) => isReceipt(item, "readAt"))
-    && Array.isArray(value.deliveryReceipts)
-    && value.deliveryReceipts.length <= MAX_SYNC_ITEMS
-    && value.deliveryReceipts.every((item) => isReceipt(item, "deliveredAt"))
-    && (value.folders === undefined || isFolderList(value.folders));
-}
-
-function isRealtimeEvent(value: unknown): value is RealtimeEvent {
-  if (!isRecord(value) || typeof value.type !== "string") return false;
-  if (value.type === "ready") return typeof value.version === "number" && Number.isFinite(value.version);
-  if (value.type === "sync") return isSyncResponse(value);
-  if (value.type === "message") return typeof value.cursor === "number" && value.cursor >= 0 && isRemoteMessage(value.message);
-  if (value.type === "readReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "readAt");
-  if (value.type === "deliveryReceipt") return typeof value.cursor === "number" && value.cursor >= 0 && isReceipt(value, "deliveredAt");
-  if (value.type === "presence") return isString(value.conversationId, 256) && typeof value.online === "boolean" && typeof value.lastSeenAt === "number" && Number.isFinite(value.lastSeenAt);
-  if (value.type === "folders") return isFolderList(value.folders);
-  if (value.type === "pong") return true;
-  return value.type === "error" && isString(value.code, 128);
-}
-
-function isAcceptedResponse(value: unknown): value is { accepted: boolean } {
-  return isRecord(value) && typeof value.accepted === "boolean";
-}
-
 function isAcceptedTrueResponse(value: unknown): value is { accepted: true } {
   return isRecord(value) && value.accepted === true;
 }
@@ -257,38 +82,6 @@ function isNonNegativeTimestamp(value: unknown): value is number {
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]) {
   return Object.keys(value).every((key) => keys.includes(key));
-}
-
-function isAccountSettings(value: unknown): value is AccountSettings {
-  return isRecord(value)
-    && hasOnlyKeys(value, ["id", "name", "handle", "showOnline", "showLastSeen", "readReceipts", "typingIndicators", "showPhone", "showProfilePhoto", "allowForwarding", "allowCalls", "suggestPeople"])
-    && isString(value.id, 256)
-    && isString(value.name, 256)
-    && isString(value.handle, 256)
-    && typeof value.showOnline === "boolean"
-    && typeof value.showLastSeen === "boolean"
-    && typeof value.readReceipts === "boolean"
-    && typeof value.typingIndicators === "boolean"
-    && typeof value.showPhone === "boolean"
-    && typeof value.showProfilePhoto === "boolean"
-    && typeof value.allowForwarding === "boolean"
-    && typeof value.allowCalls === "boolean"
-    && typeof value.suggestPeople === "boolean";
-}
-
-function isBlockedAccount(value: unknown): value is BlockedAccount {
-  return isRecord(value)
-    && hasOnlyKeys(value, ["id", "address", "handle", "name", "server", "createdAt"])
-    && isString(value.id, 256)
-    && isString(value.address, 2048)
-    && isString(value.handle, 256)
-    && isString(value.name, 256)
-    && isString(value.server, 2048)
-    && isNonNegativeTimestamp(value.createdAt);
-}
-
-function isBlockedAccountList(value: unknown): value is BlockedAccount[] {
-  return Array.isArray(value) && value.length <= 10_000 && value.every(isBlockedAccount);
 }
 
 function isManagedSession(value: unknown): value is ManagedSession {
@@ -314,20 +107,6 @@ function isSessionsResponse(value: unknown): value is ManagedSession[] {
   return Array.isArray(value) && value.length <= 256 && value.every(isManagedSession);
 }
 
-function isTimestampResponse(value: unknown, field: "readAt" | "deliveredAt"): value is Record<string, number> {
-  return isRecord(value) && typeof value[field] === "number" && Number.isFinite(value[field]);
-}
-
-function isDeviceHistoryResponse(value: unknown): value is { accepted: number; nextCursor: number } {
-  return isRecord(value)
-    && typeof value.accepted === "number"
-    && Number.isFinite(value.accepted)
-    && value.accepted >= 0
-    && typeof value.nextCursor === "number"
-    && Number.isFinite(value.nextCursor)
-    && value.nextCursor >= 0;
-}
-
 function validateDirectory(value: unknown, expected?: { handle: string; server: string }): PublicKeyDirectoryResponse {
   if (!isRecord(value)) throw new Error("Некорректный ответ каталога ключей");
   const handle = typeof value.handle === "string" ? value.handle.trim().replace(/^@+/, "").toLowerCase() : "";
@@ -340,7 +119,7 @@ function validateDirectory(value: unknown, expected?: { handle: string; server: 
     throw new Error("Ответ каталога не соответствует запрошенному адресу");
   }
   const accountKey = value.accountKey;
-  if (accountKey !== undefined && (!isRecord(accountKey) || typeof accountKey.keyId !== "string" || typeof accountKey.encryptionPublicKey !== "string")) {
+  if (accountKey !== undefined && accountKey !== null && (!isRecord(accountKey) || typeof accountKey.keyId !== "string" || typeof accountKey.encryptionPublicKey !== "string")) {
     throw new Error("Некорректный ключ аккаунта в каталоге");
   }
   return {
@@ -354,26 +133,12 @@ function validateDirectory(value: unknown, expected?: { handle: string; server: 
   };
 }
 
-export type SearchUser = {
-  id: string;
-  address: string;
-  handle: string;
-  name: string;
-  server: string;
-  serverId?: string;
-  avatar: string;
-  deviceCount: number;
-};
-
 function apiUrl(profile: Profile, path: string) {
-  return `${profile.server.replace(/\/+$/, "")}${path}`;
+  return buildApiUrl(profile.server, path);
 }
 
 function headers(profile: Profile) {
-  return {
-    authorization: `Bearer ${profile.token}`,
-    "content-type": "application/json",
-  };
+  return authHeaders(profile.token);
 }
 
 async function request(input: RequestInfo | URL, init?: RequestInit) {
@@ -397,17 +162,6 @@ async function request(input: RequestInfo | URL, init?: RequestInit) {
     window.clearTimeout(timeout);
     externalSignal?.removeEventListener("abort", abort);
   }
-}
-
-async function readJson<T>(response: Response, validate?: (value: unknown) => value is T): Promise<T> {
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: unknown } | null;
-    const detail = payload && typeof payload.error === "string" ? `: ${payload.error}` : "";
-    throw new Error(`Enter API request failed: ${response.status}${detail}`);
-  }
-  const payload: unknown = await response.json().catch(() => undefined);
-  if (validate && !validate(payload)) throw new Error("Enter API вернул некорректный ответ");
-  return payload as T;
 }
 
 async function fetchDirectory(profile: Profile, rawAddress: string) {
@@ -711,31 +465,4 @@ export async function syncDeviceHistory(profile: Profile, entries: DeviceHistory
   return readJson<{ accepted: number; nextCursor: number }>(response, isDeviceHistoryResponse);
 }
 
-export function mapRemoteConversation(remote: RemoteConversation): Conversation {
-  return {
-    id: remote.id,
-    serverId: remote.serverId,
-    name: remote.name,
-    handle: remote.handle ?? undefined,
-    avatar: remote.avatar,
-    subtitle: remote.subtitle ?? undefined,
-    canWrite: remote.canWrite,
-    lastMessage: remote.lastMessage,
-    time: remote.lastMessageAt ? formatMessageTime(new Date(remote.lastMessageAt)) : "",
-    pinned: remote.pinned,
-    online: remote.online,
-    lastSeenAt: remote.lastSeenAt ?? undefined,
-    unread: remote.unread ?? 0,
-  };
-}
-
-export function mapRemoteMessage(remote: RemoteMessage): Message {
-  return {
-    id: remote.encryptedMessage.message_id,
-    author: remote.author,
-    text: "",
-    time: formatMessageTime(new Date(remote.createdAt)),
-    stackId: remote.stackId,
-    encryptedMessage: remote.encryptedMessage,
-  };
-}
+export { mapRemoteConversation, mapRemoteMessage } from "../../../common/src/api-mappers.ts";

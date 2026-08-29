@@ -3,18 +3,12 @@ import { sha256 } from "@noble/hashes/sha2";
 import { fromByteArray, toByteArray } from "base64-js";
 import { randomBytes } from "./crypto-random";
 import type { MessageAttachment } from "./types";
+import { kindForMime, MAX_MEDIA_BYTES } from "../../common/src/media.ts";
 
-export const MAX_MEDIA_BYTES = 200 * 1024 * 1024;
+export { isAudioAttachment, MAX_MEDIA_BYTES } from "../../common/src/media.ts";
 
 export type MobileMediaSource = { uri: string; name: string; mimeType: string; size?: number };
 export type EncryptedMedia = { attachment: MessageAttachment; ciphertext: Uint8Array };
-
-function kindForMime(mimeType: string): MessageAttachment["kind"] {
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("video/")) return "video";
-  if (mimeType.startsWith("audio/")) return "audio";
-  return "file";
-}
 
 export async function encryptMedia(source: MobileMediaSource): Promise<EncryptedMedia> {
   if (source.size !== undefined && (!Number.isFinite(source.size) || source.size < 0 || source.size > MAX_MEDIA_BYTES)) {

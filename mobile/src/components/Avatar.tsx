@@ -4,8 +4,8 @@ import Svg, { Defs, G, Mask, Path, Rect } from "react-native-svg";
 import { colors, fonts } from "../theme";
 import type { Conversation } from "../types";
 import { Icon } from "./Icon";
-
-const avatarColors = ["#ff3b30", "#ffd60a", "#30d158", "#0a84ff", "#bf5af2", "#ff375f", "#ff9f0a", "#ffffff"];
+import { AVATAR_COLORS, conversationAvatarKind, normalizeAvatarName } from "../../../common/src/conversations.ts";
+import { commonDebugStyle, useCommonDebug } from "../common-debug";
 
 function hash(value: string) {
   let result = 0;
@@ -26,7 +26,7 @@ function signed(value: number, modulo: number, position?: number) {
 }
 
 function palette(value: number) {
-  return avatarColors[value % avatarColors.length];
+  return AVATAR_COLORS[value % AVATAR_COLORS.length];
 }
 
 function isDark(color: string) {
@@ -80,19 +80,22 @@ function BeamAvatar({ name, size }: { name: string; size: number }) {
 }
 
 export function ProfileAvatar({ name, size = 44 }: { name: string; size?: number }) {
+  const commonDebug = useCommonDebug();
   return (
-    <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2, overflow: "hidden" }]}>
-      <BeamAvatar name={name.replace(/^@/, "")} size={size} />
+    <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2, overflow: "hidden" }, commonDebug && commonDebugStyle]}>
+      <BeamAvatar name={normalizeAvatarName(name)} size={size} />
     </View>
   );
 }
 
 export function ConversationAvatar({ conversation, size = 48 }: { conversation: Pick<Conversation, "id" | "handle" | "avatar" | "name">; size?: number }) {
-  if (conversation.handle === "favorites" || conversation.avatar === "favorites") {
-    return <View style={[styles.avatar, styles.favorites, { width: size, height: size, borderRadius: size / 2 }]}><Icon name="star" size={size * 0.48} color={colors.primaryText} /></View>;
+  const commonDebug = useCommonDebug();
+  const kind = conversationAvatarKind(conversation);
+  if (kind === "favorites") {
+    return <View style={[styles.avatar, styles.favorites, { width: size, height: size, borderRadius: size / 2 }, commonDebug && commonDebugStyle]}><Icon name="star" size={size * 0.48} color={colors.primaryText} /></View>;
   }
-  if (conversation.handle === "official" || conversation.avatar === "enter-official") {
-    return <View style={[styles.avatar, styles.official, { width: size, height: size, borderRadius: size / 2 }]}><Text style={[styles.officialLetter, { fontSize: size * 0.48 }]}>E</Text></View>;
+  if (kind === "official") {
+    return <View style={[styles.avatar, styles.official, { width: size, height: size, borderRadius: size / 2 }, commonDebug && commonDebugStyle]}><Text style={[styles.officialLetter, { fontSize: size * 0.48 }]}>E</Text></View>;
   }
   return <ProfileAvatar name={conversation.name} size={size} />;
 }

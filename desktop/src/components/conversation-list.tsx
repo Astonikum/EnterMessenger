@@ -9,6 +9,7 @@ import { ContextMenu } from "./ui/context-menu";
 import { cn, formatLastSeen } from "../lib/utils";
 import { Icon } from "./ui/icon";
 import { folderContains, type ChatFolder } from "../lib/folders";
+import { compactText, filterConversations } from "../../../common/src/conversations.ts";
 
 type ConversationListProps = {
   conversations: Conversation[];
@@ -34,11 +35,6 @@ type ConversationListProps = {
   onReorder?: (sourceId: string, targetId: string) => void;
 };
 
-function previewText(value: string) {
-  const compact = value.replace(/\s+/g, " ").trim();
-  return compact.length > 48 ? `${compact.slice(0, 48).trimEnd()}…` : compact;
-}
-
 // #preview ConversationList {"conversations":[{"id":"maria","name":"Мария","avatar":"maria","lastMessage":"Привет!","time":"12:48","online":true,"unread":2,"pinned":true}],"activeId":"maria"}
 export function ConversationList({ conversations, activeId, activeFolder = "all", listLayout = "two-line", folders = [], onSelect = () => undefined, className, isLoading = false, isConnected = false, searchUser = null, searchBusy = false, searchError = "", onSearchUser = () => undefined, onOpenSearchUser = () => undefined, onTogglePinned = () => undefined, onToggleMuted = () => undefined, onMarkUnread = () => undefined, onArchive = () => undefined, onManageFolders = () => undefined, onDelete = () => undefined, onReorder = () => undefined }: ConversationListProps) {
   const [query, setQuery] = useState("");
@@ -46,9 +42,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   useEffect(() => () => { if (searchTimer.current !== null) window.clearTimeout(searchTimer.current); }, []);
-  const visibleConversations = conversations
-    .filter((conversation) => !conversation.archived && !conversation.deleted && (activeFolder === "all" || folders.some((folder) => folder.id === activeFolder && folderContains(folder, conversation))) && `${conversation.name} ${conversation.handle ?? ""} ${conversation.lastMessage}`.toLowerCase().includes(query.toLowerCase()))
-    .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)));
+  const visibleConversations = filterConversations(conversations, folders, activeFolder, query);
 
   return (
     <section className={cn("app-conversations-panel flex min-h-0 shrink-0 flex-col border-r border-border/70 bg-surface/35", className)}>
@@ -61,7 +55,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
       <div className="scrollbar-none flex-1 overflow-y-auto px-2 pb-2">
         {searchBusy && <div className="mx-1 mb-2 flex items-center gap-2 rounded-2xl bg-accent/60 px-3 py-2 text-sm text-muted-foreground"><Icon name="progress_activity" className="size-4 animate-spin" />Ищем пользователя…</div>}
         {searchError && <div className="mx-1 mb-2 flex items-start gap-2 rounded-2xl bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert"><Icon name="error" className="mt-0.5 size-4 shrink-0" />{searchError}</div>}
-        {searchUser && <button type="button" className="conversation-item group mb-2 flex w-full items-center gap-3 rounded-2xl bg-accent/70 p-2.5 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60" onClick={() => { setQuery(""); void onOpenSearchUser(searchUser); }} disabled={searchBusy || searchUser.deviceCount === 0} title={searchUser.deviceCount === 0 ? "Нет активного устройства" : "Открыть чат"}>
+        {searchUser && <button type="button" className="common-debug conversation-item group mb-2 flex w-full items-center gap-3 rounded-2xl bg-accent/70 p-2.5 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60" onClick={() => { setQuery(""); void onOpenSearchUser(searchUser); }} disabled={searchBusy || searchUser.deviceCount === 0} title={searchUser.deviceCount === 0 ? "Нет активного устройства" : "Открыть чат"}>
           <ProfileAvatar name={searchUser.name} size={42} />
           <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{searchUser.name}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">@{searchUser.handle} · {searchUser.server.replace(/^https?:\/\//, "")}</span></span>
           <Icon name="person" className="size-4 text-muted-foreground" />
@@ -105,7 +99,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
                 setDragOverId(null);
               }}
               onClick={() => onSelect(conversation.id)}
-              className={cn("conversation-item group mb-1 flex w-full items-center gap-3 rounded-2xl p-2.5 text-left", activeId === conversation.id ? "bg-accent" : "hover:bg-accent/70", draggedId === conversation.id && "opacity-50", dragOverId === conversation.id && "ring-2 ring-primary/50")}
+              className={cn("common-debug conversation-item group mb-1 flex w-full items-center gap-3 rounded-2xl p-2.5 text-left", activeId === conversation.id ? "bg-accent" : "hover:bg-accent/70", draggedId === conversation.id && "opacity-50", dragOverId === conversation.id && "ring-2 ring-primary/50")}
             >
               <div className="relative" title={conversation.online ? "В сети" : formatLastSeen(conversation.lastSeenAt)}>
                 <ConversationAvatar id={conversation.id} handle={conversation.handle} avatar={conversation.name} size={42} />
@@ -119,7 +113,7 @@ export function ConversationList({ conversations, activeId, activeFolder = "all"
                   {folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" className="size-3 text-muted-foreground" aria-label="Есть папка" /> : null}
                 </span>
                 <span className="mt-0.5 flex min-w-0 items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{previewText(conversation.lastMessage)}</span>
+                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{compactText(conversation.lastMessage, 48)}</span>
                   {conversation.time && <span className="shrink-0 text-[0.625rem] text-muted-foreground">{conversation.time}</span>}
                 </span>
                 {listLayout === "three-line" && <span className="mt-0.5 block truncate text-[0.625rem] text-muted-foreground">{conversation.handle ? `@${conversation.handle.replace(/^@/, "")}` : conversation.online ? "В сети" : "Не в сети"}</span>}

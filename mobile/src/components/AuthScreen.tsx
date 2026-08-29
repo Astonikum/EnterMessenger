@@ -11,31 +11,10 @@ import { clientDeviceMetadata } from "../rn-api";
 import { LogsScreen } from "./LogsScreen";
 import { logEvent } from "../logs";
 import { friendlyError } from "../client-errors";
+import { isAuthDraftValid, isAuthHealthResponse, isAuthResponse, type AuthMode } from "../../../common/src/auth.ts";
 
 type Props = { onAuthenticated: (profile: Profile, password: string) => void | Promise<void>; onCancel?: () => void };
-type Mode = "login" | "register";
 const SERVER_CHECK_TIMEOUT_MS = 5000;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isHealthResponse(value: unknown): value is { status: string; protocol: string; serverName?: string; logo?: string | null } {
-  return isRecord(value)
-    && value.status === "ok"
-    && typeof value.protocol === "string"
-    && (value.serverName === undefined || typeof value.serverName === "string")
-    && (value.logo === undefined || value.logo === null || typeof value.logo === "string");
-}
-
-function isAuthResponse(value: unknown): value is { token: string; profile: { id: string; name: string; handle: string; serverId: string }; error?: string } {
-  if (!isRecord(value) || typeof value.token !== "string" || !value.token || !isRecord(value.profile)) return false;
-  return typeof value.profile.id === "string"
-    && typeof value.profile.name === "string"
-    && typeof value.profile.handle === "string"
-    && typeof value.profile.serverId === "string"
-    && (value.error === undefined || typeof value.error === "string");
-}
 
 function Field({ label, value, onChangeText, placeholder, secureTextEntry, autoCapitalize = "none", autoFocus, keyboardType = "default", returnKeyType = "next", blurOnSubmit = true, onSubmitEditing, inputRef }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; secureTextEntry?: boolean; autoCapitalize?: "none" | "words"; autoFocus?: boolean; keyboardType?: "default" | "url"; returnKeyType?: "next" | "done" | "go"; blurOnSubmit?: boolean; onSubmitEditing?: () => void; inputRef?: (instance: TextInput | null) => void }) {
   return <View style={styles.field}><Text style={styles.label}>{label}</Text><TextInput ref={inputRef} value={value} onChangeText={onChangeText} placeholder={placeholder} placeholderTextColor={colors.muted} secureTextEntry={secureTextEntry} autoCapitalize={autoCapitalize} autoFocus={autoFocus} keyboardType={keyboardType} returnKeyType={returnKeyType} blurOnSubmit={blurOnSubmit} onSubmitEditing={onSubmitEditing} style={styles.input} /></View>;
@@ -43,7 +22,7 @@ function Field({ label, value, onChangeText, placeholder, secureTextEntry, autoC
 
 export function AuthScreen({ onAuthenticated, onCancel }: Props) {
   const [step, setStep] = useState<"server" | "auth">("server");
-  const [mode, setMode] = useState<Mode>("login");
+  const [mode, setMode] = useState<AuthMode>("login");
   const [serverInput, setServerInput] = useState(getSuggestedServerAddress);
   const [serverUrl, setServerUrl] = useState("");
   const [serverName, setServerName] = useState("Enter");
@@ -81,7 +60,7 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
       const response = await fetch(`${url}/health`, { signal: controller.signal });
       if (!response.ok) throw new Error("unavailable");
       const health: unknown = await response.json();
-      if (!isHealthResponse(health)) throw new Error("unavailable");
+      if (!isAuthHealthResponse(health)) throw new Error("unavailable");
       if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
       setServerUrl(url); setServerName(health.serverName || "Enter"); setServerLogo(health.logo ? resolveServerResource(url, health.logo) : undefined); logEvent("auth", "Server is available", url, "success"); transitionToStep("auth", "forward");
     } catch (reason) {
@@ -95,14 +74,14 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
   }
 
   async function submitAuth() {
-    if (!handle.trim() || password.length < 8 || (mode === "register" && !name.trim())) {
+    if (!isAuthDraftValid({ mode, name, handle, password })) {
       setError(mode === "register" ? "Заполните имя, логин и пароль от 8 символов" : "Введите логин и пароль от 8 символов"); return;
     }
     setBusy(true); setError("");
     try {
       const response = await fetch(`${serverUrl}/auth/${mode}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: mode === "register" ? name.trim() : undefined, handle: handle.trim(), password, ...clientDeviceMetadata() }) });
       const data: unknown = await response.json();
-      if (!response.ok || !isAuthResponse(data)) throw new Error(isRecord(data) && typeof data.error === "string" ? data.error : "Не удалось войти");
+      if (!response.ok || !isAuthResponse(data)) throw new Error(data && typeof data === "object" && "error" in data && typeof data.error === "string" ? data.error : "Не удалось войти");
       logEvent("auth", mode === "login" ? "Signed in" : "Account registered", serverUrl, "success");
       await onAuthenticated({ id: data.profile.id, serverId: data.profile.serverId, name: data.profile.name, handle: data.profile.handle, server: serverUrl, color: colors.primary, token: data.token, serverName, serverLogo }, password);
     } catch (reason) { logEvent("auth", mode === "login" ? "Sign-in failed" : "Registration failed", reason instanceof Error ? reason.message : "Authorization request failed", "error"); setError(friendlyError(reason, mode === "login" ? "Не удалось войти. Проверьте данные и попробуйте снова." : "Не удалось зарегистрироваться. Проверьте данные и попробуйте снова.")); }

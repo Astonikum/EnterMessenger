@@ -1,44 +1,17 @@
 import type { MessageAttachment } from "../types";
+import { audioMimeTypeForName, isAudioAttachment, kindForMime, MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 
-export const MAX_MEDIA_BYTES = 200 * 1024 * 1024;
+export { isAudioAttachment, MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 
 export type EncryptedMedia = {
   attachment: MessageAttachment;
   ciphertext: Uint8Array;
 };
 
-const audioMimeTypes: Record<string, string> = {
-  aac: "audio/aac",
-  amr: "audio/amr",
-  flac: "audio/flac",
-  m4a: "audio/mp4",
-  mp3: "audio/mpeg",
-  oga: "audio/ogg",
-  ogg: "audio/ogg",
-  opus: "audio/opus",
-  wav: "audio/wav",
-  weba: "audio/webm",
-};
-
-function audioMimeTypeForName(name: string) {
-  return audioMimeTypes[name.toLowerCase().split(".").pop() ?? ""];
-}
-
-export function isAudioAttachment(attachment: MessageAttachment) {
-  return attachment.kind === "audio" || (attachment.kind === "file" && (attachment.mimeType.toLowerCase().startsWith("audio/") || Boolean(audioMimeTypeForName(attachment.name))));
-}
-
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
-}
-
-function kindForMime(mimeType: string): MessageAttachment["kind"] {
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("video/")) return "video";
-  if (mimeType.startsWith("audio/")) return "audio";
-  return "file";
 }
 
 function mimeTypeForFile(file: File) {

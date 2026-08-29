@@ -9,20 +9,15 @@ import { Icon } from "./ui/icon";
 import { LogsPanel } from "./logs-panel";
 import { logEvent } from "../lib/logs";
 import { friendlyError } from "../lib/client-errors";
+import { isAuthDraftValid, isAuthHealthResponse, isAuthResponse, type AuthMode } from "../../../common/src/auth.ts";
 
 type AuthPageProps = {
   onAuthenticated: (profile: Profile, password: string) => void | Promise<void>;
   onCancel?: () => void;
 };
 
-type AuthMode = "login" | "register";
 type StepDirection = "forward" | "backward";
 const SERVER_CHECK_TIMEOUT_MS = 5000;
-
-type AuthResponse = {
-  token: string;
-  profile: { id: string; name: string; handle: string; serverId: string };
-};
 
 // #preview AuthPage {}
 export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPageProps) {
@@ -55,8 +50,8 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
     try {
       const response = await fetch(`${url}/health`, { signal: controller.signal });
       if (!response.ok) throw new Error("unavailable");
-      const health = await response.json() as { status?: string; protocol?: string; serverName?: string; logo?: string };
-      if (health.status !== "ok") throw new Error("unavailable");
+      const health: unknown = await response.json();
+      if (!isAuthHealthResponse(health)) throw new Error("unavailable");
       if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("unsupported_protocol");
       setServerUrl(url);
       setServerName(health.serverName || "Enter");
@@ -79,6 +74,10 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
 
   async function submitAuth(event: FormEvent) {
     event.preventDefault();
+    if (!isAuthDraftValid({ mode, name, handle, password })) {
+      setError(mode === "register" ? "Заполните имя, логин и пароль от 8 символов" : "Введите логин и пароль от 8 символов");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -87,12 +86,12 @@ export function AuthPage({ onAuthenticated = () => undefined, onCancel }: AuthPa
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: mode === "register" ? name : undefined, handle, password, ...clientDeviceMetadata() }),
       });
-      const data = await response.json().catch(() => null) as AuthResponse | { error?: string } | null;
+      const data: unknown = await response.json().catch(() => null);
       if (!response.ok) {
         const serverError = data && typeof data === "object" && "error" in data && typeof data.error === "string" ? data.error : "auth_failed";
         throw new Error(serverError);
       }
-      if (!data || typeof data !== "object" || !("token" in data)) throw new Error("auth_failed");
+      if (!isAuthResponse(data)) throw new Error("auth_failed");
       logEvent("auth", mode === "login" ? "Signed in" : "Account registered", serverUrl, "success");
       await onAuthenticated({
         id: data.profile.id,

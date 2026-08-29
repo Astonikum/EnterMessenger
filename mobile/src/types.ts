@@ -1,92 +1,11 @@
-export type Profile = {
-  id: string;
-  name: string;
-  handle: string;
-  server: string;
-  serverId?: string;
-  color: string;
-  token: string;
-  serverName?: string;
-  serverLogo?: string;
-  deviceId?: string;
-};
-
-export type FolderTemplate = "custom" | "personal" | "all";
-export type FolderIcon = "folder" | "chat" | "person" | "star" | "bookmark";
-export type ChatFolder = {
-  id: string;
-  name: string;
-  template: FolderTemplate;
-  icon: FolderIcon;
-  chatIds: string[];
-};
-
-export type Conversation = {
-  id: string;
-  serverId?: string;
-  name: string;
-  handle?: string;
-  avatar: string;
-  lastMessage: string;
-  time: string;
-  subtitle?: string;
-  canWrite?: boolean;
-  unread?: number;
-  online?: boolean;
-  pinned?: boolean;
-  muted?: boolean;
-  archived?: boolean;
-  deleted?: boolean;
-  lastSeenAt?: number;
-};
-
-export type MessageAttachment = {
-  id: string;
-  kind: "image" | "video" | "audio" | "file";
-  name: string;
-  mimeType: string;
-  size: number;
-  sha256: string;
-  key: string;
-  nonce: string;
-  width?: number;
-  height?: number;
-  durationMs?: number;
-};
-
-export type Message = {
-  id: string;
-  author: "me" | "them";
-  text: string;
-  time: string;
-  attachments?: MessageAttachment[];
-  stackId?: string;
-  replyTo?: { id: string; text: string };
-  editOf?: string;
-  reaction?: string;
-  pinned?: boolean;
-  edited?: boolean;
-  readAt?: number;
-  deliveredAt?: number;
-  deliveryStatus?: "pending" | "failed";
-  encryptedMessage?: import("./protocol").EncryptedMessage;
-};
-
-export type OutboxEntry = {
-  id: string;
-  conversationId: string;
-  message: Message;
-  attempts: number;
-  nextAttemptAt: number;
-};
-
-export type SearchUser = {
-  id: string;
-  address: string;
-  handle: string;
-  name: string;
-  server: string;
-  serverId?: string;
-  avatar: string;
-  deviceCount: number;
-};
+export type {
+  ChatFolder,
+  Conversation,
+  FolderIcon,
+  FolderTemplate,
+  Message,
+  MessageAttachment,
+  OutboxEntry,
+  Profile,
+} from "../../common/src/types.ts";
+export type { SearchUser } from "../../common/src/api-types.ts";

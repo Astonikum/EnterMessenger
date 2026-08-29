@@ -8,6 +8,8 @@ import { ConversationAvatar, ProfileAvatar } from "./Avatar";
 import { SafeAreaSheet } from "./SafeAreaSheet";
 import { FolderEditorSheet, FolderMenuSheet, FolderPickerSheet, type FolderDraft } from "./FolderSheets";
 import { readSettings } from "../settings";
+import { compactText, filterConversations } from "../../../common/src/conversations.ts";
+import { commonDebugStyle, useCommonDebug } from "../common-debug";
 
 type Action = "pin" | "mute" | "archive" | "delete" | "unread" | "folder";
 type Props = {
@@ -37,18 +39,14 @@ type Props = {
 
 const ALL_FOLDER = "all";
 
-function preview(value: string) {
-  const compact = value.replace(/\s+/g, " ").trim();
-  return compact.length > 54 ? `${compact.slice(0, 54).trimEnd()}…` : compact;
-}
-
 export function ConversationList({ profile, themeColors = colors, syncConnected = false, conversations, folders, activeFolder = ALL_FOLDER, listLayout = "two-line", activeId, query, searchUser, searchBusy, searchError, onQueryChange, onSelect, onProfilePress, onOpenSearchUser, onAction, onSelectFolder, onCreateFolder, onUpdateFolder, onDeleteFolder, onToggleConversationFolder }: Props) {
+  const commonDebug = useCommonDebug();
   const [folderMenu, setFolderMenu] = useState<ChatFolder>();
   const [folderEditor, setFolderEditor] = useState<ChatFolder | "new" | null>(null);
   const [folderTarget, setFolderTarget] = useState<Conversation>();
   const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
   useEffect(() => { void readSettings().then((settings) => setDensity(settings.density)); }, []);
-  const visible = useMemo(() => conversations.filter((item) => !item.archived && !item.deleted && (activeFolder === ALL_FOLDER || folders.some((folder) => folder.id === activeFolder && folderContains(folder, item))) && `${item.name} ${item.handle ?? ""} ${item.lastMessage}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned))), [activeFolder, conversations, folders, query]);
+  const visible = useMemo(() => filterConversations(conversations, folders, activeFolder, query), [activeFolder, conversations, folders, query]);
 
   return <View style={[styles.root, { backgroundColor: themeColors.background }]}>
     <View style={[styles.header, { backgroundColor: themeColors.background }]}><Image source={require("../../assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /><View style={styles.headerTitle}><Text style={[styles.headerTitleText, { color: themeColors.foreground }]}>{syncConnected ? "Сообщения" : "Подключение..."}</Text></View><Pressable onPress={onProfilePress} hitSlop={8}>{profile ? <ProfileAvatar name={profile.name} size={40} /> : <View style={[styles.emptyProfile, { borderColor: themeColors.border }]}><Icon name="plus" size={19} color={themeColors.muted} /></View>}</Pressable></View>
@@ -60,7 +58,7 @@ export function ConversationList({ profile, themeColors = colors, syncConnected 
     </ScrollView>
     {searchBusy && <View style={[styles.inlineNotice, { backgroundColor: themeColors.surface }]}><ActivityIndicator size="small" color={themeColors.primary} /><Text style={[styles.noticeText, { color: themeColors.muted }]}>Ищем пользователя…</Text></View>}
     {!!searchError && <View style={[styles.inlineNotice, styles.errorNotice, { backgroundColor: themeColors.surface }]}><Icon name="error" size={18} color={themeColors.danger} /><Text style={[styles.noticeText, styles.errorText, { color: themeColors.danger }]}>{searchError}</Text></View>}
-    {searchUser && <Pressable style={[styles.searchResult, { backgroundColor: themeColors.accent }]} onPress={() => onOpenSearchUser(searchUser)} disabled={searchUser.deviceCount === 0}><ProfileAvatar name={searchUser.name} size={44} /><View style={styles.rowCopy}><Text style={[styles.rowName, { color: themeColors.foreground }]}>{searchUser.name}</Text><Text style={[styles.rowMeta, { color: themeColors.muted }]} numberOfLines={1}>@{searchUser.handle} · {searchUser.server.replace(/^https?:\/\//, "")}</Text></View><Icon name="arrowForward" size={19} color={themeColors.muted} /></Pressable>}
+    {searchUser && <Pressable style={[styles.searchResult, { backgroundColor: themeColors.accent }, commonDebug && commonDebugStyle]} onPress={() => onOpenSearchUser(searchUser)} disabled={searchUser.deviceCount === 0}><ProfileAvatar name={searchUser.name} size={44} /><View style={styles.rowCopy}><Text style={[styles.rowName, { color: themeColors.foreground }]}>{searchUser.name}</Text><Text style={[styles.rowMeta, { color: themeColors.muted }]} numberOfLines={1}>@{searchUser.handle} · {searchUser.server.replace(/^https?:\/\//, "")}</Text></View><Icon name="arrowForward" size={19} color={themeColors.muted} /></Pressable>}
     <FlatList bounces={false} data={visible} keyExtractor={(item) => item.id} contentContainerStyle={styles.list} showsVerticalScrollIndicator={false} renderItem={({ item }) => <ConversationRow themeColors={themeColors} conversation={item} folders={folders} listLayout={listLayout} density={density} active={activeId === item.id} onSelect={() => onSelect(item.id)} onAction={onAction} onOpenFolderPicker={() => setFolderTarget(item)} />} ListEmptyComponent={<View style={styles.empty}><Text style={[styles.emptyTitle, { color: themeColors.foreground }]}>Нет чатов</Text></View>} />
     <FolderMenuSheet visible={Boolean(folderMenu)} folder={folderMenu} onClose={() => setFolderMenu(undefined)} onOpen={() => { if (folderMenu) onSelectFolder(folderMenu.id); }} onEdit={() => { if (folderMenu) setFolderEditor(folderMenu); }} onDelete={() => { if (folderMenu) onDeleteFolder(folderMenu); }} />
     <FolderEditorSheet visible={folderEditor !== null} folder={folderEditor === "new" ? null : folderEditor} onClose={() => setFolderEditor(null)} onSave={(draft) => { if (folderEditor === "new") onCreateFolder(draft); else if (folderEditor) onUpdateFolder({ ...folderEditor, ...draft }); setFolderEditor(null); }} />
@@ -69,6 +67,7 @@ export function ConversationList({ profile, themeColors = colors, syncConnected 
 }
 
 function ConversationRow({ themeColors = colors, conversation, folders, listLayout, density = "comfortable", active, onSelect, onAction, onOpenFolderPicker }: { themeColors?: ThemeColors; conversation: Conversation; folders: ChatFolder[]; listLayout: "two-line" | "three-line"; density?: "comfortable" | "compact"; active: boolean; onSelect: () => void; onAction: (conversation: Conversation, action: Action) => void; onOpenFolderPicker: () => void }) {
+  const commonDebug = useCommonDebug();
   const [actionsVisible, setActionsVisible] = useState(false);
   function openActions() {
     setActionsVisible(true);
@@ -82,9 +81,9 @@ function ConversationRow({ themeColors = colors, conversation, folders, listLayo
 
   return <>
     <View>
-    <Pressable onPress={onSelect} onLongPress={openActions} style={({ pressed }) => [styles.row, density === "compact" && styles.compactRow, active && { backgroundColor: themeColors.accent }, pressed && styles.pressed]}>
+    <Pressable onPress={onSelect} onLongPress={openActions} style={({ pressed }) => [styles.row, density === "compact" && styles.compactRow, active && { backgroundColor: themeColors.accent }, commonDebug && commonDebugStyle, pressed && styles.pressed]}>
     <View><ConversationAvatar conversation={conversation} size={48} />{conversation.online && <View style={[styles.online, { borderColor: themeColors.background }]} />}</View>
-    <View style={styles.rowCopy}><View style={styles.nameLine}><Text style={[styles.rowName, { color: themeColors.foreground }]} numberOfLines={1}>{conversation.name}</Text>{conversation.pinned && <Icon name="pin" size={13} color={themeColors.primary} />}{conversation.muted && <Icon name="notificationsOff" size={13} color={themeColors.muted} />}{folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" size={13} color={themeColors.muted} /> : null}</View><View style={styles.previewLine}><Text style={[styles.rowMessage, { color: themeColors.muted }]} numberOfLines={1}>{preview(conversation.lastMessage)}</Text>{conversation.time ? <Text style={[styles.rowTime, { color: themeColors.muted }]}>{conversation.time}</Text> : null}</View>{listLayout === "three-line" && <Text style={[styles.rowExtra, { color: themeColors.muted }]} numberOfLines={1}>{conversation.handle ? `@${conversation.handle.replace(/^@/, "")}` : conversation.online ? "В сети" : "Не в сети"}</Text>}</View>
+    <View style={styles.rowCopy}><View style={styles.nameLine}><Text style={[styles.rowName, { color: themeColors.foreground }]} numberOfLines={1}>{conversation.name}</Text>{conversation.pinned && <Icon name="pin" size={13} color={themeColors.primary} />}{conversation.muted && <Icon name="notificationsOff" size={13} color={themeColors.muted} />}{folders.some((folder) => folderContains(folder, conversation)) ? <Icon name="folder" size={13} color={themeColors.muted} /> : null}</View><View style={styles.previewLine}><Text style={[styles.rowMessage, { color: themeColors.muted }]} numberOfLines={1}>{compactText(conversation.lastMessage, 54)}</Text>{conversation.time ? <Text style={[styles.rowTime, { color: themeColors.muted }]}>{conversation.time}</Text> : null}</View>{listLayout === "three-line" && <Text style={[styles.rowExtra, { color: themeColors.muted }]} numberOfLines={1}>{conversation.handle ? `@${conversation.handle.replace(/^@/, "")}` : conversation.online ? "В сети" : "Не в сети"}</Text>}</View>
     <View style={styles.rowRight}>{conversation.unread ? <View style={[styles.unread, { backgroundColor: themeColors.primary }]}><Text style={[styles.unreadText, { color: themeColors.primaryText }]}>{conversation.unread}</Text></View> : null}</View>
     </Pressable>
     </View>

@@ -14,17 +14,8 @@ import type { MobileSettings } from "../settings";
 import { colors, fonts, radii } from "../theme";
 import { friendlyError } from "../client-errors";
 import { Icon } from "./Icon";
+import { formatFileSize, formatPlaybackTime } from "../../../common/src/format.ts";
 
-function formatFileSize(size: number) {
-  if (size < 1024) return `${size} Б`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
-  return `${(size / (1024 * 1024)).toFixed(size > 10 * 1024 * 1024 ? 0 : 1)} МБ`;
-}
-
-function formatPlaybackTime(milliseconds: number) {
-  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
-  return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, "0")}`;
-}
 
 const speedOptions = [
   { value: 0.5, label: "Медленно" },

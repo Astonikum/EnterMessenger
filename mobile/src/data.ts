@@ -1,5 +1,8 @@
 import { randomUUID } from "./crypto-random";
 import type { Message } from "./types";
+import { formatMessageTime } from "../../common/src/format.ts";
+
+export { formatMessageTime } from "../../common/src/format.ts";
 
 export const EMPTY_MESSAGES: Record<string, Message[]> = {};
 
@@ -8,5 +11,5 @@ export function makeId() {
 }
 
 export function messageTime(date = new Date()) {
-  return new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" }).format(date);
+  return formatMessageTime(date);
 }

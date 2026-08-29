@@ -14,7 +14,7 @@ globalThis.localStorage = {
 globalThis.window = globalThis;
 
 assert.deepEqual(readLocalSettings(), DEFAULT_LOCAL_SETTINGS);
-const customSettings = { ...DEFAULT_LOCAL_SETTINGS, theme: "light", fontScale: 1.1, density: "compact", accent: "blue", locale: "en", notifications: { ...DEFAULT_LOCAL_SETTINGS.notifications, desktop: false, sound: true, preview: false }, cachePolicy: "minimal" };
+const customSettings = { ...DEFAULT_LOCAL_SETTINGS, theme: "light", fontScale: 1.1, density: "compact", accent: "blue", locale: "en", notifications: { ...DEFAULT_LOCAL_SETTINGS.notifications, desktop: false, sound: true, preview: false }, cachePolicy: "minimal", debug: { showCommonElements: true } };
 writeLocalSettings(customSettings);
 assert.deepEqual(readLocalSettings(), customSettings);
 globalThis.matchMedia = () => ({ matches: true });
@@ -22,6 +22,7 @@ globalThis.document = { documentElement: { dataset: {}, style: { setProperty: ()
 applyLocalSettings(customSettings);
 assert.equal(document.documentElement.dataset.theme, "light");
 assert.equal(document.documentElement.dataset.density, "compact");
+assert.equal(document.documentElement.dataset.commonDebug, "true");
 assert.equal(document.documentElement.lang, "en");
 
 assert.equal(isManagedDeviceResponse({ deviceId: "desktop-1", platform: "desktop", name: "Desktop", appVersion: "0.2.0", createdAt: 1_700_000_000_000, lastSeenAt: 1_700_000_000_000, current: true, revokedAt: null }), true);

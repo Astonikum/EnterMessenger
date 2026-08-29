@@ -4,6 +4,7 @@ import { cn, formatMessageTime, makeId } from "../lib/utils";
 import type { Message } from "../types";
 import { Icon } from "./ui/icon";
 import type { EncryptedMedia } from "../lib/media";
+import { formatFileSize } from "../../../common/src/format.ts";
 
 // #preview MessageComposer {}
 type MessageComposerProps = {
@@ -17,12 +18,6 @@ type MessageComposerProps = {
 };
 
 export type PendingMedia = { file: File } | { encrypted: EncryptedMedia };
-
-function formatFileSize(size: number) {
-  if (size < 1024) return `${size} Б`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
-  return `${(size / (1024 * 1024)).toFixed(size > 10 * 1024 * 1024 ? 0 : 1)} МБ`;
-}
 
 function PendingMediaPreview({ file, onRemove }: { file: File; onRemove: () => void }) {
   const [previewUrl, setPreviewUrl] = useState<string>();

@@ -1,0 +1,9 @@
+{
+  "name": "@enter-messenger/common",
+  "private": true,
+  "version": "0.2.3",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test ../test/common.test.mjs"
+  }
+}

@@ -1,5 +1,6 @@
 import type { Conversation, Message } from "../types";
 import type { CachePolicy } from "./local-settings";
+import { exceedsMessageLimits, isCachedConversation, isCachedMessage, limitMessagesByTotal } from "../../../common/src/storage-models.ts";
 
 const CACHE_VERSION = 2;
 export const MESSAGE_CACHE_KEY_PREFIX = "enter-message-cache:";
@@ -35,46 +36,12 @@ function cacheKey(profileId: string) {
   return `${MESSAGE_CACHE_KEY_PREFIX}${profileId}`;
 }
 
-function isMessage(value: unknown): value is Message {
-  if (!value || typeof value !== "object") return false;
-  const message = value as Partial<Message>;
-  return typeof message.id === "string" && (message.author === "me" || message.author === "them") && typeof message.text === "string" && typeof message.time === "string";
-}
-
-function isConversation(value: unknown): value is Conversation {
-  if (!value || typeof value !== "object") return false;
-  const conversation = value as Partial<Conversation>;
-  return typeof conversation.id === "string"
-    && typeof conversation.name === "string"
-    && typeof conversation.avatar === "string"
-    && typeof conversation.lastMessage === "string"
-    && typeof conversation.time === "string";
-}
-
 function limitMessages(messages: Record<string, Message[]>, policy: CachePolicy) {
-  const limited: Record<string, Message[]> = {};
-  let remaining = CACHE_LIMITS[policy].total;
-
-  for (const [conversationId, conversationMessages] of Object.entries(messages)) {
-    const recent = conversationMessages.slice(-CACHE_LIMITS[policy].perConversation);
-    const allowed = Math.min(remaining, recent.length);
-    limited[conversationId] = allowed > 0 ? recent.slice(-allowed) : [];
-    remaining -= allowed;
-    if (remaining === 0) break;
-  }
-
-  return limited;
+  return limitMessagesByTotal(messages, CACHE_LIMITS[policy]);
 }
 
 function exceedsCacheLimits(messages: Record<string, Message[]>, policy: CachePolicy) {
-  const limits = CACHE_LIMITS[policy];
-  let total = 0;
-  for (const conversationMessages of Object.values(messages)) {
-    if (conversationMessages.length > limits.perConversation) return true;
-    total += conversationMessages.length;
-    if (total > limits.total) return true;
-  }
-  return false;
+  return exceedsMessageLimits(messages, CACHE_LIMITS[policy]);
 }
 
 function parseCache(value: unknown, policy: CachePolicy, limit = true): MessageCache | null {
@@ -82,8 +49,8 @@ function parseCache(value: unknown, policy: CachePolicy, limit = true): MessageC
   const payload = value as Partial<MessageCachePayload>;
   if (![1, CACHE_VERSION].includes(payload.version as number) || !payload.messages || typeof payload.messages !== "object") return null;
 
-  const messages = Object.fromEntries(Object.entries(payload.messages).map(([conversationId, conversationMessages]) => [conversationId, Array.isArray(conversationMessages) ? conversationMessages.filter(isMessage) : []]));
-  const conversations = Array.isArray(payload.conversations) ? payload.conversations.filter(isConversation).map((conversation) => ({ ...conversation, online: conversation.handle === "official" ? true : conversation.online })) : undefined;
+  const messages = Object.fromEntries(Object.entries(payload.messages).map(([conversationId, conversationMessages]) => [conversationId, Array.isArray(conversationMessages) ? conversationMessages.filter(isCachedMessage) : []]));
+  const conversations = Array.isArray(payload.conversations) ? payload.conversations.filter(isCachedConversation).map((conversation) => ({ ...conversation, online: conversation.handle === "official" ? true : conversation.online })) : undefined;
   const overLimit = exceedsCacheLimits(messages, policy);
   return {
     cursor: overLimit ? 0 : typeof payload.cursor === "number" && payload.cursor >= 0 ? payload.cursor : 0,

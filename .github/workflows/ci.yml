@@ -42,6 +42,10 @@ jobs:
         working-directory: desktop
         run: npm run build
 
+      - name: Common pure logic checks
+        working-directory: common
+        run: npm test
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Check Tauri shell
@@ -74,6 +78,17 @@ jobs:
       - name: Realtime lifecycle check
         working-directory: mobile
         run: npm run test:realtime
+
+      - name: Android Metro bundle
+        working-directory: mobile
+        run: |
+          out_dir="$(mktemp -d)"
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output "$out_dir/index.android.bundle" \
+            --assets-dest "$out_dir/assets"
 
       - name: Validate native dependency graph
         working-directory: mobile

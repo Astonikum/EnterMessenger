@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 — 2026-08-29
+
+- вынесены общие типы, протокол, очереди, ошибки, папки, payload сообщений и headless UI-модели в `common`;
+- сохранены отдельные native/DOM-адаптеры desktop и mobile;
+- обновлены client/native build версии до `0.2.3` (`203` для Android).
+
 ## 0.2.2 — 2026-08-29
 
 - обновлены mobile и desktop клиенты до `0.2.2` с native build number `202`;

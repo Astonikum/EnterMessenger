@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { clearLogs, getLogs, loadLogs, subscribeLogs, type LogCategory, type LogEntry, type LogLevel } from "../lib/logs";
+import { clearLogs, getLogs, loadLogs, subscribeLogs, type LogCategory, type LogEntry } from "../lib/logs";
+import { formatLogLine } from "../../../common/src/logs.ts";
 import { Button } from "./ui/button";
 import { Icon } from "./ui/icon";
 
@@ -17,27 +18,6 @@ const filters: Array<{ id: LogFilter; label: string }> = [
   { id: "media", label: "Медиа" },
   { id: "system", label: "Система" },
 ];
-
-const categoryLabels: Record<LogCategory, string> = {
-  auth: "Auth",
-  network: "Network",
-  sync: "Sync",
-  realtime: "Realtime",
-  send: "Send",
-  media: "Media",
-  crypto: "Crypto",
-  system: "System",
-};
-
-const levelLabels: Record<LogLevel, string> = { info: "INFO", success: "OK", warn: "WARN", error: "ERROR" };
-
-function formatLogDate(value: number) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
-}
-
-function formatLogLine(entry: LogEntry) {
-  return `${formatLogDate(entry.at)} [${levelLabels[entry.level]}] [${categoryLabels[entry.category]}] ${entry.message}${entry.details ? ` — ${entry.details}` : ""}`;
-}
 
 export function LogsPanel({ onClose }: Props) {
   const [logs, setLogs] = useState<LogEntry[]>(() => [...loadLogs()].reverse());

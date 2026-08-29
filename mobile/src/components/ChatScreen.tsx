@@ -7,12 +7,13 @@ import type { Conversation, Message, MessageAttachment, Profile } from "../types
 import type { MobileSettings } from "../settings";
 import { MediaBubble, MediaGroup } from "./MediaBubble";
 import type { EncryptedMedia, MobileMediaSource } from "../media";
-import { makeId, messageTime } from "../data";
+import { makeId } from "../data";
 import { colors, fonts, radii, type ThemeColors } from "../theme";
 import { Icon } from "./Icon";
 import { ConversationAvatar } from "./Avatar";
 import { SafeAreaSheet } from "./SafeAreaSheet";
 import { readSettings } from "../settings";
+import { formatFileSize, presenceLabel, sameMessageStack } from "../../../common/src/format.ts";
 
 type Props = {
   profile: Profile;
@@ -44,30 +45,6 @@ export type PendingMedia = { source: MobileMediaSource } | { encrypted: Encrypte
 
 const MIN_MESSAGE_INPUT_HEIGHT = 21;
 const MAX_MESSAGE_INPUT_HEIGHT = 112;
-
-function formatFileSize(size?: number) {
-  if (!size) return "";
-  if (size < 1024) return `${size} Б`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
-  return `${(size / (1024 * 1024)).toFixed(1)} МБ`;
-}
-
-function sameStack(left?: Message, right?: Message) {
-  if (!left || !right || left.author !== right.author) return false;
-  return left.stackId && right.stackId ? left.stackId === right.stackId : !left.stackId && !right.stackId && left.time === right.time;
-}
-
-function presenceLabel(conversation: Conversation) {
-  if (conversation.online) return "В сети";
-  if (!conversation.lastSeenAt) return "был(а) давно";
-  const date = new Date(conversation.lastSeenAt);
-  const now = new Date();
-  if (date.toDateString() === now.toDateString()) return `был(а) сегодня в ${messageTime(date)}`;
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return `был(а) вчера в ${messageTime(date)}`;
-  return `был(а) ${new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long" }).format(date)} в ${messageTime(date)}`;
-}
 
 export function ChatScreen({ profile, conversation, messages, error = "", uploadProgress = null, messageTextSize = 16, bubbleRadius = 17, themeColors = colors, mediaSettings, energySavingActive = false, replyTo, editingMessage, onBack, onSend, onReply, onStartEdit, onEdit, onPin, onSave, onDelete, onReact, onForward, onCancelContext }: Props) {
   const [text, setText] = useState("");
@@ -162,8 +139,8 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
 }
 
 export function MessageBubble({ themeColors = colors, profile, message, previous, next, messageTextSize, bubbleRadius, mediaSettings, energySavingActive = false, selected = false, onToggleSelection, onReply, onStartEdit, onPin, onSave, onDelete, onReact, onForward }: { themeColors?: ThemeColors; profile: Profile; message: Message; previous?: Message; next?: Message; messageTextSize: number; bubbleRadius: number; mediaSettings?: MobileSettings["media"]; energySavingActive?: boolean; selected?: boolean; onToggleSelection: () => void; onReply: (message: Message) => void; onStartEdit: (message: Message) => void; onPin: (message: Message) => void; onSave: (message: Message) => void; onDelete: (message: Message) => void; onReact: (message: Message, reaction: string) => void; onForward: (message: Message) => void }) {
-  const samePrevious = sameStack(previous, message);
-  const sameNext = sameStack(message, next);
+  const samePrevious = sameMessageStack(previous, message);
+  const sameNext = sameMessageStack(message, next);
   const bubblePosition = samePrevious
     ? sameNext
       ? (message.author === "me" ? styles.groupMiddleOut : styles.groupMiddleIn)

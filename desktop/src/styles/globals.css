@@ -51,6 +51,7 @@ html[data-theme="light"] {
 }
 
 html[data-density="compact"] { --radius: 0.625rem; }
+html[data-common-debug="true"] .common-debug { outline: 2px solid #ff3b30; outline-offset: 2px; }
 
 @layer base {
   h1, h2, h3, h4, h5, h6 { font-family: "Montserrat", ui-sans-serif, system-ui, sans-serif; }
@@ -262,6 +263,12 @@ html[data-density="compact"] { --radius: 0.625rem; }
 .settings-nav-icon { display: grid; flex: 0 0 auto; width: 2.15rem; height: 2.15rem; place-items: center; border-radius: 0.65rem; background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); transition: background-color 150ms ease, color 150ms ease; }
 .settings-nav-item:hover .settings-nav-icon { background: hsl(var(--primary) / 0.16); color: hsl(var(--primary)); }
 .settings-nav-item-active .settings-nav-icon { background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); }
+.settings-update-banner { display: flex; min-height: 3.75rem; align-items: center; gap: 0.65rem; border: 0.0625rem solid hsl(var(--primary) / 0.35); border-radius: 0.8rem; background: hsl(var(--primary) / 0.12); padding: 0.6rem 0.65rem; color: hsl(var(--foreground)); text-align: left; transition: background-color 150ms ease, border-color 150ms ease; }
+.settings-update-banner:hover { border-color: hsl(var(--primary) / 0.6); background: hsl(var(--primary) / 0.2); }
+.settings-update-banner-icon { display: grid; flex: 0 0 auto; width: 2.15rem; height: 2.15rem; place-items: center; border-radius: 0.65rem; background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); }
+.settings-update-banner-copy { display: grid; min-width: 0; flex: 1; gap: 0.15rem; }
+.settings-update-banner-copy strong { font-size: 0.8rem; font-weight: 700; }
+.settings-update-banner-copy span { color: hsl(var(--muted-foreground)); font-size: 0.72rem; }
 .settings-main { min-width: 0; min-height: 0; overflow-y: auto; background: hsl(var(--background)); padding: clamp(1.25rem, 3vw, 3rem); }
 .settings-section-content { display: grid; width: min(100%, 56rem); gap: 1rem; margin: 0 auto; }
 .settings-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
