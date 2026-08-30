@@ -1,6 +1,6 @@
 services:
   server:
-    image: astonikum/enter-server:latest
+    image: astonikum/enter-server:0.2.3
     container_name: enter-server
     restart: unless-stopped
     ports:

@@ -1,6 +1,6 @@
 FROM rust:1.88-bookworm AS builder
 
-ARG APP_VERSION=0.2.1
+ARG APP_VERSION=0.2.3
 WORKDIR /app
 COPY server/Cargo.toml server/Cargo.lock ./
 RUN mkdir src && printf 'fn main() {}\n' > src/main.rs && cargo build --release
@@ -10,7 +10,7 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 
-ARG APP_VERSION=0.2.1
+ARG APP_VERSION=0.2.3
 LABEL org.opencontainers.image.title="Enter Server" \
       org.opencontainers.image.version="$APP_VERSION" \
       org.opencontainers.image.source="https://github.com/Astonikum/EnterMessenger"
