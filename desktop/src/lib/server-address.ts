@@ -1,1 +1,1 @@
-export { getServerHostname, migrateLocalServerAddress, normalizeServerAddress, resolveServerResource, sameServerAddress } from "../../../common/src/server-address.ts";
+export { getServerHostname, migrateLocalServerAddress, normalizeServerAddress, resolveServerResource } from "../../../common/src/server-address.ts";

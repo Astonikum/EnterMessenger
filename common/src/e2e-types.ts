@@ -6,6 +6,6 @@ export type DeviceKeyBundle = {
   createdAt: number;
 };
 
-export type PublicDeviceKey = DeviceKeyBundle & { address: string };
-export type PublicAccountKey = { keyId: string; encryptionPublicKey: string; address: string };
+export type PublicDeviceKey = DeviceKeyBundle & { address: string; serverId?: string };
+export type PublicAccountKey = { keyId: string; encryptionPublicKey: string; address: string; serverId?: string };
 export type PublicEncryptionKey = Pick<PublicDeviceKey, "keyId" | "encryptionPublicKey" | "address">;

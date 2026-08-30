@@ -1,6 +1,6 @@
-import { formatEnterAddress, parseEnterAddress } from "./enter-protocol";
+import { formatEnterAddress, parseEnterAddress, ENTER_PROTOCOL_VERSION } from "./enter-protocol";
 import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
-import { normalizeServerAddress, sameServerAddress } from "./server-address";
+import { normalizeServerAddress } from "./server-address";
 import { logEvent } from "./logs";
 import { MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
@@ -9,6 +9,7 @@ import type { Conversation, Message, Profile } from "../types";
 import type { AccountSettings, AccountSettingsPatch, BlockedAccount, ClientDeviceMetadata, DeviceHistoryEntry, RemoteConversation, RemoteDeliveryReceipt, RemoteMessage, RemoteReadReceipt, RealtimeEvent, SearchUser, SyncResponse } from "../../../common/src/api-types.ts";
 import type { EncryptedMessage } from "../../../common/src/protocol.ts";
 import { isAcceptedResponse, isAccountSettings, isBlockedAccount, isBlockedAccountList, isDeviceHistoryResponse, isEncryptedMessage, isFolderList, isRealtimeEvent, isRemoteConversation, isRemoteMessage, isSyncResponse, isTimestampResponse } from "../../../common/src/api-contract.ts";
+import { isAuthHealthResponse } from "../../../common/src/auth.ts";
 import { apiUrl as buildApiUrl, authHeaders, readJson } from "../../../common/src/api-helpers.ts";
 
 export type { AccountSettings, AccountSettingsPatch, BlockedAccount, ClientDeviceMetadata, DeviceHistoryEntry, RemoteConversation, RemoteDeliveryReceipt, RemoteMessage, RemoteReadReceipt, RealtimeEvent, SearchUser, SyncResponse } from "../../../common/src/api-types.ts";
@@ -49,7 +50,7 @@ type PublicKeyDirectoryResponse = {
   handle: string;
   name: string;
   server: string;
-  serverId?: string;
+  serverId: string;
   devices: DeviceKeyBundle[];
   accountKey?: { keyId: string; encryptionPublicKey: string } | null;
 };
@@ -107,15 +108,18 @@ function isSessionsResponse(value: unknown): value is ManagedSession[] {
   return Array.isArray(value) && value.length <= 256 && value.every(isManagedSession);
 }
 
-function validateDirectory(value: unknown, expected?: { handle: string; server: string }): PublicKeyDirectoryResponse {
+function validateDirectory(value: unknown, expected?: { handle?: string; serverId?: string }): PublicKeyDirectoryResponse {
   if (!isRecord(value)) throw new Error("Некорректный ответ каталога ключей");
   const handle = typeof value.handle === "string" ? value.handle.trim().replace(/^@+/, "").toLowerCase() : "";
-  const server = typeof value.server === "string" && value.server.trim() ? normalizeServerAddress(value.server) : expected?.server ?? null;
+  const server = typeof value.server === "string" && value.server.trim() ? normalizeServerAddress(value.server) : null;
+  const serverId = typeof value.serverId === "string" ? value.serverId.trim() : "";
   const devices = Array.isArray(value.devices) ? value.devices : null;
-  if (!isString(value.id, 256) || !isString(value.name, 256) || !handle || !server || !devices || devices.length > 256 || !devices.every(isDeviceKeyBundle)) {
+  if (!isString(value.id, 256) || !isString(value.name, 256) || !handle || !server || !serverId || !devices || devices.length > 256 || !devices.every(isDeviceKeyBundle)) {
     throw new Error("Некорректный ответ каталога ключей");
   }
-  if (expected && (handle !== expected.handle || !sameServerAddress(server, expected.server))) {
+  const handleMismatch = expected?.handle !== undefined && handle !== expected.handle;
+  const serverMismatch = expected?.serverId !== undefined && serverId !== expected.serverId;
+  if (handleMismatch || serverMismatch) {
     throw new Error("Ответ каталога не соответствует запрошенному адресу");
   }
   const accountKey = value.accountKey;
@@ -127,10 +131,17 @@ function validateDirectory(value: unknown, expected?: { handle: string; server: 
     handle,
     name: value.name,
     server,
-    serverId: typeof value.serverId === "string" ? value.serverId : undefined,
+    serverId,
     devices,
     accountKey: accountKey as PublicKeyDirectoryResponse["accountKey"],
   };
+}
+
+async function serverIdentity(server: string) {
+  const response = await request(`${server}/health`);
+  const health = await readJson(response, isAuthHealthResponse);
+  if (health.protocol !== ENTER_PROTOCOL_VERSION) throw new Error("Сервер использует другую версию Enter API");
+  return health.serverId;
 }
 
 function apiUrl(profile: Profile, path: string) {
@@ -167,8 +178,9 @@ async function request(input: RequestInfo | URL, init?: RequestInit) {
 async function fetchDirectory(profile: Profile, rawAddress: string) {
   const address = parseEnterAddress(rawAddress, profile.server);
   if (!address) throw new Error("Некорректный Enter-адрес");
+  const serverId = await serverIdentity(address.server);
   const response = await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`);
-  const directory = validateDirectory(await readJson<unknown>(response), address);
+  const directory = validateDirectory(await readJson<unknown>(response), { handle: address.handle, serverId });
   return { address, directory };
 }
 
@@ -330,17 +342,18 @@ export async function registerDeviceKey(profile: Profile, bundle: DeviceKeyBundl
 }
 
 export async function fetchPublicDeviceKeys(profile: Profile, rawAddress: string): Promise<PublicDeviceKey[]> {
-  const { address, directory } = await fetchDirectory(profile, rawAddress);
-  const recipientAddress = formatEnterAddress(address);
-  return directory.devices.map((device) => ({ ...device, address: recipientAddress }));
+  const { directory } = await fetchDirectory(profile, rawAddress);
+  const recipientAddress = formatEnterAddress({ handle: directory.handle, server: directory.server });
+  return directory.devices.map((device) => ({ ...device, address: recipientAddress, serverId: directory.serverId }));
 }
 
 export async function fetchPublicAccountKey(profile: Profile, rawAddress: string): Promise<PublicAccountKey | undefined> {
-  const { address, directory } = await fetchDirectory(profile, rawAddress);
+  const { directory } = await fetchDirectory(profile, rawAddress);
   if (!directory.accountKey) return undefined;
   return {
     ...directory.accountKey,
-    address: formatEnterAddress(address),
+    address: formatEnterAddress({ handle: directory.handle, server: directory.server }),
+    serverId: directory.serverId,
   };
 }
 
@@ -349,10 +362,13 @@ export async function searchUser(profile: Profile, rawQuery: string): Promise<Se
   const address = raw.startsWith("@") || raw.includes("@") ? parseEnterAddress(raw, profile.server) : null;
   const query = raw.replace(/^@+/, "");
   if (!address && (!query || query.includes("@"))) throw new Error("Введите username или @username@server");
-  const response = address
-    ? await request(`${address.server}/enter/v1/keys/${encodeURIComponent(address.handle)}`)
-    : await request(`${apiUrl(profile, "/enter/v1/keys/search")}?q=${encodeURIComponent(query)}`);
-  const directory = validateDirectory(await readJson<unknown>(response), address ?? undefined);
+  const directory = address
+    ? (await fetchDirectory(profile, raw)).directory
+    : await (async () => {
+        const serverId = await serverIdentity(profile.server);
+        const response = await request(`${apiUrl(profile, "/enter/v1/keys/search")}?q=${encodeURIComponent(query)}`);
+        return validateDirectory(await readJson<unknown>(response), { serverId });
+      })();
   const server = directory.server;
   return {
     id: directory.id,

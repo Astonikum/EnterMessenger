@@ -10,6 +10,7 @@ export type AuthDraft = {
 export type AuthHealthResponse = {
   status: "ok";
   protocol: string;
+  serverId: string;
   serverName?: string;
   logo?: string | null;
 };
@@ -41,6 +42,7 @@ export function isAuthHealthResponse(value: unknown): value is AuthHealthRespons
   return isRecord(value)
     && value.status === "ok"
     && typeof value.protocol === "string"
+    && typeof value.serverId === "string"
     && (value.serverName === undefined || typeof value.serverName === "string")
     && (value.logo === undefined || value.logo === null || typeof value.logo === "string");
 }
