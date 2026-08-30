@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+target_root="${3:-/}"
+case "$target_root" in
+  /*) ;;
+  *) exit 0 ;;
+esac
+
+app="${target_root%/}/Applications/Enter Messenger.app"
+lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+if [ -d "$app" ] && [ -x "$lsregister" ]; then
+	"$lsregister" -f "$app" >/dev/null 2>&1 || true
+fi
+
+mdimport="/usr/bin/mdimport"
+if [ -d "$app" ] && [ -x "$mdimport" ]; then
+	"$mdimport" -i "$app" >/dev/null 2>&1 || true
+fi

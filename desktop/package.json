@@ -6,8 +6,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "self-check": "node --no-warnings --experimental-strip-types scripts/self-check.mjs",
+    "self-check:macos": "node scripts/check-macos-bundle.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
+    "package:macos": "sh scripts/package-macos.sh",
     "server": "cargo run --manifest-path ../server/Cargo.toml",
     "test:extension": "npm --prefix ../vscode-extension test",
     "package:extension": "npm --prefix ../vscode-extension run package"

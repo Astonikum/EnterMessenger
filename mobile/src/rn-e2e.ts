@@ -1,7 +1,7 @@
 import { gcm } from "@noble/ciphers/aes";
 import { p256 } from "@noble/curves/p256";
 import { hkdf } from "@noble/hashes/hkdf";
-import { pbkdf2 } from "@noble/hashes/pbkdf2";
+import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToUtf8, concatBytes, hexToBytes, utf8ToBytes, bytesToHex } from "@noble/hashes/utils";
 import { fromByteArray, toByteArray } from "base64-js";
@@ -9,6 +9,7 @@ import * as Keychain from "react-native-keychain";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
 import { randomBytes } from "./crypto-random";
+import { withTimeout } from "./with-timeout";
 import { ENTER_PROTOCOL_VERSION, type EncryptedMessage } from "./protocol";
 import { decodeMessagePayload, encodeMessagePayload } from "../../common/src/message-payload.ts";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey, PublicEncryptionKey } from "../../common/src/e2e-types.ts";
@@ -63,7 +64,7 @@ function safeProfileKey(profileId: string) {
 
 async function secureStoreAvailable() {
   if (Platform.OS === "web") return false;
-  try { await Keychain.getGenericPassword({ service: "enter-availability-probe" }); return true; } catch { return false; }
+  try { await withTimeout(Keychain.getGenericPassword({ service: "enter-availability-probe" }), "Время проверки безопасного хранилища истекло"); return true; } catch { return false; }
 }
 
 const webKeyStorage = Platform.OS === "web";
@@ -74,14 +75,14 @@ async function readPrivateValue(primaryKey: string, fallbackKey: string, unavail
   let raw: string | null;
   try {
     if (secure) {
-      const credentials = await Keychain.getGenericPassword({ service: primaryKey });
+      const credentials = await withTimeout(Keychain.getGenericPassword({ service: primaryKey }), readErrorMessage);
       raw = credentials ? credentials.password : null;
     } else raw = await AsyncStorage.getItem(fallbackKey);
   } catch { throw new Error(readErrorMessage); }
   if (!raw && secure) {
     const legacy = await AsyncStorage.getItem(fallbackKey);
     if (legacy) {
-      await Keychain.setGenericPassword("enter", legacy, { service: primaryKey });
+      await withTimeout(Keychain.setGenericPassword("enter", legacy, { service: primaryKey }), readErrorMessage);
       await AsyncStorage.removeItem(fallbackKey);
       raw = legacy;
     }
@@ -94,7 +95,7 @@ async function writePrivateValue(primaryKey: string, fallbackKey: string, value:
   if (!secure && !webKeyStorage) throw new Error(unavailableMessage);
   try {
     if (secure) {
-      await Keychain.setGenericPassword("enter", value, { service: primaryKey });
+      await withTimeout(Keychain.setGenericPassword("enter", value, { service: primaryKey }), writeErrorMessage);
       await AsyncStorage.removeItem(fallbackKey).catch(() => undefined);
     } else {
       await AsyncStorage.setItem(fallbackKey, value);
@@ -223,8 +224,8 @@ export async function ensureDeviceKeys(profileId: string) {
   try { return await request; } finally { pendingDevices.delete(profileId); }
 }
 
-function accountPrivateBytes(profileId: string, password: string) {
-  const seed = pbkdf2(sha256, utf8ToBytes(password), utf8ToBytes(`enter/account-key/v1/${profileId}`), { c: 210_000, dkLen: 32 });
+async function accountPrivateBytes(profileId: string, password: string) {
+  const seed = await pbkdf2Async(sha256, utf8ToBytes(password), utf8ToBytes(`enter/account-key/v1/${profileId}`), { c: 210_000, dkLen: 32 });
   for (let counter = 0; counter < 256; counter += 1) {
     const candidate = counter === 0 ? seed : sha256(concatBytes(seed, new Uint8Array([counter])));
     if (p256.utils.isValidPrivateKey(candidate)) return candidate;
@@ -235,7 +236,7 @@ function accountPrivateBytes(profileId: string, password: string) {
 export async function ensureAccountKey(profileId: string, password: string) {
   const existing = await readAccount(profileId);
   if (existing) return existing;
-  const privateBytes = accountPrivateBytes(profileId, password);
+  const privateBytes = await accountPrivateBytes(profileId, password);
   const account: StoredAccount = {
     profileId,
     keyId: `account:${profileId}`,

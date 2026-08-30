@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { AuthView } from "./views/auth-view";
 import { MessengerView } from "./views/messenger-view";
 import { readTabState, writeTabState } from "./lib/app-state";
@@ -23,7 +24,11 @@ import type { AppPanel } from "./components/app-rail";
 import type { ChatFolder, Conversation, Message, OutboxEntry, Profile } from "./types";
 import { messagePreview } from "../../common/src/messages.ts";
 import { formatProfileAddress } from "../../common/src/address.ts";
-import { isUnauthorized, mergeDeliveryReceipts, mergeReadReceipts, mergeRemoteMessages, retryDelay } from "../../common/src/message-state.ts";
+import { applyBeforeAcknowledge, isUnauthorized, mergeRemoteMessages, reconcileRemoteMessages, retryDelay } from "../../common/src/message-state.ts";
+import { clearConversationUnread, incrementConversationUnread } from "../../common/src/conversations.ts";
+import { createPresenceLifecycle } from "../../common/src/presence-lifecycle.ts";
+import { createPresenceStateMachine, PRESENCE_HEARTBEAT_TIMEOUT_MS, shouldKeepPresenceConnection } from "../../common/src/presence.ts";
+import { markMessageStateApplied, timingElapsed, timingNow } from "../../common/src/timing.ts";
 
 const LEGACY_OUTBOX_KEY = "enter-outbox";
 const OUTBOX_KEY_PREFIX = "enter-outbox:";
@@ -151,6 +156,8 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
     text: payload.text,
     editOf: payload.editOf,
     attachments: payload.attachments,
+    replyTo: payload.replyTo,
+    reactionEvent: payload.reactionEvent,
     time: formatMessageTime(new Date(remote.createdAt)),
     stackId: remote.stackId,
     encryptedMessage: remote.encryptedMessage,
@@ -198,6 +205,7 @@ export default function App() {
   const [mediaUploadProgress, setMediaUploadProgress] = useState<number | null>(null);
   const messagesByProfileRef = useRef(messagesByProfile);
   const activeConversationIdRef = useRef(activeConversationId);
+  const activePanelRef = useRef<AppPanel>(activePanel);
   const syncCursorsRef = useRef(syncCursors);
   const outboxRef = useRef(outboxByProfile);
   const retryingOutbox = useRef(new Set<string>());
@@ -206,6 +214,8 @@ export default function App() {
   const persistedOutboxProfilesRef = useRef(new Set(Object.keys(outboxByProfile)));
   const mediaOperationRef = useRef(0);
   const mediaAbortRef = useRef<AbortController | null>(null);
+  activeConversationIdRef.current = activeConversationId;
+  activePanelRef.current = activePanel;
   const folderWritesRef = useRef<Record<string, Promise<void>>>({});
 
   useEffect(() => {
@@ -273,16 +283,12 @@ export default function App() {
   }, [messagesByProfile]);
 
   useEffect(() => {
-    activeConversationIdRef.current = activeConversationId;
-  }, [activeConversationId]);
-
-  useEffect(() => {
     let active = true;
     let dispose: (() => void) | null = null;
     void subscribeToNotificationActions((profileId, conversationId) => {
       if (!profiles.some((profile) => profile.id === profileId)) return;
       setActiveProfileId(profileId);
-      setActiveConversationId(conversationId);
+      selectConversation(conversationId);
       setActivePanel("chats");
     }).then((cleanup) => {
       if (active) dispose = cleanup;
@@ -292,7 +298,7 @@ export default function App() {
       const detail = (event as CustomEvent<{ profileId?: string; conversationId?: string }>).detail;
       if (!detail?.profileId || !detail.conversationId || !profiles.some((profile) => profile.id === detail.profileId)) return;
       setActiveProfileId(detail.profileId);
-      setActiveConversationId(detail.conversationId);
+      selectConversation(detail.conversationId);
       setActivePanel("chats");
     };
     window.addEventListener("enter:open-conversation", openConversation);
@@ -424,30 +430,46 @@ export default function App() {
   }, [activeProfileId, profiles]);
 
   useEffect(() => {
-    if (!activeProfile || !activeConversationId) return;
+    if (!activeProfile || !activeConversationId || activePanel !== "chats") return;
     let cancelled = false;
-    setConversations((current) => current.some((conversation) => conversation.id === activeConversationId && (conversation.unread ?? 0) > 0)
-      ? current.map((conversation) => conversation.id === activeConversationId ? { ...conversation, unread: 0 } : conversation)
-      : current);
+    setConversations((current) => clearConversationUnread(current, activeConversationId, true));
     const markRead = () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       void markConversationRead(activeProfile, activeConversationId).then(() => {
         if (cancelled) return;
-        setConversations((current) => current.map((conversation) => conversation.id === activeConversationId ? { ...conversation, unread: 0 } : conversation));
+        setConversations((current) => clearConversationUnread(current, activeConversationId, true));
       }).catch(() => undefined);
     };
     markRead();
     document.addEventListener("visibilitychange", markRead);
+    window.addEventListener("focus", markRead);
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", markRead);
+      window.removeEventListener("focus", markRead);
     };
-  }, [activeConversationId, activeProfile?.id, activeProfile?.token, messages.length]);
+  }, [activeConversationId, activePanel, activeProfile?.id, activeProfile?.token, messages.length]);
 
   useEffect(() => {
     if (!activeProfile || showAuth) return;
     setSyncConnected(false);
     let cancelled = false;
+    const isWindowForeground = () => document.visibilityState === "visible" && document.hasFocus();
+    let foreground = isWindowForeground();
+    const presence = createPresenceStateMachine({
+      appActive: foreground,
+      visible: document.visibilityState === "visible",
+      focused: document.hasFocus(),
+      networkOnline: navigator.onLine !== false,
+      realtimeReady: false,
+      lastHeartbeatAt: null,
+    });
+    const presenceConnectionAllowed = () => shouldKeepPresenceConnection(presence.getInputs());
+    const visibleActiveConversationId = () => (
+      foreground && activePanelRef.current === "chats" && document.visibilityState === "visible" && document.hasFocus()
+        ? activeConversationIdRef.current
+        : null
+    );
     let cursor = syncCursorsRef.current[activeProfile.id] ?? 0;
     let ownBundle: PublicDeviceKey | null = null;
     let ownAccount: PublicAccountKey | null = null;
@@ -589,6 +611,7 @@ export default function App() {
 
     const knownConversationIds = new Set(conversations.map((conversation) => conversation.id));
     const seenMessageIds = new Set(Object.values(messagesByProfileRef.current[profile.id] ?? EMPTY_MESSAGES).flat().map((message) => message.id));
+    const realtimeReceivedAt = new Map<number, number>();
     let retryRealtime: () => void | Promise<void> = () => undefined;
     const advanceCursor = (nextCursor: number) => {
       if (nextCursor <= cursor) return;
@@ -598,17 +621,17 @@ export default function App() {
     };
 
     async function applySyncResult(result: SyncResponse) {
-      if (cancelled) return false;
+      if (cancelled || !presenceConnectionAllowed()) return false;
       logEvent("sync", "Sync package received", `chats ${result.conversations.length}, messages ${result.messages.length}, cursor ${result.nextCursor}`);
       setSyncConnected(true);
       if (result.folders) setFoldersByProfile((current) => ({ ...current, [profile.id]: result.folders! }));
       result.conversations.forEach((conversation) => knownConversationIds.add(conversation.id));
-      setConversations((current) => result.conversations.map((remote) => {
+      setConversations((current) => clearConversationUnread(result.conversations.map((remote) => {
         const mapped = mapRemoteConversation(remote);
         const local = current.find((conversation) => conversation.id === mapped.id);
         return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted } : mapped;
-      }));
-      if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+      }), visibleActiveConversationId()));
+      if (!(await ensureOwnBundle()) || cancelled || !presenceConnectionAllowed() || !ownBundle) return false;
       const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
       const deviceMessages = result.messages.filter((message) => ownKeyIds.has(message.encryptedMessage.key_id));
       let quarantinedCount = 0;
@@ -639,25 +662,25 @@ export default function App() {
         }
       }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
       logEvent("crypto", "Sync decryption completed", `success ${decryptedMessages.length}, retries ${retryingFailures.length}, skipped ${quarantinedCount}`, retryingFailures.length || quarantinedCount ? "warn" : "success");
-      if (cancelled) return false;
-      const newIncomingMessages = decryptedMessages.filter(({ message }) => message.author === "them" && !seenMessageIds.has(message.id));
+      if (cancelled || !presenceConnectionAllowed()) return false;
+      const newIncomingMessages = decryptedMessages.filter(({ message }) => message.author === "them" && !message.reactionEvent && !seenMessageIds.has(message.id));
       const acknowledged = [...new Set(decryptedMessages
         .filter(({ message }) => message.author === "them")
         .map(({ message }) => message.id))];
-      try {
-        await Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId)));
-      } catch {
-        if (!cancelled) setMessageError("Не удалось подтвердить получение сообщения. Синхронизация повторится.");
-        return false;
-      }
-      decryptedMessages.forEach(({ message }) => seenMessageIds.add(message.id));
-      setMessagesByProfile((current) => {
-        const existing = current[profile.id] ?? EMPTY_MESSAGES;
-        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decryptedMessages), result.readReceipts), result.deliveryReceipts) };
-      });
+      await applyBeforeAcknowledge(
+        () => {
+          decryptedMessages.forEach(({ message }) => seenMessageIds.add(message.id));
+          setMessagesByProfile((current) => {
+            const existing = current[profile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [profile.id]: reconcileRemoteMessages(existing, decryptedMessages, result.readReceipts, result.deliveryReceipts) };
+          });
+        },
+        () => Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId))).then(() => undefined),
+        (reason) => logEvent("sync", "Message acknowledgement failed", reason instanceof Error ? reason.message : "Acknowledgement error", "warn"),
+      );
       if (syncNotificationsReady && syncNotificationsAllowed) {
         newIncomingMessages.forEach(({ conversationId, message }) => {
-          if (activeConversationIdRef.current === conversationId && document.visibilityState === "visible" && document.hasFocus()) return;
+          if (visibleActiveConversationId() === conversationId) return;
           const conversation = conversations.find((item) => item.id === conversationId)
             ?? result.conversations.find((item) => item.id === conversationId);
           void notifyIncomingMessage({ profileId: profile.id, conversationId, title: conversation?.name ?? "Enter", text: message.text });
@@ -677,12 +700,12 @@ export default function App() {
     }
 
     const syncOnce = createSyncQueue(async () => {
-      if (cancelled) return;
+      if (cancelled || !presenceConnectionAllowed()) return;
       try {
         cursor = Math.max(cursor, syncCursorsRef.current[profile.id] ?? 0);
         await applySyncResult(await syncProfile(profile, cursor));
       } catch (reason) {
-        if (cancelled) return;
+        if (cancelled || !presenceConnectionAllowed()) return;
         logEvent("sync", "Sync failed", reason instanceof Error ? reason.message : "Sync error", "error");
         setSyncConnected(false);
         if (isUnauthorized(reason)) {
@@ -693,45 +716,57 @@ export default function App() {
         }
         // Cached messages remain available while the server is offline or the session expired.
       }
-      retryRealtime();
+      if (presenceConnectionAllowed()) retryRealtime();
     });
 
     type DirectRealtimeEvent = Extract<RealtimeEvent, { cursor: number }>;
     async function applyRealtimeEvent(event: DirectRealtimeEvent) {
+      if (cancelled || !presenceConnectionAllowed()) return false;
+      const receivedAt = realtimeReceivedAt.get(event.cursor) ?? timingNow();
+      realtimeReceivedAt.delete(event.cursor);
       if (event.type === "message") {
         if (!knownConversationIds.has(event.message.conversationId)) {
           const before = cursor;
           await syncOnce();
           return cursor > before;
         }
-        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+        if (!(await ensureOwnBundle()) || cancelled || !presenceConnectionAllowed() || !ownBundle) return false;
+        const cryptoReadyAt = timingNow();
         const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
         if (!ownKeyIds.has(event.message.encryptedMessage.key_id)) return true;
         try {
-          const message = await decryptRemoteMessage(profile, event.message, await senderDevicesFor(event.message.encryptedMessage.sender));
-          if (message.author === "them") {
-            try {
-              await acknowledgeMessage(profile, message.id);
-            } catch {
-              setMessageError("Не удалось подтвердить получение realtime-сообщения. Синхронизация повторится.");
-              return false;
-            }
-          }
+          const senderKeysStartedAt = timingNow();
+          const senderDevices = await senderDevicesFor(event.message.encryptedMessage.sender);
+          const decryptStartedAt = timingNow();
+          const message = await decryptRemoteMessage(profile, event.message, senderDevices);
+          logEvent("realtime", "Message decrypted", `cursor ${event.cursor}; websocket-to-crypto-ready ${timingElapsed(receivedAt, cryptoReadyAt)}ms; sender-keys ${timingElapsed(senderKeysStartedAt, decryptStartedAt)}ms; decrypt ${timingElapsed(decryptStartedAt)}ms`, "info");
           const isNewMessage = !seenMessageIds.has(message.id);
-          seenMessageIds.add(message.id);
-          setMessagesByProfile((current) => {
-            const existing = current[profile.id] ?? EMPTY_MESSAGES;
-            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }]) };
-          });
-          if (isNewMessage && event.message.author === "them") {
-            setConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
-            if (activeConversationIdRef.current !== event.message.conversationId || document.visibilityState !== "visible" || !document.hasFocus()) {
-              const conversation = conversations.find((item) => item.id === event.message.conversationId);
-              void notifyIncomingMessage({ profileId: profile.id, conversationId: event.message.conversationId, title: conversation?.name ?? "Enter", text: message.text });
-            }
-          }
-          setMessageError("");
-          return true;
+          return await applyBeforeAcknowledge(
+            () => {
+              seenMessageIds.add(message.id);
+              const isActiveChat = visibleActiveConversationId() === event.message.conversationId;
+              setMessagesByProfile((current) => {
+                const existing = current[profile.id] ?? EMPTY_MESSAGES;
+                return { ...current, [profile.id]: reconcileRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }]) };
+              });
+              if (isActiveChat) markMessageStateApplied(message.id);
+              logEvent("realtime", "Message state applied", `cursor ${event.cursor}; websocket-to-state ${timingElapsed(receivedAt)}ms; active ${isActiveChat}`, "info");
+              if (isNewMessage && event.message.author === "them" && !message.reactionEvent) {
+                setConversations((current) => incrementConversationUnread(current, event.message.conversationId, visibleActiveConversationId(), isActiveChat));
+                if (isActiveChat) {
+                  void markConversationRead(profile, event.message.conversationId).catch(() => undefined);
+                }
+                if (!isActiveChat) {
+                  const conversation = conversations.find((item) => item.id === event.message.conversationId);
+                  void notifyIncomingMessage({ profileId: profile.id, conversationId: event.message.conversationId, title: conversation?.name ?? "Enter", text: message.text });
+                }
+              }
+              setMessageError("");
+              return true;
+            },
+            message.author === "them" ? () => acknowledgeMessage(profile, message.id).then(() => undefined) : () => Promise.resolve(),
+            (reason) => logEvent("realtime", "Message acknowledgement failed", reason instanceof Error ? reason.message : "Acknowledgement error", "warn"),
+          );
         } catch (reason) {
           logEvent("crypto", "Realtime message decryption failed", reason instanceof Error ? reason.message : "Decryption error", "error");
           setMessageError("Не удалось расшифровать realtime-сообщение. Синхронизация повторится.");
@@ -741,8 +776,8 @@ export default function App() {
       setMessagesByProfile((current) => {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         const messages = event.type === "readReceipt"
-          ? mergeReadReceipts(existing, [{ messageId: event.messageId, readAt: event.readAt }])
-          : mergeDeliveryReceipts(existing, [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
+          ? reconcileRemoteMessages(existing, [], [{ messageId: event.messageId, readAt: event.readAt }])
+          : reconcileRemoteMessages(existing, [], [], [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
         return { ...current, [profile.id]: messages };
       });
       return true;
@@ -750,7 +785,7 @@ export default function App() {
 
     const realtimeQueue = createRealtimeQueue<DirectRealtimeEvent>(() => cursor, advanceCursor, applyRealtimeEvent, syncOnce);
     retryRealtime = realtimeQueue.retry;
-    let realtimeSnapshot = Promise.resolve();
+    let realtimeSnapshot: Promise<unknown> = Promise.resolve();
 
     let realtime: WebSocket | null = null;
     let reconnectTimer: number | null = null;
@@ -758,15 +793,17 @@ export default function App() {
     let fallbackDelay = 5_000;
     let realtimeReady = false;
     let reconnectDelay = 1000;
+    let heartbeatTimer: number | null = null;
+    let lastRealtimePongAt = 0;
 
     const startFallbackSync = () => {
-      if (fallbackTimer !== null || realtimeReady) return;
+      if (!presenceConnectionAllowed() || fallbackTimer !== null || realtimeReady) return;
       fallbackTimer = window.setTimeout(() => {
         fallbackTimer = null;
-        if (cancelled || realtimeReady) return;
+        if (cancelled || !presenceConnectionAllowed() || realtimeReady) return;
         syncNotificationsAllowed = true;
         void syncOnce().catch(() => undefined).then(() => {
-          if (cancelled || realtimeReady) return;
+          if (cancelled || !presenceConnectionAllowed() || realtimeReady) return;
           fallbackDelay = Math.min(30_000, fallbackDelay * 2);
           startFallbackSync();
         });
@@ -781,51 +818,149 @@ export default function App() {
       syncNotificationsAllowed = false;
     };
     const scheduleRealtimeReconnect = () => {
-      if (cancelled || reconnectTimer !== null) return;
+      if (cancelled || !presenceConnectionAllowed() || reconnectTimer !== null) return;
       const delay = reconnectDelay;
       reconnectDelay = Math.min(30_000, reconnectDelay * 2);
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
-        connectRealtime();
+        if (presenceConnectionAllowed()) connectRealtime();
       }, delay);
     };
     const handleRealtimeClose = (details?: RealtimeClose) => {
-      if (cancelled) return;
+      lastRealtimePongAt = 0;
+      presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+      if (cancelled || !presenceConnectionAllowed()) return;
       realtimeReady = false;
       const closeDetails = details ? `code ${details.code}, clean ${details.wasClean}${details.reason ? `, reason ${details.reason}` : ""}` : "code unknown";
       logEvent("realtime", "Realtime connection closed", `${closeDetails}; switching to reconnect`, "warn");
+      void syncOnce();
       startFallbackSync();
       scheduleRealtimeReconnect();
     };
     const connectRealtime = () => {
-      if (cancelled) return;
+      if (cancelled || !presenceConnectionAllowed() || realtime !== null) return;
+      let socket: WebSocket | null = null;
       try {
-        realtime = openRealtime(profile, cursor, (event) => {
-          if (event.type === "ready") {
+        socket = openRealtime(profile, cursor, (event) => {
+          if (cancelled || !presenceConnectionAllowed() || realtime !== socket) return;
+          if (event.type === "pong") {
+            lastRealtimePongAt = Date.now();
+            presence.update({ lastHeartbeatAt: lastRealtimePongAt });
+          } else if (event.type === "ready") {
             realtimeReady = true;
+            lastRealtimePongAt = Date.now();
+            presence.update({ realtimeReady: true, lastHeartbeatAt: lastRealtimePongAt });
             logEvent("realtime", "Realtime connection established", undefined, "success");
             reconnectDelay = 1000;
             stopFallbackSync();
             setSyncConnected(true);
           } else if (event.type === "sync") {
-            realtimeSnapshot = realtimeSnapshot.then(() => applySyncResult(event)).then(() => realtimeQueue.retry());
+            queueRealtimeTask(async () => {
+              await applySyncResult(event);
+              await realtimeQueue.retry();
+            });
           } else if (event.type === "folders") {
             setFoldersByProfile((current) => ({ ...current, [profile.id]: event.folders }));
           } else if (event.type === "message" || event.type === "readReceipt" || event.type === "deliveryReceipt") {
-            realtimeSnapshot = realtimeSnapshot.then(() => { realtimeQueue.enqueue(event); });
+            realtimeReceivedAt.set(event.cursor, timingNow());
+            logEvent("realtime", "Realtime event queued", `type ${event.type}; cursor ${event.cursor}`, "info");
+            queueRealtimeTask(() => { realtimeQueue.enqueue(event); });
           } else if (event.type === "presence") {
             setConversations((current) => current.map((conversation) => conversation.id === event.conversationId
               ? { ...conversation, online: event.online, lastSeenAt: event.lastSeenAt }
               : conversation));
           } else if (event.type === "error") {
             logEvent("realtime", "Realtime returned an error", "closing connection", "error");
-            realtime?.close();
+            socket?.close();
           }
-        }, handleRealtimeClose);
+        }, (details) => {
+          if (realtime !== socket) return;
+          realtime = null;
+          handleRealtimeClose(details);
+        });
+        realtime = socket;
       } catch (reason) {
         logEvent("realtime", "Failed to start Realtime", reason instanceof Error ? reason.message : "WebSocket error", "error");
         handleRealtimeClose();
       }
+    };
+
+    const queueRealtimeTask = (task: () => unknown | Promise<unknown>) => {
+      realtimeSnapshot = realtimeSnapshot
+        .catch((reason) => {
+          logEvent("realtime", "Realtime pipeline recovered", reason instanceof Error ? reason.message : "Realtime pipeline error", "warn");
+        })
+        .then(task)
+        .catch((reason) => {
+          if (cancelled || !presenceConnectionAllowed()) return;
+          logEvent("realtime", "Realtime pipeline failed", reason instanceof Error ? reason.message : "Realtime pipeline error", "error");
+          void syncOnce();
+        });
+    };
+
+    const stopRealtimeHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+    const startRealtimeHeartbeat = () => {
+      if (heartbeatTimer !== null) return;
+      heartbeatTimer = window.setInterval(() => {
+        if (cancelled || !presenceConnectionAllowed()) return;
+        if (!realtimeReady || !realtime) return;
+        const socket = realtime;
+        if (lastRealtimePongAt > 0 && Date.now() - lastRealtimePongAt > PRESENCE_HEARTBEAT_TIMEOUT_MS) {
+          logEvent("realtime", "Realtime heartbeat timeout", "closing stale connection", "warn");
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+          return;
+        }
+        if (socket.readyState !== 1) {
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+          return;
+        }
+        try {
+          socket.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+        }
+      }, 15_000);
+    };
+
+    const suspendRealtime = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      stopFallbackSync();
+      stopRealtimeHeartbeat();
+      realtimeReady = false;
+      lastRealtimePongAt = 0;
+      presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+      const socket = realtime;
+      realtime = null;
+      socket?.close();
+      setSyncConnected(false);
+    };
+
+    const resumeRealtime = () => {
+      if (cancelled || !presenceConnectionAllowed()) return;
+      reconnectDelay = 1000;
+      startRealtimeHeartbeat();
+      void syncOnce();
+      connectRealtime();
     };
 
     void (async () => {
@@ -840,7 +975,7 @@ export default function App() {
           setMessagesByProfile((current) => ({ ...current, [profile.id]: cached.messages }));
           if (cached.conversations) setConversations(cached.conversations);
         }
-        await syncOnce();
+        if (presenceConnectionAllowed()) await syncOnce();
       } catch (reason) {
         if (cancelled) return;
         setSyncConnected(false);
@@ -851,17 +986,79 @@ export default function App() {
         // Cached messages remain available while the server is offline or the session expired.
       }
     })();
-    connectRealtime();
-    const wake = () => { if (document.visibilityState === "visible") void syncOnce(); };
-    document.addEventListener("visibilitychange", wake);
-    window.addEventListener("focus", wake);
+    const lifecycle = createPresenceLifecycle(foreground, {
+      onForeground: () => {
+        foreground = true;
+        presence.update({
+          appActive: true,
+          visible: true,
+          focused: true,
+        });
+        resumeRealtime();
+      },
+      onBackground: () => {
+        foreground = false;
+        presence.update({
+          appActive: false,
+          visible: document.visibilityState === "visible",
+          focused: document.hasFocus(),
+          realtimeReady: false,
+          lastHeartbeatAt: null,
+        });
+        suspendRealtime();
+      },
+    });
+    const handleWindowLifecycle = (focusedOverride?: boolean) => {
+      const visible = document.visibilityState === "visible";
+      const focused = focusedOverride ?? document.hasFocus();
+      presence.update({ visible, focused, appActive: visible && focused });
+      lifecycle.setForeground(visible && focused);
+    };
+    const handleVisibilityChange = () => handleWindowLifecycle();
+    const handleWindowFocus = () => handleWindowLifecycle(true);
+    const handleWindowBlur = () => handleWindowLifecycle(false);
+    lifecycle.start();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener("blur", handleWindowBlur);
+    const handleOnline = () => {
+      const wasAllowed = presenceConnectionAllowed();
+      presence.update({ networkOnline: true });
+      if (!wasAllowed) resumeRealtime();
+    };
+    const handleOffline = () => {
+      presence.update({ networkOnline: false });
+      suspendRealtime();
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    let removeTauriLifecycle: (() => void) | null = null;
+    if (isTauri()) {
+      void import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
+        const currentWindow = getCurrentWindow();
+        const removeFocus = await currentWindow.onFocusChanged(({ payload }) => handleWindowLifecycle(payload));
+        const removeClose = await currentWindow.onCloseRequested(() => {
+          presence.update({ appActive: false, visible: false, focused: false, realtimeReady: false, lastHeartbeatAt: null });
+          lifecycle.setForeground(false);
+        });
+        const cleanup = () => {
+          removeFocus();
+          removeClose();
+        };
+        if (cancelled) cleanup();
+        else removeTauriLifecycle = cleanup;
+      }).catch(() => undefined);
+    }
     return () => {
       cancelled = true;
-      realtime?.close();
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      stopFallbackSync();
-      document.removeEventListener("visibilitychange", wake);
-      window.removeEventListener("focus", wake);
+      lifecycle.stop();
+      suspendRealtime();
+      removeTauriLifecycle?.();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
     };
   }, [activeProfileId, activeProfile?.token, showAuth]);
 
@@ -981,7 +1178,7 @@ export default function App() {
     const existing = conversations.find((conversation) => conversation.handle === user.address);
     if (existing) {
       setConversations((current) => current.map((conversation) => conversation.id === existing.id ? { ...conversation, deleted: false } : conversation));
-      setActiveConversationId(existing.id);
+      selectConversation(existing.id);
       setSearchResult(null);
       setSearchError("");
       return;
@@ -990,7 +1187,7 @@ export default function App() {
       const remote = await createConversation(activeProfile, user);
       const conversation = mapRemoteConversation(remote);
       setConversations((current) => current.some((item) => item.id === conversation.id) ? current : [...current, conversation]);
-      setActiveConversationId(conversation.id);
+      selectConversation(conversation.id);
       setSearchResult(null);
       setSearchError("");
     } catch {
@@ -1004,6 +1201,15 @@ export default function App() {
       const messages = profileMessages[conversationId] ?? [];
       return { ...current, [profileId]: { ...profileMessages, [conversationId]: messages.map((item) => item.id === messageId ? update(item) : item) } };
     });
+  }
+
+  function selectConversation(conversationId: string | null) {
+    activeConversationIdRef.current = conversationId;
+    activePanelRef.current = "chats";
+    setActiveConversationId(conversationId);
+    setReplyTo(null);
+    setEditingMessage(null);
+    setConversations((current) => clearConversationUnread(current, conversationId));
   }
 
   function queueOutbox(profileId: string, conversationId: string, message: Message) {
@@ -1037,6 +1243,7 @@ export default function App() {
   async function sendMessageToConversation(conversationId: string, message: Message, pendingMedia: PendingMedia[] = [], fromOutbox = false) {
     if (!activeProfileId || !activeProfile) return;
     const profile = activeProfile;
+    const sendStartedAt = timingNow();
     logEvent("send", fromOutbox ? "Retrying message send" : "Preparing message", `attachments ${pendingMedia.length}`);
     const conversation = conversations.find((item) => item.id === conversationId || (conversationId === "favorites" && item.handle === "favorites"));
     if (!conversation || conversation.canWrite === false) {
@@ -1046,6 +1253,7 @@ export default function App() {
     }
     const targetConversationId = conversation.id;
     const isEdit = Boolean(message.editOf);
+    const isReactionEvent = Boolean(message.reactionEvent);
     setMessageError("");
     const hasPendingMedia = pendingMedia.length > 0 && !fromOutbox;
     if (!fromOutbox && !hasPendingMedia && !queueOutbox(profile.id, targetConversationId, message)) {
@@ -1068,13 +1276,15 @@ export default function App() {
     if (hasPendingMedia) setMediaUploadProgress(0);
     if (fromOutbox) {
       updateLocalMessage(profile.id, targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "pending" }));
-    } else if (!isEdit && !hasPendingMedia) {
+    } else if (!isEdit && !hasPendingMedia && !isReactionEvent) {
       const pendingMessage = { ...message, deliveryStatus: "pending" } satisfies Message;
       setMessagesByProfile((current) => {
         const profileMessages = current[profile.id] ?? EMPTY_MESSAGES;
-        return { ...current, [profile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
+        return { ...current, [profile.id]: mergeRemoteMessages(profileMessages, [{ conversationId: targetConversationId, message: pendingMessage }]) };
       });
+      markMessageStateApplied(message.id, timingNow(), "send");
       setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(message), time: message.time } : item));
+      logEvent("send", "Message optimistic apply scheduled", `message ${message.id}; local ${timingElapsed(sendStartedAt)}ms`, "info");
     }
     try {
       const { bundle, account } = await prepareProfile(profile);
@@ -1107,16 +1317,18 @@ export default function App() {
           const pendingMessage = { ...messageToSend, deliveryStatus: "pending" } satisfies Message;
           setMessagesByProfile((current) => {
             const profileMessages = current[profile.id] ?? EMPTY_MESSAGES;
-            return { ...current, [profile.id]: { ...profileMessages, [targetConversationId]: [...(profileMessages[targetConversationId] ?? []), pendingMessage] } };
+            return { ...current, [profile.id]: mergeRemoteMessages(profileMessages, [{ conversationId: targetConversationId, message: pendingMessage }]) };
           });
           setConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(messageToSend), time: messageToSend.time } : item));
         }
       }
+      const encryptionStartedAt = timingNow();
       const encryptedMessages = await Promise.all(recipients.map((recipient) => encryptMessage(profile, targetConversationId, messageToSend, recipient)));
-      logEvent("crypto", "Message encrypted", `recipients ${encryptedMessages.length}`, "success");
+      logEvent("crypto", "Message encrypted", `recipients ${encryptedMessages.length}; prepare ${timingElapsed(sendStartedAt, encryptionStartedAt)}ms; encrypt ${timingElapsed(encryptionStartedAt)}ms`, "success");
       const localEncryptedMessage = encryptedMessages.find((encryptedMessage) => encryptedMessage.key_id === account?.keyId) ?? encryptedMessages[0];
       const localMessage: Message = { ...messageToSend, encryptedMessage: localEncryptedMessage, deliveryStatus: "pending" };
       updateLocalMessage(profile.id, targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage }));
+      const transportStartedAt = timingNow();
       const sent = await sendRemoteMessage(profile, targetConversationId, localMessage, encryptedMessages);
       updateLocalMessage(profile.id, targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage, time: formatMessageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
       removeOutbox(profile.id, messageToSend.id);
@@ -1125,7 +1337,7 @@ export default function App() {
         if (mediaAbortRef.current === mediaController) mediaAbortRef.current = null;
         setMediaUploadProgress(null);
       }
-      logEvent("send", "Message sent", undefined, "success");
+      logEvent("send", "Message sent", `message ${message.id}; local-to-accepted ${timingElapsed(sendStartedAt)}ms; transport ${timingElapsed(transportStartedAt)}ms`, "success");
     } catch (reason) {
       if (hasPendingMedia && mediaOperation !== mediaOperationRef.current) return;
       if (mediaOperation === mediaOperationRef.current) {
@@ -1207,7 +1419,16 @@ export default function App() {
   }
 
   function reactToMessage(message: Message, reaction: string) {
-    updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : reaction }));
+    if (!activeConversationId || activeConversation?.canWrite === false) return;
+    const nextReaction = message.reaction === reaction ? null : reaction;
+    updateActiveMessage(message.id, (current) => ({ ...current, reaction: nextReaction ?? undefined }));
+    void sendMessageToConversation(activeConversationId, {
+      id: makeId(),
+      author: "me",
+      text: "",
+      time: formatMessageTime(),
+      reactionEvent: { targetMessageId: message.id, reaction: nextReaction },
+    });
   }
 
   function deleteMessage(message: Message) {
@@ -1261,7 +1482,7 @@ export default function App() {
 
   function archiveConversation(conversationId: string) {
     setConversations((current) => current.map((conversation) => conversation.id === conversationId ? { ...conversation, archived: true } : conversation));
-    if (activeConversationId === conversationId) setActiveConversationId(null);
+    if (activeConversationId === conversationId) selectConversation(null);
   }
 
   function saveFolder(draft: Pick<ChatFolder, "name" | "template" | "icon">) {
@@ -1289,7 +1510,7 @@ export default function App() {
 
   function deleteConversation(conversationId: string) {
     setConversations((current) => current.map((conversation) => conversation.id === conversationId ? { ...conversation, deleted: true } : conversation));
-    if (activeConversationId === conversationId) setActiveConversationId(null);
+    if (activeConversationId === conversationId) selectConversation(null);
   }
 
   function reorderConversations(sourceId: string, targetId: string) {
@@ -1322,7 +1543,7 @@ export default function App() {
   function selectFolder(folder: string) {
     setActiveFolder(folder);
     const definition = availableFolders.find((item) => item.id === folder);
-    if (folder !== ALL_FOLDER && (!definition || !activeConversation || !folderContains(definition, activeConversation))) setActiveConversationId(null);
+    if (folder !== ALL_FOLDER && (!definition || !activeConversation || !folderContains(definition, activeConversation))) selectConversation(null);
   }
 
   if (profiles.length === 0 || showAuth) {
@@ -1359,7 +1580,7 @@ export default function App() {
         searchError={searchError}
         onSearchUser={searchForUser}
         onOpenSearchUser={openSearchUser}
-        onSelectConversation={setActiveConversationId}
+        onSelectConversation={selectConversation}
         onSelectFolder={selectFolder}
         onTogglePinned={togglePinned}
         onToggleMuted={toggleMuted}

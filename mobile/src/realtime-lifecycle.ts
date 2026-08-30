@@ -1,3 +1,5 @@
+import { createPresenceLifecycle } from "../../common/src/presence-lifecycle.ts";
+
 type RealtimeLifecycleHooks = {
   onActive: () => void;
   onInactive: () => void;
@@ -8,28 +10,13 @@ function isActive(state: string | null) {
 }
 
 export function createRealtimeLifecycle(initialState: string | null, hooks: RealtimeLifecycleHooks) {
-  let active = isActive(initialState);
-  let stopped = false;
-
+  const lifecycle = createPresenceLifecycle(isActive(initialState), { onForeground: hooks.onActive, onBackground: hooks.onInactive });
   return {
-    start() {
-      if (!stopped && active) hooks.onActive();
-    },
+    start: lifecycle.start,
     change(state: string | null) {
-      if (stopped) return;
-      const nextActive = isActive(state);
-      if (nextActive === active) return;
-      active = nextActive;
-      if (active) hooks.onActive();
-      else hooks.onInactive();
+      lifecycle.setForeground(isActive(state));
     },
-    stop() {
-      if (stopped) return;
-      stopped = true;
-      hooks.onInactive();
-    },
-    isActive() {
-      return active && !stopped;
-    },
+    stop: lifecycle.stop,
+    isActive: lifecycle.isForeground,
   };
 }

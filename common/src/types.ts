@@ -56,6 +56,11 @@ export type MessageAttachment = {
   durationMs?: number;
 };
 
+export type MessageReactionEvent = {
+  targetMessageId: string;
+  reaction: string | null;
+};
+
 export type Message = {
   id: string;
   author: "me" | "them";
@@ -64,6 +69,7 @@ export type Message = {
   attachments?: MessageAttachment[];
   stackId?: string;
   replyTo?: { id: string; text: string };
+  reactionEvent?: MessageReactionEvent;
   editOf?: string;
   reaction?: string;
   pinned?: boolean;

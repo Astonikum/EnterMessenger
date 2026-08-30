@@ -10,6 +10,7 @@
     "bundle:android": "react-native bundle --platform android --dev false --entry-file index.js --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res",
     "build:android": "cd android && ./gradlew assembleRelease",
     "typecheck": "tsc --noEmit",
+    "test:back-navigation": "node --experimental-strip-types scripts/back-navigation-self-check.mjs",
     "test:crypto": "node scripts/e2e-self-check.mjs",
     "test:state": "node --experimental-strip-types scripts/state-self-check.mjs",
     "test:realtime": "node --experimental-strip-types --test ../test/realtime-lifecycle.test.mjs"
@@ -25,6 +26,7 @@
     "@react-native-community/netinfo": "11.4.1",
     "@react-native-documents/picker": "10.1.5",
     "base64-js": "^1.5.1",
+    "fast-text-encoding": "^1.0.6",
     "lucide-react-native": "^1.31.0",
     "react": "18.3.1",
     "react-native": "0.76.9",

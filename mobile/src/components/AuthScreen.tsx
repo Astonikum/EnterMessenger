@@ -12,6 +12,7 @@ import { LogsScreen } from "./LogsScreen";
 import { logEvent } from "../logs";
 import { friendlyError } from "../client-errors";
 import { isAuthDraftValid, isAuthHealthResponse, isAuthResponse, type AuthMode } from "../../../common/src/auth.ts";
+import { useBackAction } from "../back-navigation";
 
 type Props = { onAuthenticated: (profile: Profile, password: string) => void | Promise<void>; onCancel?: () => void };
 const SERVER_CHECK_TIMEOUT_MS = 5000;
@@ -93,6 +94,18 @@ export function AuthScreen({ onAuthenticated, onCancel }: Props) {
     transitionToStep("server", "backward");
     setError("");
   }
+
+  useBackAction(() => {
+    if (showLogs) {
+      setShowLogs(false);
+      return true;
+    }
+    if (step === "auth" || onCancel) {
+      goBack();
+      return true;
+    }
+    return false;
+  }, showLogs || step === "auth" || Boolean(onCancel));
 
   if (showLogs) return <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}><StatusBar barStyle="light-content" /><LogsScreen onClose={() => setShowLogs(false)} /></SafeAreaView>;
 

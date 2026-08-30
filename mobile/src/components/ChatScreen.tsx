@@ -14,6 +14,9 @@ import { ConversationAvatar } from "./Avatar";
 import { SafeAreaSheet } from "./SafeAreaSheet";
 import { readSettings } from "../settings";
 import { formatFileSize, presenceLabel, sameMessageStack } from "../../../common/src/format.ts";
+import { useBackAction } from "../back-navigation";
+import { consumeMessageStateApplied, timingElapsed } from "../../../common/src/timing.ts";
+import { logEvent } from "../logs";
 
 type Props = {
   profile: Profile;
@@ -60,6 +63,30 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
   const listRef = useRef<FlatList<Message>>(null);
   const contextMotion = useRef(new Animated.Value(0)).current;
   const activeEditingMessage = editingMessage ?? localEditingMessage;
+  function cancelComposerContext() {
+    setText("");
+    setLocalEditingMessage(null);
+    setInputHeight(MIN_MESSAGE_INPUT_HEIGHT);
+    setInputScrollable(false);
+    onCancelContext();
+  }
+
+  useBackAction(() => {
+    if (searchOpen) {
+      setSearchOpen(false);
+      setSearchQuery("");
+      return true;
+    }
+    if (selectedIds.length > 0) {
+      setSelectedIds([]);
+      return true;
+    }
+    if (replyTo || activeEditingMessage) {
+      cancelComposerContext();
+      return true;
+    }
+    return false;
+  }, Boolean(searchOpen || selectedIds.length > 0 || replyTo || activeEditingMessage));
   const startEditing = (message: Message) => {
     if (onStartEdit) onStartEdit(message);
     else { setLocalEditingMessage(message); setText(message.text); onCancelContext(); }
@@ -68,13 +95,22 @@ export function ChatScreen({ profile, conversation, messages, error = "", upload
     const value = searchQuery.trim().toLowerCase();
     return value ? messages.filter((message) => message.text.toLowerCase().includes(value)) : messages;
   }, [messages, searchQuery]);
+  const lastMessageId = visibleMessages[visibleMessages.length - 1]?.id;
 
   useEffect(() => setText(activeEditingMessage?.text ?? ""), [activeEditingMessage?.id]);
   useEffect(() => { void readSettings().then((settings) => setDensity(settings.density)); }, []);
   useEffect(() => setSelectedIds((current) => current.filter((id) => messages.some((message) => message.id === id))), [messages]);
-  useEffect(() => { if (visibleMessages.length) setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 30); }, [conversation.id, searchQuery]);
+  useEffect(() => {
+    if (!visibleMessages.length) return;
+    const timer = setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 30);
+    return () => clearTimeout(timer);
+  }, [conversation.id, lastMessageId, searchQuery, visibleMessages.length]);
+  useEffect(() => {
+    if (!lastMessageId) return;
+    const mark = consumeMessageStateApplied(lastMessageId);
+    if (mark !== undefined) logEvent(mark.source, "Message list rendered", `message ${lastMessageId}; state-to-render ${timingElapsed(mark.at)}ms`, "info");
+  }, [lastMessageId]);
   useEffect(() => { Animated.timing(contextMotion, { toValue: replyTo || activeEditingMessage ? 1 : 0, duration: 130, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start(); }, [activeEditingMessage?.id, contextMotion, replyTo?.id]);
-
   function toggleSelection(messageId: string) {
     setSelectedIds((current) => current.includes(messageId) ? current.filter((id) => id !== messageId) : [...current, messageId]);
   }

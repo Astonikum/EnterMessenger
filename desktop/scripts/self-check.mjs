@@ -1,9 +1,22 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createRealtimeQueue, createSyncQueue } from "../src/lib/sync-queue.ts";
 import { writeMessageCache } from "../src/lib/message-cache.ts";
 import { applyLocalSettings, DEFAULT_LOCAL_SETTINGS, readLocalSettings, writeLocalSettings } from "../src/lib/local-settings.ts";
 import { isManagedDeviceResponse } from "../src/lib/enter-api-contract.ts";
 import { normalizeServerAddress, resolveServerResource } from "../src/lib/server-address.ts";
+
+const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+const macosConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.macos.conf.json", import.meta.url), "utf8"));
+assert.equal(tauriConfig.version, "0.2.3");
+assert.equal(tauriConfig.app.windows[0].label, "main");
+assert.ok(tauriConfig.bundle.icon.includes("icons/icon.icns"));
+assert.equal(macosConfig.bundle.category, "SocialNetworking");
+assert.deepEqual(macosConfig.bundle.icon, ["icons/icon.icns"]);
+assert.equal(macosConfig.bundle.macOS.bundleName, "Enter Messenger");
+assert.equal(macosConfig.bundle.macOS.bundleVersion, tauriConfig.version);
+assert.equal(macosConfig.bundle.macOS.signingIdentity, "-");
+assert.equal(macosConfig.bundle.macOS.infoPlist, "Info.plist");
 
 const values = new Map();
 globalThis.localStorage = {

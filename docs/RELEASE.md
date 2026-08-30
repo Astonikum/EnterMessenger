@@ -3,6 +3,7 @@
 Релизы запускаются вручную из GitHub Actions:
 
 - `Desktop release` — Windows x64, Linux x64, macOS Intel и macOS Apple Silicon.
+- На macOS action дополнительно выпускает `Enter-Messenger_<version>_<arch>.pkg`.
 - `Mobile release` — нативная сборка Android через Gradle и iOS через Xcode/CocoaPods.
 - `CI` запускается на pull request и push в `main` и проверяет desktop/mobile, VS Code
   extension и server.
@@ -58,6 +59,21 @@ Mobile хранит обычное состояние и кэш через Async
 Текущий action готовит release-артефакты, но signing secrets еще не заведены. Перед
 публичным распространением нужно добавить code-signing для Windows и Apple Developer
 signing/notarization для macOS. Linux-пакеты можно выпускать без отдельного store signing.
+
+## Установка desktop на macOS
+
+Для установки в `/Applications` используйте `.pkg` из draft-релиза. Installer размещает
+полный `.app` в системной папке Applications и postinstall-регистрацией добавляет его в
+LaunchServices; запуск приложения вручную для регистрации не требуется.
+
+DMG остаётся доступным как стандартный drag-and-drop сценарий: перетащите `Enter Messenger.app`
+в `/Applications` и извлеките образ. Не запускайте приложение прямо со смонтированного DMG,
+из `Downloads` или из временной папки — в этих местах LaunchServices может оставить старую
+или дублирующую запись.
+
+Текущие macOS `.pkg`/DMG не подписываются и не notarize-ятся: для публичной раздачи всё ещё
+нужны Apple Developer signing/notarization secrets, иначе Gatekeeper может показать системное
+предупреждение даже у корректно установленного приложения.
 
 ## Security follow-up
 

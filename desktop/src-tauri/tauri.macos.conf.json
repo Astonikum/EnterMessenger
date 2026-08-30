@@ -1,0 +1,31 @@
+{
+  "bundle": {
+    "category": "SocialNetworking",
+    "shortDescription": "Secure federated messenger",
+    "longDescription": "Enter Messenger is a secure federated messenger.",
+    "icon": [
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "bundleName": "Enter Messenger",
+      "bundleVersion": "0.2.3",
+      "minimumSystemVersion": "10.13",
+      "signingIdentity": "-",
+      "infoPlist": "Info.plist",
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    }
+  }
+}

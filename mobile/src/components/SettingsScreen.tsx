@@ -9,6 +9,7 @@ import { blockAccount, changePassword, deleteDevice, deleteSession, fetchAccount
 import { friendlyError } from "../client-errors";
 import { CURRENT_VERSION, fetchLatestRelease, isNewerVersion, type PlatformRelease } from "../github-releases";
 import { deviceDetails, deviceTitle, formatReleaseDate, formatSessionDate, knownValue, sessionDetails, sessionTitle, shortId } from "../../../common/src/format.ts";
+import { useBackAction } from "../back-navigation";
 
 type CategoryId = "password" | "security" | "notifications" | "appearance" | "privacy" | "storage" | "energy" | "debug" | "updates" | "logs";
 type Category = { id: CategoryId; label: string; icon: IconName };
@@ -60,6 +61,12 @@ export function SettingsScreen({ profile, themeColors = colors, onClose, onOpenL
   const accountRef = useRef(account);
   const privacyRevisionRef = useRef(0);
   const privacyWriteRef = useRef(Promise.resolve());
+
+  useBackAction(() => {
+    if (!category) return false;
+    setCategory(null);
+    return true;
+  }, category !== null);
 
   useEffect(() => {
     let mounted = true;

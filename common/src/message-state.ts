@@ -1,5 +1,5 @@
 import type { RemoteDeliveryReceipt, RemoteReadReceipt } from "./api-types.ts";
-import type { Message } from "./types.ts";
+import type { Message, MessageReactionEvent } from "./types.ts";
 
 export function retryDelay(attempts: number) {
   return Math.min(60_000, 1000 * 2 ** Math.min(attempts, 6));
@@ -19,10 +19,20 @@ export function resolveMessageEdits(messages: Message[]) {
   return [...baseMessages, ...editEvents];
 }
 
+export function applyMessageReaction(messages: Message[], event: MessageReactionEvent) {
+  return messages.map((message) => message.id === event.targetMessageId
+    ? { ...message, reaction: event.reaction ?? undefined }
+    : message);
+}
+
 export function mergeRemoteMessages(current: Record<string, Message[]>, incoming: Array<{ conversationId: string; message: Message }>, limit?: (messages: Message[]) => Message[]) {
   const next = { ...current };
   incoming.forEach(({ conversationId, message }) => {
     const existing = next[conversationId] ?? [];
+    if (message.reactionEvent) {
+      next[conversationId] = limit ? limit(applyMessageReaction(existing, message.reactionEvent)) : applyMessageReaction(existing, message.reactionEvent);
+      return;
+    }
     const index = existing.findIndex((item) => item.id === message.id);
     if (index < 0) next[conversationId] = [...existing, message];
     else {
@@ -52,4 +62,27 @@ export function mergeDeliveryReceipts(current: Record<string, Message[]>, receip
     const deliveredAt = deliveredAtByMessage.get(message.id);
     return deliveredAt && (!message.deliveredAt || deliveredAt > message.deliveredAt) ? { ...message, deliveredAt } : message;
   })]));
+}
+
+export function reconcileRemoteMessages(
+  current: Record<string, Message[]>,
+  incoming: Array<{ conversationId: string; message: Message }>,
+  readReceipts: RemoteReadReceipt[] = [],
+  deliveryReceipts: RemoteDeliveryReceipt[] = [],
+  limit?: (messages: Message[]) => Message[],
+) {
+  return mergeDeliveryReceipts(
+    mergeReadReceipts(mergeRemoteMessages(current, incoming, limit), readReceipts),
+    deliveryReceipts,
+  );
+}
+
+export async function applyBeforeAcknowledge<T>(
+  apply: () => T | Promise<T>,
+  acknowledge: () => Promise<void>,
+  onAcknowledgeError: (reason: unknown) => void = () => undefined,
+) {
+  const value = await apply();
+  void Promise.resolve().then(acknowledge).catch(onAcknowledgeError);
+  return value;
 }

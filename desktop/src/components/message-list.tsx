@@ -7,6 +7,8 @@ import { ContextMenu } from "./ui/context-menu";
 import { Icon } from "./ui/icon";
 import { MediaBubble, MediaGroup, type MediaContextActions } from "./media-bubble";
 import type { MediaSettings } from "../lib/local-settings";
+import { consumeMessageStateApplied, timingElapsed } from "../../../common/src/timing.ts";
+import { logEvent } from "../lib/logs";
 
 type MessageListProps = {
   messages: Message[];
@@ -66,6 +68,12 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
     if (shouldAutoScrollRef.current) scrollToBottom();
   }, [lastMessageId]);
 
+  useLayoutEffect(() => {
+    if (!lastMessageId) return;
+    const mark = consumeMessageStateApplied(lastMessageId);
+    if (mark !== undefined) logEvent(mark.source, "Message list rendered", `message ${lastMessageId}; state-to-render ${timingElapsed(mark.at)}ms`, "info");
+  }, [lastMessageId]);
+
   return (
     <div ref={listRef} onScroll={handleScroll} className="scrollbar-none flex-1 space-y-0.5 overflow-y-auto px-5 py-6">
       {selectedIds.length > 0 && <div className="message-selection-bar sticky top-0 z-10 mx-auto flex max-w-[min(70%,28.75rem)] items-center justify-between gap-3 rounded-xl px-3 py-2 text-xs"><span>Выбрано: {selectedIds.length}</span><button type="button" className="icon-button size-7" title="Снять выделение" aria-label="Снять выделение" onClick={() => setSelectedIds([])}><Icon name="close" className="size-4" /></button></div>}
@@ -106,7 +114,7 @@ export function MessageList({ messages, onReply = () => undefined, onEdit = () =
           {message.author === "me" && (message.deliveryStatus ? <span title={message.deliveryStatus === "failed" ? "Не отправлено, будет повтор" : "Отправляется"}>{message.deliveryStatus === "failed" ? "!" : "…"}</span> : <span title={message.readAt ? "Прочитано" : message.deliveredAt ? "Доставлено" : "Отправлено"}><Icon name={message.readAt || message.deliveredAt ? "done_all" : "check"} className="size-3" /></span>)}
           {message.edited && <span>изменено</span>}
         </div> : null;
-        const messageCopy = <>{message.text && <p className="chat-message-text whitespace-pre-wrap">{message.text}</p>}{message.reaction && <span className="mt-1 inline-flex rounded-full bg-background/25 px-1.5 py-0.5 text-sm">{message.reaction}</span>}{messageMeta}</>;
+        const messageCopy = <>{message.replyTo && <div className="mb-2 border-l-2 border-primary/70 pl-2 text-xs"><span className="block font-semibold">Ответ</span><span className="block truncate opacity-75">{message.replyTo.text}</span></div>}{message.text && <p className="chat-message-text whitespace-pre-wrap">{message.text}</p>}{message.reaction && <span className="mt-1 inline-flex rounded-full bg-background/25 px-1.5 py-0.5 text-sm">{message.reaction}</span>}{messageMeta}</>;
         const fileList = otherAttachments.length > 0 ? <div className={cn("flex flex-col gap-1.5", visualAttachments.length > 0 && "mt-2", (message.text || message.reaction) && "mb-2")}>{otherAttachments.map((attachment) => <MediaBubble key={attachment.id} profile={profile} attachment={attachment} autoDownload={mediaAutoDownloadAllowed(attachment, mediaSettings)} autoplayVideo={mediaSettings?.autoplayVideo ?? false} onAttachmentContextMenu={(selectedAttachment, actions) => setAttachmentContext({ messageId: message.id, attachment: selectedAttachment, actions })} />)}</div> : null;
 
         return (

@@ -2,6 +2,7 @@ import { formatEnterAddress, parseEnterAddress, ENTER_PROTOCOL_VERSION } from ".
 import { isManagedDeviceResponse, type ManagedDeviceResponse } from "./enter-api-contract";
 import { normalizeServerAddress } from "./server-address";
 import { logEvent } from "./logs";
+import { timingElapsed, timingNow } from "../../../common/src/timing.ts";
 import { MAX_MEDIA_BYTES } from "../../../common/src/media.ts";
 import type { DeviceKeyBundle, PublicAccountKey, PublicDeviceKey } from "./e2e";
 import type { ChatFolder } from "./folders";
@@ -185,12 +186,13 @@ async function fetchDirectory(profile: Profile, rawAddress: string) {
 }
 
 export async function syncProfile(profile: Profile, since: number): Promise<SyncResponse> {
+  const startedAt = timingNow();
   logEvent("sync", "Sync request", `cursor ${Math.max(0, since)}`);
   const response = await request(`${apiUrl(profile, "/api/v1/sync")}?since=${Math.max(0, since)}`, {
     headers: headers(profile),
   });
   const result = await readJson<SyncResponse>(response, isSyncResponse);
-  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}`, "success");
+  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}; HTTP ${timingElapsed(startedAt)}ms`, "success");
   return result;
 }
 
@@ -397,6 +399,7 @@ export async function createConversation(profile: Profile, user: SearchUser): Pr
 }
 
 export async function sendMessage(profile: Profile, conversationId: string, message: Message, encryptedMessages: EncryptedMessage[]): Promise<SendMessageResponse> {
+  const startedAt = timingNow();
   logEvent("send", "Sending message", `recipients ${encryptedMessages.length}${message.attachments?.length ? `, attachments ${message.attachments.length}` : ""}`);
   const response = await request(apiUrl(profile, "/api/v1/messages"), {
     method: "POST",
@@ -412,7 +415,7 @@ export async function sendMessage(profile: Profile, conversationId: string, mess
     && Number.isFinite(value.nextCursor)
     && value.nextCursor >= 0
     && isRemoteMessage(value.message));
-  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}`, "success");
+  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}; HTTP ${timingElapsed(startedAt)}ms`, "success");
   return result;
 }
 

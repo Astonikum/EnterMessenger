@@ -6,6 +6,7 @@ import type { Conversation, Message, Profile } from "./types";
 import type { ChatFolder } from "./folders";
 import { MAX_MEDIA_BYTES } from "./media";
 import { logEvent } from "./logs";
+import { timingElapsed, timingNow } from "../../common/src/timing.ts";
 import type { AccountSettings, AccountSettingsPatch, BlockedAccount, ChangePasswordPayload, ClientDeviceMetadata, DeviceHistoryEntry, RemoteConversation, RemoteDeliveryReceipt, RemoteMessage, RemoteReadReceipt, RealtimeEvent, SearchUser, SyncResponse } from "../../common/src/api-types.ts";
 import { isAcceptedResponse, isAccountSettings, isBlockedAccount, isBlockedAccountList, isDeviceHistoryResponse, isEncryptedMessage, isFolderList, isRealtimeEvent, isRemoteConversation, isRemoteMessage, isSyncResponse, isTimestampResponse, MAX_SYNC_ITEMS } from "../../common/src/api-contract.ts";
 import { isAuthHealthResponse } from "../../common/src/auth.ts";
@@ -285,10 +286,11 @@ export async function revokeOtherSessions(profile: Profile) {
 }
 
 export async function syncProfile(profile: Profile, since: number) {
+  const startedAt = timingNow();
   logEvent("sync", "Sync request", `cursor ${Math.max(0, since)}`);
   const response = await request(`${apiUrl(profile, "/api/v1/sync")}?since=${Math.max(0, since)}`, { headers: headers(profile) });
   const result = await readJson<SyncResponse>(response, isSyncResponse);
-  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}`, "success");
+  logEvent("sync", "Sync completed", `messages ${result.messages.length}, chats ${result.conversations.length}, cursor ${result.nextCursor}; HTTP ${timingElapsed(startedAt)}ms`, "success");
   return result;
 }
 
@@ -382,10 +384,11 @@ export async function createConversation(profile: Profile, user: SearchUser) {
 }
 
 export async function sendMessage(profile: Profile, conversationId: string, message: Message, encryptedMessages: EncryptedMessage[]) {
+  const startedAt = timingNow();
   logEvent("send", "Sending message", `recipients ${encryptedMessages.length}${message.attachments?.length ? `, attachments ${message.attachments.length}` : ""}`);
   const response = await request(apiUrl(profile, "/api/v1/messages"), { method: "POST", headers: headers(profile), body: JSON.stringify({ conversationId, clientMessageId: message.id, encryptedMessages }) });
   const result = await readJson<{ nextCursor: number; message: RemoteMessage }>(response, (value): value is { nextCursor: number; message: RemoteMessage } => isRecord(value) && isNumber(value.nextCursor) && value.nextCursor >= 0 && isRemoteMessage(value.message));
-  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}`, "success");
+  logEvent("send", "Message accepted by server", `cursor ${result.nextCursor}; HTTP ${timingElapsed(startedAt)}ms`, "success");
   return result;
 }
 

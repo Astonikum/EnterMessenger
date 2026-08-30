@@ -124,6 +124,28 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      - name: Build macOS installer
+        if: runner.os == 'macOS'
+        working-directory: desktop
+        run: npm run package:macos -- "${{ matrix.target }}"
+
+      - name: Upload macOS installer
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        shell: bash
+        run: |
+          version="$(node -p "require('./desktop/package.json').version")"
+          target="${{ matrix.target }}"
+          case "$target" in
+            aarch64-apple-darwin) architecture="arm64" ;;
+            x86_64-apple-darwin) architecture="x86_64" ;;
+            *) echo "Unsupported macOS target: $target" >&2; exit 1 ;;
+          esac
+          pkg="desktop/src-tauri/target/$target/release/bundle/macos/Enter-Messenger_${version}_${architecture}.pkg"
+          test -f "$pkg"
+          gh release upload "desktop-v$version" "$pkg" --clobber
+
   finalize:
     name: Keep desktop draft release
     needs: release

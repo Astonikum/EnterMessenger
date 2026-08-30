@@ -27,3 +27,17 @@ export function conversationAvatarKind(conversation: Pick<Conversation, "handle"
   if (conversation.handle === "official" || conversation.avatar === "enter-official") return "official" as const;
   return "generated" as const;
 }
+
+export function clearConversationUnread(conversations: Conversation[], conversationId: string | null, isOpen = true) {
+  if (!conversationId || !isOpen) return conversations;
+  return conversations.map((conversation) => conversation.id === conversationId && conversation.unread
+    ? { ...conversation, unread: 0 }
+    : conversation);
+}
+
+export function incrementConversationUnread(conversations: Conversation[], conversationId: string, activeConversationId: string | null, isOpen = true) {
+  if (isOpen && conversationId === activeConversationId) return conversations;
+  return conversations.map((conversation) => conversation.id === conversationId
+    ? { ...conversation, unread: (conversation.unread ?? 0) + 1 }
+    : conversation);
+}

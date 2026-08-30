@@ -58,4 +58,28 @@ for (const [name, createSyncQueue, createRealtimeQueue] of [["desktop", createDe
     await queue.retry();
     assert.deepEqual(applied, [1, 2, 4]);
   });
+
+  test(`${name} retries a pending gap after a temporary reconnect recovery failure`, async () => {
+    let cursor = 0;
+    let recoveries = 0;
+    const applied = [];
+    const queue = createRealtimeQueue(
+      () => cursor,
+      (next) => { cursor = Math.max(cursor, next); },
+      async (event) => { applied.push(event.cursor); return true; },
+      async () => {
+        recoveries += 1;
+        if (recoveries > 1) cursor = 1;
+      },
+    );
+
+    queue.enqueue({ cursor: 2 });
+    await queue.retry();
+    assert.deepEqual(applied, []);
+    await queue.retry();
+
+    assert.deepEqual(applied, [2]);
+    assert.equal(recoveries, 2);
+    assert.equal(cursor, 2);
+  });
 }

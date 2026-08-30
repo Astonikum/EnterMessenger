@@ -2,7 +2,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import notifee, { EventType } from "@notifee/react-native";
 import { useBatteryLevel } from "react-native-device-info";
-import { Alert, Animated, AppState, Appearance, Easing, Image, PanResponder, Platform, Pressable, StatusBar, StyleSheet, Text, View, useColorScheme, useWindowDimensions } from "react-native";
+import NetInfo, { type NetInfoState } from "@react-native-community/netinfo";
+import { Alert, Animated, AppState, Appearance, BackHandler, Easing, Image, Keyboard, PanResponder, Platform, Pressable, StatusBar, StyleSheet, Text, View, useColorScheme, useWindowDimensions } from "react-native";
 import { initialWindowMetrics, SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { AuthScreen } from "./src/components/AuthScreen";
 import { ConversationList, type Action } from "./src/components/ConversationList";
@@ -29,11 +30,16 @@ import { messagePreview } from "../common/src/messages.ts";
 import { deleteSessionToken, readSessionToken, writeSessionToken } from "./src/secure-session";
 import { limitMessageList, limitMessagesByProfile, limitOutboxEntries, MAX_OUTBOX_ATTEMPTS, retryDelay, sanitizeMessagesByProfile, sanitizeOutboxByProfile, sanitizeSyncCursors } from "./src/storage-limits";
 import { isCachedConversation } from "../common/src/storage-models.ts";
+import { clearConversationUnread, incrementConversationUnread } from "../common/src/conversations.ts";
+import { createPresenceStateMachine, PRESENCE_HEARTBEAT_TIMEOUT_MS, shouldKeepPresenceConnection } from "../common/src/presence.ts";
 import { folderContains, sanitizeFoldersByProfile, type ChatFolder } from "./src/folders";
 import { DEFAULT_SETTINGS, readSettings, type MobileSettings } from "./src/settings";
 import { CommonDebugProvider } from "./src/common-debug";
-import { isUnauthorized, mergeDeliveryReceipts, mergeReadReceipts, mergeRemoteMessages } from "../common/src/message-state.ts";
+import { applyBeforeAcknowledge, isUnauthorized, mergeRemoteMessages, reconcileRemoteMessages } from "../common/src/message-state.ts";
 import { formatProfileAddress } from "../common/src/address.ts";
+import { type NavigationScreen } from "../common/src/navigation.ts";
+import { BackNavigationProvider, createBackActionRegistry, useBackAction } from "./src/back-navigation";
+import { markMessageStateApplied, timingElapsed, timingNow } from "../common/src/timing.ts";
 
 const PROFILES_KEY = "enter-profiles";
 const MESSAGES_KEY = "enter-mobile-messages";
@@ -45,7 +51,7 @@ const OUTBOX_KEY = "enter-mobile-outbox";
 const ALL_FOLDER = "all";
 const MAX_DECRYPT_RETRIES = 3;
 
-type Screen = "inbox" | "chat" | "profile" | "settings" | "logs";
+type Screen = NavigationScreen;
 type MessagesByProfile = Record<string, Record<string, Message[]>>;
 type ConversationsByProfile = Record<string, Conversation[]>;
 type FoldersByProfile = Record<string, ChatFolder[]>;
@@ -57,6 +63,19 @@ type NavigationState = {
 };
 
 type StoredProfile = Omit<Profile, "token"> & { token?: string };
+
+function RegisteredBackAction({ onBack }: { onBack: () => void }) {
+  useBackAction(() => {
+    onBack();
+    return true;
+  });
+  return null;
+}
+
+function RootBackAction({ onBack }: { onBack: () => boolean }) {
+  useBackAction(onBack);
+  return null;
+}
 
 function isStoredProfile(value: unknown): value is StoredProfile {
   if (!value || typeof value !== "object") return false;
@@ -103,7 +122,7 @@ async function decryptRemoteMessage(profile: Profile, remote: RemoteMessage, kno
   const sender = senderDevices.find((device) => device.deviceId === remote.encryptedMessage.sender_device);
   if (!sender) throw new Error("Ключ устройства отправителя не найден");
   const payload = decodeMessagePayload(await decryptMessage(profile, remote.encryptedMessage, sender));
-  return { id: remote.encryptedMessage.message_id, author: remote.author, text: payload.text, editOf: payload.editOf, attachments: payload.attachments, time: messageTime(new Date(remote.createdAt)), stackId: remote.stackId, encryptedMessage: remote.encryptedMessage };
+  return { id: remote.encryptedMessage.message_id, author: remote.author, text: payload.text, editOf: payload.editOf, attachments: payload.attachments, replyTo: payload.replyTo, reactionEvent: payload.reactionEvent, time: messageTime(new Date(remote.createdAt)), stackId: remote.stackId, encryptedMessage: remote.encryptedMessage };
 }
 
 export default function App() {
@@ -145,6 +164,9 @@ export default function App() {
   const previousScreen = useRef<Screen>(screen);
   const activeConversationIdRef = useRef(activeConversationId);
   const screenRef = useRef(screen);
+  const queryRef = useRef(query);
+  const keyboardVisibleRef = useRef(false);
+  const backRegistry = useMemo(() => createBackActionRegistry(), []);
   const swipeResponder = useRef(PanResponder.create({
     onMoveShouldSetPanResponder: (_event, gesture) => {
       if (screenRef.current !== "inbox" && screenRef.current !== "settings") return false;
@@ -182,8 +204,42 @@ export default function App() {
     Animated.timing(screenMotion, { toValue: 1, duration: energySavingActive && !localSettings.energySaving.smoothTransitions ? 0 : 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
   }, [energySavingActive, localSettings.energySaving.smoothTransitions, screen, screenMotion]);
 
-  useEffect(() => { activeConversationIdRef.current = activeConversationId; }, [activeConversationId]);
-  useEffect(() => { screenRef.current = screen; }, [screen]);
+  activeConversationIdRef.current = activeConversationId;
+  screenRef.current = screen;
+  queryRef.current = query;
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const shown = Keyboard.addListener("keyboardDidShow", () => { keyboardVisibleRef.current = true; });
+    const hidden = Keyboard.addListener("keyboardDidHide", () => { keyboardVisibleRef.current = false; });
+    return () => { shown.remove(); hidden.remove(); };
+  }, []);
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (keyboardVisibleRef.current) {
+        keyboardVisibleRef.current = false;
+        Keyboard.dismiss();
+        return true;
+      }
+      return backRegistry.handle();
+    });
+    return () => subscription.remove();
+  }, [backRegistry]);
+  function handleRootBack() {
+    if (queryRef.current && screenRef.current === "inbox") {
+      setQuery("");
+      return true;
+    }
+    if (screenRef.current === "chat" && activeConversationIdRef.current) {
+      leaveConversation();
+      return true;
+    }
+    if (screenRef.current !== "inbox") {
+      setScreen("inbox");
+      return true;
+    }
+    return false;
+  }
   useEffect(() => { void configureNotifications(); }, []);
 
   useEffect(() => {
@@ -202,8 +258,12 @@ export default function App() {
       }
       const profileId = next.profileId && profiles.some((profile) => profile.id === next.profileId) ? next.profileId : activeProfileId;
       if (!profileId) return;
+      activeConversationIdRef.current = next.conversationId;
+      screenRef.current = "chat";
       setActiveProfileId(profileId);
       setActiveConversationId(next.conversationId);
+      setReplyTo(null);
+      setEditingMessage(null);
       setActiveConversationByProfile((current) => ({ ...current, [profileId]: next.conversationId }));
       setScreen("chat");
     };
@@ -220,8 +280,12 @@ export default function App() {
     pendingNotificationRef.current = null;
     const profileId = pending.profileId && profiles.some((profile) => profile.id === pending.profileId) ? pending.profileId : activeProfileId;
     if (!profileId) return;
+    activeConversationIdRef.current = pending.conversationId;
+    screenRef.current = "chat";
     setActiveProfileId(profileId);
     setActiveConversationId(pending.conversationId);
+    setReplyTo(null);
+    setEditingMessage(null);
     setActiveConversationByProfile((current) => ({ ...current, [profileId]: pending.conversationId }));
     setScreen("chat");
   }, [activeProfileId, hydrated, profiles]);
@@ -347,9 +411,25 @@ export default function App() {
   }, [hydrated, activeProfileId, activeConversationByProfile, activeFolderByProfile, screen]);
 
   useEffect(() => {
+    if (!activeProfile || screen !== "chat" || !activeConversationId) return;
+    updateConversations((current) => clearConversationUnread(current, activeConversationId, true));
+    void markConversationRead(activeProfile, activeConversationId).catch(() => undefined);
+  }, [activeConversationId, activeProfile?.id, activeProfile?.token, messages.length, screen]);
+
+  useEffect(() => {
     if (!activeProfile || showAuth) { setSyncConnected(false); return; }
     let cancelled = false;
     let appActive = AppState.currentState === null || AppState.currentState === "active";
+    let networkOnline = true;
+    const presence = createPresenceStateMachine({
+      appActive,
+      visible: appActive,
+      focused: true,
+      networkOnline,
+      realtimeReady: false,
+      lastHeartbeatAt: null,
+    });
+    const presenceConnectionAllowed = () => shouldKeepPresenceConnection(presence.getInputs());
     let cursor = syncCursorsRef.current[activeProfile.id] ?? 0;
     const cachedMessages = messagesByProfileRef.current[activeProfile.id] ?? EMPTY_MESSAGES;
     const hasCachedMessages = Object.values(cachedMessages).some((items) => items.length > 0);
@@ -487,6 +567,7 @@ export default function App() {
 
     const knownConversationIds = new Set(conversations.map((conversation) => conversation.id));
     const seenMessageIds = new Set(Object.values(messagesByProfileRef.current[profile.id] ?? EMPTY_MESSAGES).flat().map((message) => message.id));
+    const realtimeReceivedAt = new Map<number, number>();
     let retryRealtime: () => void | Promise<void> = () => undefined;
     const advanceCursor = (nextCursor: number) => {
       if (nextCursor <= cursor) return;
@@ -496,7 +577,7 @@ export default function App() {
     };
 
     async function applySyncResult(result: SyncResponse) {
-      if (cancelled || !appActive) return false;
+      if (cancelled || !presenceConnectionAllowed()) return false;
       logEvent("sync", "Sync package received", `chats ${result.conversations.length}, messages ${result.messages.length}, cursor ${result.nextCursor}`);
       setSyncConnected(true);
       if (result.folders) setFoldersByProfile((current) => ({ ...current, [profile.id]: result.folders! }));
@@ -504,7 +585,7 @@ export default function App() {
       updateConversations((current) => {
         const currentById = new Map(current.map((conversation) => [conversation.id, conversation]));
         const currentOrder = current.map((conversation) => conversation.id);
-        return result.conversations.map((remote) => {
+        const merged = result.conversations.map((remote) => {
           const mapped = mapRemoteConversation(remote);
           const local = currentById.get(mapped.id);
           return local ? { ...mapped, pinned: local.pinned, muted: local.muted, archived: local.archived, deleted: local.deleted } : mapped;
@@ -515,8 +596,9 @@ export default function App() {
           if (rightIndex < 0) return -1;
           return leftIndex - rightIndex;
         });
+        return clearConversationUnread(merged, activeConversationIdRef.current, screenRef.current === "chat");
       });
-      if (!(await ensureOwnBundle()) || cancelled || !appActive || !ownBundle) return false;
+      if (!(await ensureOwnBundle()) || cancelled || !presenceConnectionAllowed() || !ownBundle) return false;
       const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
       const deviceMessages = result.messages.filter((remote) => ownKeyIds.has(remote.encryptedMessage.key_id));
       let quarantinedCount = 0;
@@ -546,23 +628,23 @@ export default function App() {
         }
       }))).filter((value): value is { conversationId: string; message: Message } => value !== null);
       logEvent("crypto", "Sync decryption completed", `success ${decrypted.length}, retries ${retryingFailures.length}, skipped ${quarantinedCount}`, retryingFailures.length || quarantinedCount ? "warn" : "success");
-      if (cancelled || !appActive) return false;
-      const newIncomingMessages = decrypted.filter(({ message }) => message.author === "them" && !seenMessageIds.has(message.id));
+      if (cancelled || !presenceConnectionAllowed()) return false;
+      const newIncomingMessages = decrypted.filter(({ message }) => message.author === "them" && !message.reactionEvent && !seenMessageIds.has(message.id));
       const acknowledged = [...new Set(decrypted
         .filter(({ message }) => message.author === "them")
         .map(({ message }) => message.id))];
-      try {
-        await Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId)));
-      } catch {
-        if (!cancelled && appActive) setMessageError("Не удалось подтвердить получение сообщения. Синхронизация повторится.");
-        return false;
-      }
-      if (cancelled || !appActive) return false;
-      decrypted.forEach(({ message }) => seenMessageIds.add(message.id));
-      setMessagesByProfile((current) => {
-        const existing = current[profile.id] ?? EMPTY_MESSAGES;
-        return { ...current, [profile.id]: mergeDeliveryReceipts(mergeReadReceipts(mergeRemoteMessages(existing, decrypted, limitMessageList), result.readReceipts ?? []), result.deliveryReceipts ?? []) };
-      });
+      await applyBeforeAcknowledge(
+        () => {
+          decrypted.forEach(({ message }) => seenMessageIds.add(message.id));
+          setMessagesByProfile((current) => {
+            const existing = current[profile.id] ?? EMPTY_MESSAGES;
+            return { ...current, [profile.id]: reconcileRemoteMessages(existing, decrypted, result.readReceipts ?? [], result.deliveryReceipts ?? [], limitMessageList) };
+          });
+        },
+        () => Promise.all(acknowledged.map((messageId) => acknowledgeMessage(profile, messageId))).then(() => undefined),
+        (reason) => logEvent("sync", "Message acknowledgement failed", reason instanceof Error ? reason.message : "Acknowledgement error", "warn"),
+      );
+      if (cancelled || !presenceConnectionAllowed()) return false;
       if (syncNotificationsReady && syncNotificationsAllowed) {
         newIncomingMessages.forEach(({ conversationId, message }) => {
           if (activeConversationIdRef.current === conversationId && screenRef.current === "chat") return;
@@ -585,57 +667,68 @@ export default function App() {
     }
 
     const syncOnce = createSyncQueue(async () => {
-      if (cancelled || !appActive) return;
+      if (cancelled || !presenceConnectionAllowed()) return;
       try {
         cursor = Math.max(cursor, syncCursorsRef.current[profile.id] ?? 0);
         await applySyncResult(await syncProfile(profile, cursor));
       } catch (reason) {
-        if (cancelled || !appActive) return;
+        if (cancelled || !presenceConnectionAllowed()) return;
         logEvent("sync", "Sync failed", reason instanceof Error ? reason.message : "Sync error", "error");
         setSyncConnected(false);
         if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); }
         else setMessageError(friendlyError(reason, "Нет подключения к серверу"));
       }
-      if (appActive) retryRealtime();
+      if (presenceConnectionAllowed()) retryRealtime();
     });
 
     type DirectRealtimeEvent = Extract<RealtimeEvent, { cursor: number }>;
     async function applyRealtimeEvent(event: DirectRealtimeEvent) {
-      if (cancelled || !appActive) return false;
+      if (cancelled || !presenceConnectionAllowed()) return false;
+      const receivedAt = realtimeReceivedAt.get(event.cursor) ?? timingNow();
+      realtimeReceivedAt.delete(event.cursor);
       if (event.type === "message") {
         if (!knownConversationIds.has(event.message.conversationId)) {
           const before = cursor;
           await syncOnce();
           return cursor > before;
         }
-        if (!(await ensureOwnBundle()) || cancelled || !ownBundle) return false;
+        if (!(await ensureOwnBundle()) || cancelled || !presenceConnectionAllowed() || !ownBundle) return false;
+        const cryptoReadyAt = timingNow();
         const ownKeyIds = new Set([ownBundle.keyId, ownAccount?.keyId].filter((value): value is string => Boolean(value)));
         if (!ownKeyIds.has(event.message.encryptedMessage.key_id)) return true;
         try {
-          const message = await decryptRemoteMessage(profile, event.message, await senderDevicesFor(event.message.encryptedMessage.sender));
-          if (message.author === "them") {
-            try {
-              await acknowledgeMessage(profile, message.id);
-            } catch {
-              setMessageError("Не удалось подтвердить получение realtime-сообщения. Синхронизация повторится.");
-              return false;
-            }
-          }
+          const senderKeysStartedAt = timingNow();
+          const senderDevices = await senderDevicesFor(event.message.encryptedMessage.sender);
+          const decryptStartedAt = timingNow();
+          const message = await decryptRemoteMessage(profile, event.message, senderDevices);
+          logEvent("realtime", "Message decrypted", `cursor ${event.cursor}; websocket-to-crypto-ready ${timingElapsed(receivedAt, cryptoReadyAt)}ms; sender-keys ${timingElapsed(senderKeysStartedAt, decryptStartedAt)}ms; decrypt ${timingElapsed(decryptStartedAt)}ms`, "info");
           const isNewMessage = !seenMessageIds.has(message.id);
-          seenMessageIds.add(message.id);
-          setMessagesByProfile((current) => {
-            const existing = current[profile.id] ?? EMPTY_MESSAGES;
-            return { ...current, [profile.id]: mergeRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }], limitMessageList) };
-          });
-          if (isNewMessage && event.message.author === "them") {
-            updateConversations((current) => current.map((conversation) => conversation.id === event.message.conversationId && conversation.id !== activeConversationId ? { ...conversation, unread: (conversation.unread ?? 0) + 1 } : conversation));
-            if (activeConversationIdRef.current !== event.message.conversationId || screenRef.current !== "chat") {
-              const conversation = conversations.find((item) => item.id === event.message.conversationId);
-              void notifyIncomingMessage({ profileId: profile.id, conversationId: event.message.conversationId, messageId: message.id, title: conversation?.name ?? "Enter", text: message.text });
-            }
-          }
-          setMessageError("");
-          return true;
+          return await applyBeforeAcknowledge(
+            () => {
+              seenMessageIds.add(message.id);
+              const isActiveChat = activeConversationIdRef.current === event.message.conversationId && screenRef.current === "chat";
+              setMessagesByProfile((current) => {
+                const existing = current[profile.id] ?? EMPTY_MESSAGES;
+                return { ...current, [profile.id]: reconcileRemoteMessages(existing, [{ conversationId: event.message.conversationId, message }], [], [], limitMessageList) };
+              });
+              if (isActiveChat) markMessageStateApplied(message.id);
+              logEvent("realtime", "Message state applied", `cursor ${event.cursor}; websocket-to-state ${timingElapsed(receivedAt)}ms; active ${isActiveChat}`, "info");
+              if (isNewMessage && message.author === "them" && !message.reactionEvent) {
+                updateConversations((current) => incrementConversationUnread(current, event.message.conversationId, activeConversationIdRef.current, isActiveChat));
+                if (isActiveChat) {
+                  void markConversationRead(profile, event.message.conversationId).catch(() => undefined);
+                }
+                if (activeConversationIdRef.current !== event.message.conversationId || screenRef.current !== "chat") {
+                  const conversation = conversations.find((item) => item.id === event.message.conversationId);
+                  void notifyIncomingMessage({ profileId: profile.id, conversationId: event.message.conversationId, messageId: message.id, title: conversation?.name ?? "Enter", text: message.text });
+                }
+              }
+              setMessageError("");
+              return true;
+            },
+            message.author === "them" ? () => acknowledgeMessage(profile, message.id).then(() => undefined) : () => Promise.resolve(),
+            (reason) => logEvent("realtime", "Message acknowledgement failed", reason instanceof Error ? reason.message : "Acknowledgement error", "warn"),
+          );
         } catch (reason) {
           logEvent("crypto", "Realtime message decryption failed", reason instanceof Error ? reason.message : "Decryption error", "error");
           setMessageError("Не удалось расшифровать realtime-сообщение. Синхронизация повторится.");
@@ -645,8 +738,8 @@ export default function App() {
       setMessagesByProfile((current) => {
         const existing = current[profile.id] ?? EMPTY_MESSAGES;
         const messages = event.type === "readReceipt"
-          ? mergeReadReceipts(existing, [{ messageId: event.messageId, readAt: event.readAt }])
-          : mergeDeliveryReceipts(existing, [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
+          ? reconcileRemoteMessages(existing, [], [{ messageId: event.messageId, readAt: event.readAt }])
+          : reconcileRemoteMessages(existing, [], [], [{ messageId: event.messageId, deliveredAt: event.deliveredAt }]);
         return { ...current, [profile.id]: messages };
       });
       return true;
@@ -654,7 +747,7 @@ export default function App() {
 
     const realtimeQueue = createRealtimeQueue<DirectRealtimeEvent>(() => cursor, advanceCursor, applyRealtimeEvent, syncOnce);
     retryRealtime = realtimeQueue.retry;
-    let realtimeSnapshot = Promise.resolve();
+    let realtimeSnapshot: Promise<unknown> = Promise.resolve();
 
     let realtime: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -662,15 +755,17 @@ export default function App() {
     let fallbackDelay = 5_000;
     let realtimeReady = false;
     let reconnectDelay = 1000;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let lastRealtimePongAt = 0;
 
     const startFallbackSync = () => {
-      if (!appActive || fallbackTimer !== null || realtimeReady) return;
+      if (!presenceConnectionAllowed() || fallbackTimer !== null || realtimeReady) return;
       fallbackTimer = setTimeout(() => {
         fallbackTimer = null;
-        if (cancelled || !appActive || realtimeReady) return;
+        if (cancelled || !presenceConnectionAllowed() || realtimeReady) return;
         syncNotificationsAllowed = true;
         void syncOnce().catch(() => undefined).then(() => {
-          if (cancelled || !appActive || realtimeReady) return;
+          if (cancelled || !presenceConnectionAllowed() || realtimeReady) return;
           fallbackDelay = Math.min(30_000, fallbackDelay * 2);
           startFallbackSync();
         });
@@ -685,40 +780,53 @@ export default function App() {
       syncNotificationsAllowed = false;
     };
     const scheduleRealtimeReconnect = () => {
-      if (cancelled || !appActive || reconnectTimer !== null) return;
+      if (cancelled || !presenceConnectionAllowed() || reconnectTimer !== null) return;
       const delay = reconnectDelay;
       reconnectDelay = Math.min(30_000, reconnectDelay * 2);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
-        if (appActive) connectRealtime();
+        if (presenceConnectionAllowed()) connectRealtime();
       }, delay);
     };
     const handleRealtimeClose = (details?: RealtimeClose) => {
-      if (cancelled || !appActive) return;
+      lastRealtimePongAt = 0;
+      presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+      if (cancelled || !presenceConnectionAllowed()) return;
       realtimeReady = false;
       const closeDetails = details ? `code ${details.code}, clean ${details.wasClean}${details.reason ? `, reason ${details.reason}` : ""}` : "code unknown";
       logEvent("realtime", "Realtime connection closed", `${closeDetails}; switching to reconnect`, "warn");
+      void syncOnce();
       startFallbackSync();
       scheduleRealtimeReconnect();
     };
     const connectRealtime = () => {
-      if (cancelled || !appActive || realtime !== null) return;
+      if (cancelled || !presenceConnectionAllowed() || realtime !== null) return;
       let socket: WebSocket | null = null;
       try {
         socket = openRealtime(profile, cursor, (event) => {
-          if (cancelled || !appActive || realtime !== socket) return;
-          if (event.type === "ready") {
+          if (cancelled || !presenceConnectionAllowed() || realtime !== socket) return;
+          if (event.type === "pong") {
+            lastRealtimePongAt = Date.now();
+            presence.update({ lastHeartbeatAt: lastRealtimePongAt });
+          } else if (event.type === "ready") {
             realtimeReady = true;
+            lastRealtimePongAt = Date.now();
+            presence.update({ realtimeReady: true, lastHeartbeatAt: lastRealtimePongAt });
             logEvent("realtime", "Realtime connection established", undefined, "success");
             reconnectDelay = 1000;
             stopFallbackSync();
             setSyncConnected(true);
           } else if (event.type === "sync") {
-            realtimeSnapshot = realtimeSnapshot.then(() => applySyncResult(event)).then(() => realtimeQueue.retry());
+            queueRealtimeTask(async () => {
+              await applySyncResult(event);
+              await realtimeQueue.retry();
+            });
           } else if (event.type === "folders") {
             setFoldersByProfile((current) => ({ ...current, [profile.id]: event.folders }));
           } else if (event.type === "message" || event.type === "readReceipt" || event.type === "deliveryReceipt") {
-            realtimeSnapshot = realtimeSnapshot.then(() => { realtimeQueue.enqueue(event); });
+            realtimeReceivedAt.set(event.cursor, timingNow());
+            logEvent("realtime", "Realtime event queued", `type ${event.type}; cursor ${event.cursor}`, "info");
+            queueRealtimeTask(() => { realtimeQueue.enqueue(event); });
           } else if (event.type === "presence") {
             updateConversations((current) => current.map((conversation) => conversation.id === event.conversationId
               ? { ...conversation, online: event.online, lastSeenAt: event.lastSeenAt }
@@ -739,9 +847,63 @@ export default function App() {
       }
     };
 
+    const queueRealtimeTask = (task: () => unknown | Promise<unknown>) => {
+      realtimeSnapshot = realtimeSnapshot
+        .catch((reason) => {
+          logEvent("realtime", "Realtime pipeline recovered", reason instanceof Error ? reason.message : "Realtime pipeline error", "warn");
+        })
+        .then(task)
+        .catch((reason) => {
+          if (cancelled) return;
+          logEvent("realtime", "Realtime pipeline failed", reason instanceof Error ? reason.message : "Realtime pipeline error", "error");
+          void syncOnce();
+        });
+    };
+
+    const stopRealtimeHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+    const startRealtimeHeartbeat = () => {
+      if (heartbeatTimer !== null) return;
+      heartbeatTimer = setInterval(() => {
+        if (cancelled || !presenceConnectionAllowed()) return;
+        if (!realtimeReady || !realtime) return;
+        const socket = realtime;
+        if (lastRealtimePongAt > 0 && Date.now() - lastRealtimePongAt > PRESENCE_HEARTBEAT_TIMEOUT_MS) {
+          logEvent("realtime", "Realtime heartbeat timeout", "closing stale connection", "warn");
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+          return;
+        }
+        if (socket.readyState !== 1) {
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+          return;
+        }
+        try {
+          socket.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          realtime = null;
+          realtimeReady = false;
+          presence.update({ realtimeReady: false, lastHeartbeatAt: null });
+          socket.close();
+          handleRealtimeClose();
+        }
+      }, 15_000);
+    };
+
     const syncInForeground = () => void (async () => {
       try { await syncOnce(); }
-      catch (reason) { if (!cancelled && appActive) { setSyncConnected(false); if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); } else setMessageError(friendlyError(reason, "Нет подключения к серверу")); } }
+      catch (reason) { if (!cancelled && presenceConnectionAllowed()) { setSyncConnected(false); if (isUnauthorized(reason)) { expireProfileSession(profile.id); setMessageError("Сессия сервера истекла. Войдите снова"); } else setMessageError(friendlyError(reason, "Нет подключения к серверу")); } }
     })();
 
     const suspendRealtime = () => {
@@ -750,31 +912,60 @@ export default function App() {
         reconnectTimer = null;
       }
       stopFallbackSync();
+      stopRealtimeHeartbeat();
       realtimeReady = false;
+      lastRealtimePongAt = 0;
+      presence.update({ realtimeReady: false, lastHeartbeatAt: null });
       const socket = realtime;
       realtime = null;
       socket?.close();
       setSyncConnected(false);
     };
+    const resumeRealtime = () => {
+      if (cancelled || !presenceConnectionAllowed()) return;
+      reconnectDelay = 1000;
+      startRealtimeHeartbeat();
+      syncInForeground();
+      if (screenRef.current === "chat" && activeConversationIdRef.current) {
+        void markConversationRead(profile, activeConversationIdRef.current).catch(() => undefined);
+      }
+      connectRealtime();
+    };
     // A future APNs/FCM wake-up can reuse syncInForeground(); no push transport is installed here.
     const lifecycle = createRealtimeLifecycle(AppState.currentState, {
       onActive: () => {
         appActive = true;
-        reconnectDelay = 1000;
-        syncInForeground();
-        connectRealtime();
+        presence.update({ appActive: true, visible: true, focused: true });
+        resumeRealtime();
       },
       onInactive: () => {
         appActive = false;
+        presence.update({ appActive: false, visible: false, realtimeReady: false, lastHeartbeatAt: null });
         suspendRealtime();
       },
     });
+    const applyNetworkState = (state: NetInfoState) => {
+      if (cancelled) return;
+      const online = state.isConnected !== false && state.isInternetReachable !== false;
+      const wasAllowed = presenceConnectionAllowed();
+      networkOnline = online;
+      presence.update({ networkOnline: online });
+      if (!online) {
+        suspendRealtime();
+      } else if (!wasAllowed && presenceConnectionAllowed()) {
+        resumeRealtime();
+      }
+    };
+    const unsubscribeNetInfo = NetInfo.addEventListener(applyNetworkState);
     const appState = AppState.addEventListener("change", lifecycle.change);
     lifecycle.start();
+    void NetInfo.fetch().then(applyNetworkState).catch(() => undefined);
     return () => {
       cancelled = true;
       lifecycle.stop();
       appState.remove();
+      unsubscribeNetInfo();
+      suspendRealtime();
     };
   }, [activeProfileId, activeProfile?.token, showAuth]);
 
@@ -805,7 +996,7 @@ export default function App() {
     await prepareProfile(profile, password);
     await writeSessionToken(profile.id, profile.token);
     const nextProfiles = [...profiles.filter((item) => item.id !== profile.id), profile];
-    setProfiles(nextProfiles); setActiveProfileId(profile.id); setShowAuth(false); setScreen("inbox"); setActiveConversationId(null);
+    setProfiles(nextProfiles); setActiveProfileId(profile.id); setShowAuth(false); setScreen("inbox"); setActiveConversationId(null); setReplyTo(null); setEditingMessage(null);
     setConversationsByProfile((current) => ({ ...current, [profile.id]: current[profile.id] ?? [] }));
     setFoldersByProfile((current) => ({ ...current, [profile.id]: current[profile.id] ?? [] }));
     setActiveConversationByProfile((current) => ({ ...current, [profile.id]: null }));
@@ -825,7 +1016,7 @@ export default function App() {
     setSyncCursors((current) => { const rest = { ...current }; delete rest[profile.id]; return rest; });
     delete syncCursorsRef.current[profile.id];
     setOutboxByProfile((current) => { const rest = { ...current }; delete rest[profile.id]; return rest; });
-    if (activeProfileId === profile.id) { setActiveProfileId(next[0]?.id ?? null); setActiveConversationId(null); setScreen("inbox"); setShowAuth(next.length === 0); }
+    if (activeProfileId === profile.id) { setActiveProfileId(next[0]?.id ?? null); setActiveConversationId(null); setReplyTo(null); setEditingMessage(null); setScreen("inbox"); setShowAuth(next.length === 0); }
   }
 
   async function clearMessageCache() {
@@ -837,6 +1028,8 @@ export default function App() {
     });
     setSyncCursors((current) => ({ ...current, [activeProfileId]: 0 }));
     syncCursorsRef.current[activeProfileId] = 0;
+    setReplyTo(null);
+    setEditingMessage(null);
   }
 
   async function clearOutbox() {
@@ -865,6 +1058,8 @@ export default function App() {
     if (activeProfileId === profileId) {
       setActiveProfileId(next[0]?.id ?? null);
       setActiveConversationId(null);
+      setReplyTo(null);
+      setEditingMessage(null);
       setScreen("inbox");
     }
     setShowAuth(true);
@@ -882,6 +1077,8 @@ export default function App() {
     const definition = folders.find((item) => item.id === folder);
     if (folder !== ALL_FOLDER && (!definition || !activeConversation || !folderContains(definition, activeConversation))) {
       setActiveConversationId(null);
+      setReplyTo(null);
+      setEditingMessage(null);
       setScreen("inbox");
     }
   }
@@ -921,8 +1118,19 @@ export default function App() {
   }
 
   function openConversation(conversationId: string) {
-    setActiveConversationId(conversationId); setScreen("chat"); updateConversations((current) => current.map((item) => item.id === conversationId ? { ...item, unread: 0 } : item));
-    if (activeProfile) void markConversationRead(activeProfile, conversationId).catch(() => undefined);
+    activeConversationIdRef.current = conversationId;
+    screenRef.current = "chat";
+    setActiveConversationId(conversationId); setReplyTo(null); setEditingMessage(null); setScreen("chat"); updateConversations((current) => clearConversationUnread(current, conversationId));
+  }
+
+  function leaveConversation() {
+    activeConversationIdRef.current = null;
+    screenRef.current = "inbox";
+    setScreen("inbox");
+    setActiveConversationId(null);
+    setReplyTo(null);
+    setEditingMessage(null);
+    setForwardMessage(null);
   }
 
   function updateMessages(conversationId: string, update: (current: Message[]) => Message[]) {
@@ -966,21 +1174,25 @@ export default function App() {
 
   async function sendMessageToConversation(conversationId: string, message: Message, pendingMedia: PendingMedia[] = [], fromOutbox = false) {
     if (!activeProfile || !activeProfileId) return;
+    const sendStartedAt = timingNow();
     logEvent("send", fromOutbox ? "Retrying message send" : "Preparing message", `attachments ${pendingMedia.length}`);
     const conversation = conversations.find((item) => item.id === conversationId || (conversationId === "favorites" && item.handle === "favorites"));
     if (!conversation || conversation.canWrite === false) return;
     const targetConversationId = conversation.id;
     const isEdit = Boolean(message.editOf);
+    const isReactionEvent = Boolean(message.reactionEvent);
     setMessageError("");
     const hasPendingMedia = pendingMedia.length > 0 && !fromOutbox;
     if (hasPendingMedia) setMediaUploadProgress(0);
     if (!hasPendingMedia) queueOutbox(targetConversationId, message);
     if (fromOutbox) {
       updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "pending" }));
-    } else if (!isEdit && !hasPendingMedia) {
+    } else if (!isEdit && !hasPendingMedia && !isReactionEvent) {
       const pendingMessage = { ...message, deliveryStatus: "pending" } satisfies Message;
-      updateMessages(targetConversationId, (current) => [...current, pendingMessage]);
+      updateMessages(targetConversationId, (current) => mergeRemoteMessages({ [targetConversationId]: current }, [{ conversationId: targetConversationId, message: pendingMessage }])[targetConversationId] ?? current);
+      markMessageStateApplied(message.id, timingNow(), "send");
       updateConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(message), time: message.time } : item));
+      logEvent("send", "Message optimistic apply scheduled", `message ${message.id}; local ${timingElapsed(sendStartedAt)}ms`, "info");
     }
     try {
        const { bundle, account } = await prepareProfile(activeProfile);
@@ -1010,20 +1222,22 @@ export default function App() {
         queueOutbox(targetConversationId, messageToSend);
         if (!isEdit) {
           const pendingMessage = { ...messageToSend, deliveryStatus: "pending" } satisfies Message;
-          updateMessages(targetConversationId, (current) => [...current, pendingMessage]);
+          updateMessages(targetConversationId, (current) => mergeRemoteMessages({ [targetConversationId]: current }, [{ conversationId: targetConversationId, message: pendingMessage }])[targetConversationId] ?? current);
           updateConversations((current) => current.map((item) => item.id === targetConversationId ? { ...item, lastMessage: messagePreview(messageToSend), time: messageToSend.time } : item));
         }
       }
+      const encryptionStartedAt = timingNow();
       const encryptedMessages = await Promise.all(recipients.map((recipient) => encryptMessage(activeProfile, targetConversationId, messageToSend, recipient)));
-      logEvent("crypto", "Message encrypted", `recipients ${encryptedMessages.length}`, "success");
+      logEvent("crypto", "Message encrypted", `recipients ${encryptedMessages.length}; prepare ${timingElapsed(sendStartedAt, encryptionStartedAt)}ms; encrypt ${timingElapsed(encryptionStartedAt)}ms`, "success");
        const localEncryptedMessage = encryptedMessages.find((encryptedMessage) => encryptedMessage.key_id === account?.keyId) ?? encryptedMessages[0];
        const localMessage = { ...messageToSend, encryptedMessage: localEncryptedMessage, deliveryStatus: "pending" } satisfies Message;
       updateLocalMessage(targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage }));
+      const transportStartedAt = timingNow();
       const sent = await sendRemoteMessage(activeProfile, targetConversationId, localMessage, encryptedMessages);
       updateLocalMessage(targetConversationId, messageToSend.id, (current) => ({ ...current, ...localMessage, time: messageTime(new Date(sent.message.createdAt)), stackId: sent.message.stackId, deliveryStatus: undefined }));
       removeOutbox(messageToSend.id);
       setMediaUploadProgress(null);
-      logEvent("send", "Message sent", undefined, "success");
+      logEvent("send", "Message sent", `message ${message.id}; local-to-accepted ${timingElapsed(sendStartedAt)}ms; transport ${timingElapsed(transportStartedAt)}ms`, "success");
     } catch (reason) {
       setMediaUploadProgress(null);
       updateLocalMessage(targetConversationId, message.id, (current) => ({ ...current, deliveryStatus: "failed" }));
@@ -1049,6 +1263,19 @@ export default function App() {
   function updateActiveMessage(messageId: string, update: (message: Message) => Message | null) {
     if (!activeConversationId) return;
     updateMessages(activeConversationId, (current) => current.flatMap((message) => { if (message.id !== messageId) return [message]; const next = update(message); return next ? [next] : []; }));
+  }
+
+  function reactToMessage(message: Message, reaction: string) {
+    if (!activeConversationId || activeConversation?.canWrite === false) return;
+    const nextReaction = message.reaction === reaction ? null : reaction;
+    updateActiveMessage(message.id, (current) => ({ ...current, reaction: nextReaction ?? undefined }));
+    void sendMessageToConversation(activeConversationId, {
+      id: makeId(),
+      author: "me",
+      text: "",
+      time: messageTime(),
+      reactionEvent: { targetMessageId: message.id, reaction: nextReaction },
+    });
   }
 
   function applyMessageEdit(message: Message) {
@@ -1080,7 +1307,7 @@ export default function App() {
   }
 
   function conversationAction(conversation: Conversation, action: Action) {
-    if (action === "delete") { Alert.alert("Удалить чат?", conversation.name, [{ text: "Отмена", style: "cancel" }, { text: "Удалить", style: "destructive", onPress: () => { updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, deleted: true } : item)); if (activeConversationId === conversation.id) { setActiveConversationId(null); setScreen("inbox"); } } }]); return; }
+    if (action === "delete") { Alert.alert("Удалить чат?", conversation.name, [{ text: "Отмена", style: "cancel" }, { text: "Удалить", style: "destructive", onPress: () => { updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, deleted: true } : item)); if (activeConversationId === conversation.id) { setActiveConversationId(null); setReplyTo(null); setEditingMessage(null); setScreen("inbox"); } } }]); return; }
     if (action === "archive") updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, archived: true } : item));
     if (action === "pin") updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, pinned: !item.pinned } : item));
     if (action === "unread") updateConversations((current) => current.map((item) => item.id === conversation.id ? { ...item, unread: item.unread ? 0 : 1 } : item));
@@ -1088,15 +1315,15 @@ export default function App() {
   }
 
   if (!hydrated) return <CommonDebugProvider enabled={false}><SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={styles.loading}><Image source={require("./assets/enter_logo.png")} style={styles.logoImage} resizeMode="contain" accessibilityLabel="Enter" /></SafeAreaView></SafeAreaProvider></CommonDebugProvider>;
-  if (profiles.length === 0 || showAuth) return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider></CommonDebugProvider>;
+  if (profiles.length === 0 || showAuth) return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><BackNavigationProvider registry={backRegistry}><RootBackAction onBack={handleRootBack} /><SafeAreaProvider initialMetrics={initialWindowMetrics}><AuthScreen onAuthenticated={addProfile} onCancel={profiles.length ? () => setShowAuth(false) : undefined} /></SafeAreaProvider></BackNavigationProvider></CommonDebugProvider>;
 
-  return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar barStyle={themeColors.background === "#f5f5f7" ? "dark-content" : "light-content"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
-    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} themeColors={themeColors} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} onDeleteAccount={deleteAccountAndProfile} onSettingsChange={setLocalSettings} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} messageTextSize={localSettings.messageTextSize} bubbleRadius={localSettings.bubbleRadius} themeColors={themeColors} mediaSettings={localSettings.media} energySavingActive={energySavingActive} replyTo={replyTo} editingMessage={editingMessage} onBack={() => { setScreen("inbox"); setActiveConversationId(null); }} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={(message, reaction) => updateActiveMessage(message.id, (current) => ({ ...current, reaction: current.reaction === reaction ? undefined : reaction }))} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} themeColors={themeColors} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} listLayout={localSettings.chatListLayout} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
+  return <CommonDebugProvider enabled={localSettings.debug.showCommonElements}><BackNavigationProvider registry={backRegistry}><RootBackAction onBack={handleRootBack} /><SafeAreaProvider initialMetrics={initialWindowMetrics}><SafeAreaView style={[styles.app, { backgroundColor: themeColors.background }]} edges={["top", "bottom", "left", "right"]}><StatusBar barStyle={themeColors.background === "#f5f5f7" ? "dark-content" : "light-content"} /><View {...(screen === "inbox" || screen === "settings" ? swipeResponder.panHandlers : {})} style={{ flex: 1 }}>
+    <Animated.View style={{ flex: 1, transform: [{ translateX: screenMotion.interpolate({ inputRange: [0, 1], outputRange: [screenDirection * viewportWidth, 0] }) }] }}>{screen === "profile" && activeProfile ? <ProfileScreen profile={activeProfile} onClose={() => setScreen("inbox")} onOpenProfiles={() => setShowProfiles(true)} onAddProfile={() => setShowAuth(true)} /> : screen === "settings" && activeProfile ? <SettingsScreen profile={activeProfile} themeColors={themeColors} onClose={() => setScreen("inbox")} onOpenLogs={() => setScreen("logs")} onClearMessageCache={clearMessageCache} onClearOutbox={clearOutbox} onForgetLocalPrivateKeys={forgetLocalPrivateKeys} onDeleteAccount={deleteAccountAndProfile} onSettingsChange={setLocalSettings} /> : screen === "chat" && activeConversation && activeProfile ? <ChatScreen profile={activeProfile} conversation={activeConversation} messages={messages} error={messageError} uploadProgress={mediaUploadProgress} messageTextSize={localSettings.messageTextSize} bubbleRadius={localSettings.bubbleRadius} themeColors={themeColors} mediaSettings={localSettings.media} energySavingActive={energySavingActive} replyTo={replyTo} editingMessage={editingMessage} onBack={leaveConversation} onSend={sendMessage} onReply={(message) => { setEditingMessage(null); setReplyTo(message); }} onEdit={applyMessageEdit} onPin={(message) => updateActiveMessage(message.id, (current) => ({ ...current, pinned: !current.pinned }))} onSave={saveMessage} onDelete={(message) => updateActiveMessage(message.id, () => null)} onReact={reactToMessage} onForward={setForwardMessage} onCancelContext={() => { setReplyTo(null); setEditingMessage(null); }} /> : <ConversationList profile={activeProfile} themeColors={themeColors} syncConnected={syncConnected} conversations={conversationsWithPreviews} folders={folders} activeFolder={activeProfileId ? activeFolderByProfile[activeProfileId] ?? ALL_FOLDER : ALL_FOLDER} listLayout={localSettings.chatListLayout} activeId={activeConversationId} query={query} searchUser={searchUserResult} searchBusy={searchBusy} searchError={searchError} onQueryChange={setQuery} onSelect={openConversation} onProfilePress={() => setShowProfiles(true)} onOpenSearchUser={openSearchUser} onAction={conversationAction} onSelectFolder={selectFolder} onCreateFolder={createFolder} onUpdateFolder={updateFolder} onDeleteFolder={deleteFolder} onToggleConversationFolder={toggleConversationFolder} />}</Animated.View>
     {screen !== "chat" && <BottomNav themeColors={themeColors} screen={screen} onInbox={() => setScreen("inbox")} onProfile={() => setScreen("profile")} onSettings={() => setScreen("settings")} />}
     <ProfileSheet visible={showProfiles} profiles={profiles} activeProfile={activeProfile} onClose={() => setShowProfiles(false)} onSelect={selectProfile} onAdd={() => setShowAuth(true)} onRemove={removeProfile} />
     <ForwardSheet visible={Boolean(forwardMessage)} message={forwardMessage} conversations={conversations} currentId={activeConversationId} onClose={() => setForwardMessage(null)} onForward={(id) => forwardMessage && sendForwardedMessage(forwardMessage, id)} />
-    {screen === "logs" && <View style={styles.logsOverlay}><LogsScreen onClose={() => setScreen("settings")} /></View>}
-  </View></SafeAreaView></SafeAreaProvider></CommonDebugProvider>;
+    {screen === "logs" && <><RegisteredBackAction onBack={() => setScreen("settings")} /><View style={styles.logsOverlay}><LogsScreen onClose={() => setScreen("settings")} /></View></>}
+  </View></SafeAreaView></SafeAreaProvider></BackNavigationProvider></CommonDebugProvider>;
 }
 
 function BottomNav({ themeColors = colors, screen, onInbox, onProfile, onSettings }: { themeColors?: typeof colors; screen: Screen; onInbox: () => void; onProfile: () => void; onSettings: () => void }) {
